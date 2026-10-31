@@ -8,8 +8,8 @@ people building images for Legion.
 - [x] **Multi-architecture images.** `jailer manifest push <target>
   <source>...` publishes an OCI index naming one image per platform, from
   local images and images already pushed from other architectures' build
-  hosts. Tested against a mock registry; still to try against a real one
-  (GHCR, Docker Hub) and on an arm64 host.
+  hosts. Tested against a mock registry and Docker's `registry:2`; still
+  to try against GHCR or Docker Hub, and on an arm64 host.
 
 - [ ] **Packaging.** v0.1.0 is released with an amd64 tarball, built by
   `scripts/release.sh`, and the port overlay in `ports/sysutils/jailer`
@@ -70,11 +70,12 @@ fail with a clear message.
 
 - [x] **Clearer pull errors**: "not found, or access denied".
 - [x] **Podman interop.** `export` also writes Docker's `manifest.json`, as
-  `docker save` does. Still to try with `podman load` and `docker load`.
+  `docker save` does. `docker load` (Docker 29) loads it, and `docker
+  pull` takes pushed images, zstd ones too; `podman load` is untried.
 - [x] **Image signing**: `push --sign-key`, `sign`, `verify` and `key
   generate`, signatures as cosign makes them with a key pair (no
-  transparency log, no keyless signing). Still to check against `cosign
-  verify` itself.
+  transparency log, no keyless signing). cosign 2.4 and 3.0 verify
+  jailer's signatures, and `jailer verify` cosign's.
 - [x] **`build --squash`** flattens the image into one layer.
 - [x] **Man page note** on `schg` files in a `--no-zfs` state directory.
 - [x] **One runtime with Legion.** Images, the store and the registry

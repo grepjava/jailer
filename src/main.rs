@@ -717,13 +717,28 @@ fn default_local_image_for_cwd() -> String {
     format!("localhost/{name}:latest")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Handle `jail-shim` immediately before initializing async logging if invoked directly.
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(String::as_str) == Some("jail-shim") {
         std::process::exit(shim::main(&raw_args[2..]));
     }
+    // The commands' future is large, more so in a debug build, and Windows
+    // gives the main thread 1 MiB of stack: run it on a thread with room.
+    std::thread::Builder::new()
+        .name("jailer".to_owned())
+        .stack_size(16 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(Box::pin(run()))
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
