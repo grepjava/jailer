@@ -1,16 +1,7 @@
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::ffi::OsString;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use jailer::Reference;
 use jailer::build::{BuildBackend, BuildOptions, build};
 use jailer::init::{InitOptions, Template, scaffold};
@@ -18,177 +9,8 @@ use jailer::registry::{Client, Credentials, sha256};
 use jailer::runtime::{Config, JailRuntime};
 use jailer::sys::FakeSys;
 
-#[derive(Default)]
-struct MockRegistry {
-    blobs: Mutex<BTreeMap<String, Vec<u8>>>,
-    manifests: Mutex<BTreeMap<String, (String, Vec<u8>)>>,
-}
-
-async fn start_mock_registry() -> (SocketAddr, Arc<MockRegistry>) {
-    let state = Arc::new(MockRegistry::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let st = state.clone();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let st = st.clone();
-            tokio::spawn(async move {
-                let svc = service_fn(move |req: Request<Incoming>| {
-                    let st = st.clone();
-                    async move { handle_registry(req, st).await }
-                });
-                let _ = http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), svc)
-                    .await;
-            });
-        }
-    });
-    (addr, state)
-}
-
-async fn handle_registry(
-    req: Request<Incoming>,
-    st: Arc<MockRegistry>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-
-    // Plain files, for `ADD <url>`
-    if let Some(name) = path.strip_prefix("/files/") {
-        return Ok(Response::builder()
-            .status(if name == "data.bin" {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            })
-            .body(Full::new(Bytes::from_static(b"downloaded\n")))
-            .unwrap());
-    }
-
-    // Check Bearer token flow
-    if path == "/token" {
-        let body = serde_json::json!({"token": "test-bearer-token"}).to_string();
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .unwrap());
-    }
-
-    let auth = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if auth != "Bearer test-bearer-token" {
-        let host = req
-            .headers()
-            .get("Host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("127.0.0.1");
-        let challenge = format!(
-            "Bearer realm=\"http://{host}/token\",service=\"mock\",scope=\"repository:me/app:pull,push\""
-        );
-        return Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", challenge)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    let bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes().to_vec())
-        .unwrap_or_default();
-
-    if method == Method::HEAD && path.contains("/blobs/") {
-        let digest = path.rsplit('/').next().unwrap_or("");
-        let has = st.blobs.lock().unwrap().contains_key(digest);
-        return Ok(Response::builder()
-            .status(if has {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            })
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    if method == Method::GET && path.contains("/blobs/") {
-        let digest = path.rsplit('/').next().unwrap_or("");
-        if let Some(data) = st.blobs.lock().unwrap().get(digest).cloned() {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(Full::new(Bytes::from(data)))
-                .unwrap());
-        }
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    if method == Method::POST && path.ends_with("/blobs/uploads/") {
-        let upload_path = path.replace("/blobs/uploads/", "/blobs/uploads/u1");
-        return Ok(Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .header("Location", upload_path)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    if method == Method::PUT && path.contains("/blobs/uploads/") {
-        let digest = query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("digest="))
-            .unwrap_or("")
-            .to_owned();
-        st.blobs.lock().unwrap().insert(digest, bytes);
-        return Ok(Response::builder()
-            .status(StatusCode::CREATED)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    if method == Method::PUT && path.contains("/manifests/") {
-        let target = path.rsplit('/').next().unwrap_or("").to_owned();
-        let digest = sha256(&bytes);
-        let mut m = st.manifests.lock().unwrap();
-        m.insert(target, (digest.clone(), bytes.clone()));
-        m.insert(digest.clone(), (digest, bytes));
-        return Ok(Response::builder()
-            .status(StatusCode::CREATED)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    if method == Method::GET && path.contains("/manifests/") {
-        let target = path.rsplit('/').next().unwrap_or("");
-        if let Some((_, data)) = st.manifests.lock().unwrap().get(target).cloned() {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-                .body(Full::new(Bytes::from(data)))
-                .unwrap());
-        }
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
-    }
-
-    Ok(Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Full::new(Bytes::new()))
-        .unwrap())
-}
+mod common;
+use common::start_mock_registry;
 
 #[tokio::test]
 async fn end_to_end_init_build_export_push_and_pull() {
@@ -289,6 +111,8 @@ CMD ["--serve"]
             compression: Default::default(),
             cpuset: None,
             annotations: BTreeMap::new(),
+            cache_from: Vec::new(),
+            cache_to: None,
         },
     )
     .await
@@ -451,6 +275,8 @@ async fn manifest_push_publishes_one_image_per_platform() {
             compression: Default::default(),
             cpuset: None,
             annotations: BTreeMap::new(),
+            cache_from: Vec::new(),
+            cache_to: None,
         },
     )
     .await
@@ -607,6 +433,8 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         compression: Default::default(),
         cpuset: None,
         annotations: BTreeMap::new(),
+        cache_from: Vec::new(),
+        cache_to: None,
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -856,6 +684,8 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 compression: Default::default(),
                 cpuset: None,
                 annotations: BTreeMap::new(),
+                cache_from: Vec::new(),
+                cache_to: None,
             },
         )
         .await
@@ -898,4 +728,138 @@ async fn cache_trim_drops_least_recently_used_layers() {
     assert!(!layer(0).exists() && layer(1).exists());
     assert_eq!(jailer::store::trim_cache(&store, 0).await.unwrap(), 1);
     assert!(!layer(1).exists());
+}
+
+#[tokio::test]
+async fn registry_cache_carries_steps_to_another_store() {
+    use jailer::cache::{Imported, Remote, export};
+    use jailer::store::{CachedLayer, CachedStep, cached_step};
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, _) = start_mock_registry().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+    let open = |dir: &str| {
+        let sys = Arc::new(FakeSys::new());
+        let store = Arc::new(
+            jailer::store::open(
+                sys.clone(),
+                None,
+                &tmp.path().join(dir),
+                Client::new().unwrap().plain_http(&host),
+            )
+            .unwrap(),
+        );
+        let runtime = JailRuntime::new(
+            sys,
+            store.clone(),
+            Config {
+                state_dir: tmp.path().join(dir).join("containers"),
+                dataset: None,
+                shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+                prune_images: false,
+            },
+        )
+        .unwrap();
+        (store, runtime)
+    };
+
+    // A layer in the first store, standing for what a RUN step left.
+    let (store, runtime) = open("a");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("made"), "by a step\n").unwrap();
+    std::fs::write(ctx.join("Containerfile"), "FROM scratch\nCOPY made /made\n").unwrap();
+    let image = build(
+        &store,
+        &runtime,
+        &BuildOptions {
+            context_dir: ctx.clone(),
+            containerfile: None,
+            tag: "made:1".to_owned(),
+            build_args: BTreeMap::new(),
+            target: None,
+            backend: BuildBackend::Native,
+            creds: None,
+            strict_lint: false,
+            no_cache: false,
+            squash: false,
+            cache_max: None,
+            secrets: BTreeMap::new(),
+            ssh: BTreeMap::new(),
+            jail_params: Vec::new(),
+            labels: BTreeMap::new(),
+            timestamp: None,
+            limits: Default::default(),
+            compression: Default::default(),
+            cpuset: None,
+            annotations: BTreeMap::new(),
+            cache_from: Vec::new(),
+            cache_to: None,
+        },
+    )
+    .await
+    .unwrap()
+    .image;
+    let layer = CachedLayer {
+        chain: image.layers[0].clone(),
+        diff_id: image.config.rootfs.diff_ids[0].clone(),
+        descriptor: image.layer_descriptors[0].clone(),
+    };
+    let remote = Remote {
+        reference: Reference::parse(&format!("{host}/me/cache:main")).unwrap(),
+        creds: None,
+    };
+    let steps = [
+        (
+            "made".to_owned(),
+            CachedStep {
+                layer: Some(layer.clone()),
+            },
+        ),
+        ("empty".to_owned(), CachedStep { layer: None }),
+    ];
+    export(store.client(), &store, &remote, &steps)
+        .await
+        .unwrap();
+
+    // Another store takes both steps from the registry, the layer included.
+    let (other, _) = open("b");
+    let imported = Imported::read(other.client(), std::slice::from_ref(&remote)).await;
+    assert!(!imported.is_empty());
+    let pin = other.pin().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for key in ["made", "empty"] {
+        assert!(
+            imported
+                .fetch(&other, &pin, key, &[], None, &work)
+                .await
+                .unwrap()
+        );
+    }
+    let got = cached_step(&other, &pin, "made").await.unwrap().unwrap();
+    let got = got.layer.unwrap();
+    assert_eq!((got.chain, got.diff_id), (layer.chain, layer.diff_id));
+    assert!(other.has_layer(&image.layers[0]).unwrap());
+    assert!(
+        cached_step(&other, &pin, "empty")
+            .await
+            .unwrap()
+            .unwrap()
+            .layer
+            .is_none()
+    );
+    // A step the cache lacks is not taken.
+    assert!(
+        !imported
+            .fetch(&other, &pin, "other", &[], None, &work)
+            .await
+            .unwrap()
+    );
+
+    // A cache that is not there is left out.
+    let missing = Remote {
+        reference: Reference::parse(&format!("{host}/me/cache:none")).unwrap(),
+        creds: None,
+    };
+    assert!(Imported::read(other.client(), &[missing]).await.is_empty());
 }

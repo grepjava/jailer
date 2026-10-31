@@ -140,6 +140,14 @@ pub enum Commands {
         #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
         timestamp: Option<i64>,
 
+        /// A registry build cache to take `RUN` steps from (repeatable)
+        #[arg(long = "cache-from", value_name = "REF")]
+        cache_from: Vec<String>,
+
+        /// Push this build's `RUN` steps to a registry build cache
+        #[arg(long = "cache-to", value_name = "REF")]
+        cache_to: Option<String>,
+
         /// An annotation for the image's manifest (KEY=VALUE)
         #[arg(long = "annotation", value_name = "KEY=VALUE")]
         annotations: Vec<String>,
@@ -704,6 +712,8 @@ async fn main() -> Result<()> {
             timestamp,
             compression,
             annotations,
+            cache_from,
+            cache_to,
             creds,
             authfile,
             context,
@@ -723,6 +733,17 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("--build-arg {kv:?} must be KEY=VALUE"))?;
                 parsed_args.insert(k.to_owned(), v.to_owned());
             }
+            let remote = |r: &String| -> Result<jailer::cache::Remote> {
+                let reference = Reference::parse(r)?;
+                let creds = resolve_credentials(
+                    &reference.registry,
+                    creds.as_deref(),
+                    authfile.as_deref(),
+                )?;
+                Ok(jailer::cache::Remote { reference, creds })
+            };
+            let cache_from = cache_from.iter().map(remote).collect::<Result<Vec<_>>>()?;
+            let cache_to = cache_to.as_ref().map(remote).transpose()?;
             let mut parsed_annotations = BTreeMap::new();
             for kv in annotations {
                 let (k, v) = kv
@@ -768,6 +789,8 @@ async fn main() -> Result<()> {
                     compression: *compression,
                     cpuset: limits.cpuset_cpus.clone(),
                     annotations: parsed_annotations,
+                    cache_from,
+                    cache_to,
                 },
             )
             .await?;

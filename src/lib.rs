@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod build;
+pub mod cache;
 pub mod check;
 pub mod containerfile;
 pub mod init;

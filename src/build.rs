@@ -65,6 +65,10 @@ pub struct BuildOptions {
     pub cpuset: Option<String>,
     /// Annotations for the image's manifest.
     pub annotations: BTreeMap<String, String>,
+    /// Registry caches `RUN` steps may come from (`--cache-from`).
+    pub cache_from: Vec<crate::cache::Remote>,
+    /// Where to push this build's `RUN` steps (`--cache-to`).
+    pub cache_to: Option<crate::cache::Remote>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +175,12 @@ pub async fn build(
 
     // Keeps the base images and new layers from a concurrent `rmi`.
     let pin = store.pin()?;
+    let imported = if opts.no_cache || opts.cache_from.is_empty() {
+        crate::cache::Imported::default()
+    } else {
+        crate::cache::Imported::read(store.client(), &opts.cache_from).await
+    };
+    let used = std::sync::Mutex::new(Vec::new());
     let env = BuildEnv {
         store,
         pin: &pin,
@@ -179,6 +189,8 @@ pub async fn build(
         ignore: &ignore,
         build_args: &build_args,
         tmp_dir: build_tmp.path(),
+        imported: &imported,
+        used: &used,
     };
     let mut completed_stages: Vec<BuiltStage> = Vec::new();
     // With a ZFS store, stages are clones rather than copies: of the base
@@ -418,6 +430,15 @@ pub async fn build(
             opts.annotations.clone(),
         )
         .await?;
+    if let Some(remote) = &opts.cache_to {
+        let steps = std::mem::take(&mut *used.lock().unwrap());
+        let digest = crate::cache::export(store.client(), store, remote, &steps).await?;
+        println!(
+            "Pushed the build cache ({} steps) to {}@{digest}",
+            steps.len(),
+            remote.reference
+        );
+    }
     drop(pin);
     if let Some(max) = opts.cache_max {
         crate::store::trim_cache(store, max).await?;
@@ -462,6 +483,10 @@ struct BuildEnv<'a> {
     /// `--build-arg` values over Docker's automatic ones.
     build_args: &'a BTreeMap<String, String>,
     tmp_dir: &'a Path,
+    /// Steps the `--cache-from` caches have.
+    imported: &'a crate::cache::Imported,
+    /// This build's `RUN` steps by cache key, for `--cache-to`.
+    used: &'a std::sync::Mutex<Vec<(String, CachedStep)>>,
 }
 
 /// Extracts the image `name` (pulled if missing, pinned for the build) at
@@ -524,6 +549,7 @@ async fn execute_instruction(
         ignore,
         build_args: cli_build_args,
         tmp_dir,
+        ..
     } = env;
     let (no_cache, context_dir) = (opts.no_cache, opts.context_dir.as_path());
     match &sp.instruction {
@@ -695,15 +721,33 @@ async fn execute_instruction(
                     },
                 ],
             );
-            let cached = if no_cache {
+            let mut cached = if no_cache {
                 None
             } else {
                 crate::store::cached_step(store, pin, &key).await?
             };
+            if cached.is_none()
+                && !no_cache
+                && env
+                    .imported
+                    .fetch(
+                        store,
+                        pin,
+                        &key,
+                        &stage.config.rootfs.diff_ids,
+                        stage.layers.last().map(String::as_str),
+                        tmp_dir,
+                    )
+                    .await?
+            {
+                println!(" ---> From the registry cache");
+                cached = crate::store::cached_step(store, pin, &key).await?;
+            }
             match cached {
                 Some(step) if apply_cached(store, stage, tmp_dir, step.layer.as_ref())? => {
                     println!(" ---> Using cache");
                     record_history(&mut stage.config, &sp.raw, step.layer.is_none());
+                    env.used.lock().unwrap().push((key.clone(), step));
                 }
                 _ => {
                     let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
@@ -744,7 +788,9 @@ async fn execute_instruction(
                     }
                     drop(mounts);
                     let layer = commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
-                    crate::store::record_step(store, &key, &CachedStep { layer })?;
+                    let step = CachedStep { layer };
+                    crate::store::record_step(store, &key, &step)?;
+                    env.used.lock().unwrap().push((key.clone(), step));
                 }
             }
             stage.cache_key = key;

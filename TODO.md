@@ -97,7 +97,9 @@ fail with a clear message.
 - [x] **`build --label` and `--timestamp`** (or `SOURCE_DATE_EPOCH`).
 - [x] **`build --annotation`**: manifest annotations (Legion v0.1.3).
 - [x] **zstd layers**: `build --compression zstd`.
-- [ ] **A registry-backed build cache** (`--cache-from`/`--cache-to`).
+- [x] **A registry-backed build cache**: `--cache-to REF` pushes a
+  build's `RUN` steps as an OCI manifest; `--cache-from REF` takes them on
+  another host, downloading only the layers of the steps it uses.
 
 ## Not planned
 

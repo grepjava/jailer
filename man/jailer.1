@@ -102,7 +102,9 @@ overwrites an existing
 .Op Fl -authfile Ar path
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
+.Op Fl -cache-from Ar ref
 .Op Fl -cache-max Ar size
+.Op Fl -cache-to Ar ref
 .Op Fl -compression Cm gzip | zstd
 .Op Fl -cpus Ar n
 .Op Fl -cpuset-cpus Ar list
@@ -295,6 +297,18 @@ and the other append-only and no-unlink flags, but not
 .Cm uarch ,
 which ZFS sets on every write) and hard links; a layer holds every name
 of a hard-linked file it changes.
+.Pp
+.Fl -cache-to
+pushes this build's
+.Cm RUN
+steps to
+.Ar ref
+in a registry, as an OCI manifest of their layers;
+.Fl -cache-from ,
+which may be given more than once, lets a build on any host take a step
+from such a cache rather than run it, downloading only the layers of the
+steps it takes.
+A cache that is missing is skipped with a warning.
 .Pp
 New layers are gzip-compressed, or with
 .Fl -compression Cm zstd

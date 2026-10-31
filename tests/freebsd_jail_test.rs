@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -615,6 +617,72 @@ RUN cat /one /two > /both
         format!("{zfs_root}/build"),
         "a build's stage datasets go with it"
     );
+
+    // A registry build cache: a build in another state directory takes
+    // the RUN step from it instead of running it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (addr, _registry) = common::start_mock_registry().await;
+            tx.send(addr).unwrap();
+            std::future::pending::<()>().await;
+        })
+    });
+    let registry = format!("127.0.0.1:{}", rx.recv().unwrap().port());
+    let cache_ref = format!("{registry}/me/cache:main");
+    let cached_dir = tmp.path().join("cached");
+    std::fs::create_dir_all(&cached_dir).unwrap();
+    std::fs::write(
+        cached_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nRUN /bin/uuidgen > /id\n",
+    )
+    .unwrap();
+    cmd(&[
+        "--plain-http",
+        &registry,
+        "build",
+        "--cache-to",
+        &cache_ref,
+        "-t",
+        "cached:1",
+        cached_dir.to_str().unwrap(),
+    ]);
+    let other_state = tmp.path().join("other-state");
+    let other_zfs = format!("{zfs_root}/other");
+    let other = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args([
+                "--state-dir",
+                other_state.to_str().unwrap(),
+                "--zfs-root",
+                &other_zfs,
+                "--plain-http",
+                &registry,
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let built = other(&[
+        "build",
+        "--cache-from",
+        &cache_ref,
+        "-t",
+        "cached:1",
+        cached_dir.to_str().unwrap(),
+    ]);
+    assert!(built.contains("From the registry cache"), "{built}");
+    let id = |run: &dyn Fn(&[&str]) -> String| {
+        run(&["run", "--entrypoint", "/bin/cat", "cached:1", "/id"])
+    };
+    assert_eq!(id(&other), id(&cmd));
 
     // 4. Run `jailer export app.tar`
     let archive = tmp.path().join("app.tar");
