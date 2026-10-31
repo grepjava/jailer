@@ -380,8 +380,13 @@ pub enum Commands {
         username: String,
 
         /// Password or token
-        #[arg(short = 'p', long)]
-        password: String,
+        #[arg(short = 'p', long, required_unless_present = "password_stdin")]
+        password: Option<String>,
+
+        /// Read the password or token from standard input, so that it is
+        /// not in the command line
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
 
         /// Path to auth file
         #[arg(long, value_name = "PATH")]
@@ -715,6 +720,16 @@ fn print_report(report: &CheckReport) {
         };
         eprintln!("{prefix}[{}]: {}", f.code, f.message);
     }
+}
+
+/// The password `jailer login --password-stdin` read: its first line,
+/// as `echo $TOKEN |` gives it.
+fn password_from_stdin(input: &str) -> Result<String> {
+    let line = input.lines().next().unwrap_or("");
+    if line.is_empty() {
+        bail!("no password on standard input");
+    }
+    Ok(line.to_owned())
 }
 
 /// Which of an image's `names` the `query` that found it gives, in the
@@ -1160,14 +1175,23 @@ async fn run() -> Result<()> {
         Commands::Login {
             username,
             password,
+            password_stdin: _,
             authfile,
             registry,
         } => {
+            let password = match password {
+                Some(p) => p.clone(),
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    password_from_stdin(&buf)?
+                }
+            };
             let path = save_credentials(
                 registry,
                 &jailer::Credentials {
                     username: username.clone(),
-                    password: password.clone(),
+                    password,
                 },
                 authfile.as_deref(),
             )?;
@@ -1536,7 +1560,17 @@ async fn containers(_: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::name_given;
+    use super::{name_given, password_from_stdin};
+
+    #[test]
+    fn a_password_on_stdin_is_its_first_line() {
+        assert_eq!(password_from_stdin("tok\n").unwrap(), "tok");
+        assert_eq!(password_from_stdin("tok\r\n").unwrap(), "tok");
+        assert_eq!(password_from_stdin("tok").unwrap(), "tok");
+        assert_eq!(password_from_stdin("a b\nrest\n").unwrap(), "a b");
+        assert!(password_from_stdin("").is_err());
+        assert!(password_from_stdin("\n").is_err());
+    }
 
     #[test]
     fn an_export_names_the_image_as_asked() {

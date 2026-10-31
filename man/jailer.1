@@ -664,7 +664,7 @@ Load an OCI archive into the local store.
 .Nm login
 .Op Fl -authfile Ar path
 .Fl u Ar username
-.Fl p Ar password
+.Fl p Ar password | Fl -password-stdin
 .Ar registry
 .Xc
 Save credentials for
@@ -673,6 +673,11 @@ to
 .Pa ~/.docker/config.json
 or
 .Ar path .
+With
+.Fl -password-stdin
+the password or token is the first line of standard input, kept out of
+the command line, where other users can see it:
+.Dl gh auth token | jailer login -u me --password-stdin ghcr.io
 .It Nm images
 List local images.
 .It Nm rmi Ar reference
