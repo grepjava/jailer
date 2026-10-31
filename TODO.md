@@ -15,9 +15,11 @@ people building images for Legion.
   `scripts/release.sh`, and the port in `ports/sysutils/jailer` builds
   and packages 0.4.0 (portlint clean), with Legion's git crates fetched by
   the ports framework (`scripts/port-crates.sh` lists them) and libzstd
-  from `archivers/zstd`. Still to do: an aarch64 tarball (on an arm64
-  FreeBSD host or VM), and submitting the port to FreeBSD so that `pkg
-  install jailer` works; then link it from Legion's `docs/IMAGES.md`. At
+  from `archivers/zstd`. An aarch64 tarball is built (on a FreeBSD 15.1
+  arm64 VM, all tests passing) but not yet uploaded; both tarballs need
+  15.1 or later (libc's FBSD_1.9). Still to do: submitting the port to
+  FreeBSD so that `pkg install jailer` works; then link it from Legion's
+  `docs/IMAGES.md`. At
   each release: set `DISTVERSION`, run `scripts/port-crates.sh`, then
   `make makesum package` and `portlint -AC` on a FreeBSD host.
 
