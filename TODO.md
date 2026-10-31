@@ -16,8 +16,15 @@ people building images for Legion.
   builds, packages and installs (`make package`, portlint clean). Still to
   do: an aarch64 tarball (run the script on an arm64 host), and submitting
   the port to FreeBSD so that `pkg install jailer` works; then link it from
-  Legion's `docs/IMAGES.md`. Since jailer uses Legion's crates from git,
-  the port needs Legion's source as a second distfile (`GH_TUPLE`).
+  Legion's `docs/IMAGES.md`. jailer uses Legion's crates from git, which
+  the ports framework handles itself: `make cargo-crates` lists them as
+  `legion-*@git+https://github.com/grepjava/legion?tag=...`, and
+  `make makesum` fetches Legion's tarball as a second distfile. Checked
+  on 2026-10-31 against main: fetch, extract, crate list and checksums
+  work; the build needs `pkgconf` (zstd-sys links the system libzstd), and
+  the current ports tree wants rust 1.99. At each release: set
+  `DISTVERSION`, then `make makesum`, `make cargo-crates >
+  Makefile.crates`, `make makesum` again, `make package`, `portlint`.
 
 ## 2. Build speed
 
