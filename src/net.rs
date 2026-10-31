@@ -1,8 +1,9 @@
-//! Networking for `jailer run --vnet`, as a Legion node gives a pod: an
-//! epair whose host end joins a bridge and whose other end moves into the
-//! pod's jail, with the bridge as its default route. The bridge is
-//! jailer's own, `jailer0` on 10.88.0.0/16, so that a host that is also a
-//! Legion node keeps its `legion0` to itself. NAT to the outside and
+//! Networking for `jailer run --vnet`, as a Legion node gives a pod, with
+//! Legion's own `PodNetwork`: an epair whose host end joins a bridge and
+//! whose other end moves into the pod's jail, with the bridge as its
+//! default route. The bridge is jailer's own, `jailer0` on 10.88.0.0/16,
+//! IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
+//! node keeps its `legion0` to itself. NAT to the outside and
 //! published ports are pf rules in anchors under `jailer/`, which the
 //! host's pf.conf must call.
 //!
@@ -17,7 +18,8 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use legion_sys::{Destination, IfConfig, Ipv4Net, Sys};
+use legion_net::PodNetwork;
+use legion_sys::{Ipv4Net, Sys};
 
 use crate::Error;
 
@@ -36,9 +38,18 @@ pub const HOOKS: [&str; 3] = [
 ];
 const NAT_ANCHOR: &str = "jailer/nat";
 
+/// jailer's bridge, as Legion's pod network code makes it.
+pub fn network() -> PodNetwork {
+    PodNetwork::new(SUBNET)
+        .named(BRIDGE, "jp")
+        .expect("valid interface names")
+        .without_v6()
+        .with_mtu(1500)
+}
+
 /// The bridge's address, every pod's default route.
 pub fn gateway() -> Ipv4Addr {
-    Ipv4Addr::from(u32::from(SUBNET.addr) + 1)
+    network().gateway()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -153,18 +164,7 @@ pub fn ensure(sys: &dyn Sys) -> Result<(), Error> {
             missing.join("\n    ")
         )));
     }
-    if !sys.interfaces(None)?.iter().any(|i| i == BRIDGE) {
-        sys.bridge_create(BRIDGE)?;
-    }
-    sys.interface_configure(
-        None,
-        BRIDGE,
-        &IfConfig {
-            addr: Some(Ipv4Net::new(gateway(), SUBNET.prefix)),
-            up: true,
-            ..Default::default()
-        },
-    )?;
+    network().ensure_bridge(sys)?;
     if sys.sysctl_get("net.inet.ip.forwarding").ok().as_deref() != Some("1") {
         sys.sysctl_set("net.inet.ip.forwarding", "1")?;
     }
@@ -200,7 +200,7 @@ pub fn rdr_rules(ip: Ipv4Addr, ports: &[Port]) -> String {
 /// The host end of a pod's epair: `jp` and the last 12 characters of its
 /// id, within the 15-character limit.
 pub fn host_interface(pod: &str) -> String {
-    format!("jp{}", &pod[pod.len().saturating_sub(12)..])
+    network().host_interface(pod)
 }
 
 fn anchor(pod: &str) -> String {
@@ -210,46 +210,12 @@ fn anchor(pod: &str) -> String {
 /// Gives the pod (its jail named `pod`) the address `ip` on the bridge,
 /// and publishes `ports` to it.
 pub fn attach(sys: &dyn Sys, pod: &str, ip: Ipv4Addr, ports: &[Port]) -> Result<(), Error> {
-    let host = host_interface(pod);
-    let pair = sys.epair_create()?;
-    let result = (|| {
-        sys.interface_rename(&pair.a, &host)?;
-        // With the bridge's Ethernet address, the pod's ARP for the gateway
-        // is answered with the bridge's, as on a Legion node.
-        sys.interface_set_ether(&host, &sys.interface_ether(BRIDGE)?)?;
-        sys.interface_configure(
-            None,
-            &host,
-            &IfConfig {
-                up: true,
-                ..Default::default()
-            },
-        )?;
-        sys.bridge_add_member(BRIDGE, &host)?;
-        sys.interface_move(&pair.b, pod)?;
-        sys.interface_configure(
-            Some(pod),
-            &pair.b,
-            &IfConfig {
-                addr: Some(Ipv4Net::new(ip, SUBNET.prefix)),
-                up: true,
-                ..Default::default()
-            },
-        )?;
-        sys.route_add(Some(pod), Destination::Default, gateway().into())?;
-        if !ports.is_empty() {
-            sys.pf_load_anchor(&anchor(pod), &rdr_rules(ip, ports))?;
-        }
-        Ok::<_, legion_sys::Error>(())
-    })();
-    if let Err(e) = result {
-        // Either end name works until the rename; try both.
-        for name in [&host, &pair.a] {
-            if sys.interface_destroy(name).is_ok() {
-                break;
-            }
-        }
-        let _ = sys.pf_flush_anchor(&anchor(pod));
+    let net = network();
+    net.attach(sys, pod, pod, ip)?;
+    if !ports.is_empty()
+        && let Err(e) = sys.pf_load_anchor(&anchor(pod), &rdr_rules(ip, ports))
+    {
+        let _ = net.detach(sys, pod);
         return Err(e.into());
     }
     Ok(())
@@ -258,13 +224,7 @@ pub fn attach(sys: &dyn Sys, pod: &str, ip: Ipv4Addr, ports: &[Port]) -> Result<
 /// Takes the pod's ports and epair away, wherever its jail end is.
 pub fn detach(sys: &dyn Sys, pod: &str) {
     let _ = sys.pf_flush_anchor(&anchor(pod));
-    let host = host_interface(pod);
-    if sys
-        .interfaces(None)
-        .is_ok_and(|names| names.contains(&host))
-    {
-        let _ = sys.interface_destroy(&host);
-    }
+    let _ = network().detach(sys, pod);
 }
 
 /// The addresses taken on the bridge, one file each, naming the pod's jail
@@ -434,8 +394,13 @@ mod tests {
         held.record(ip, pod, &ports).unwrap();
         attach(&sys, pod, ip, &ports).unwrap();
         assert_eq!(
-            sys.routes(Some(pod)).get(&Destination::Default),
+            sys.routes(Some(pod)).get(&legion_sys::Destination::Default),
             Some(&gateway().into())
+        );
+        assert!(
+            !sys.routes(Some(pod))
+                .contains_key(&legion_sys::Destination::Default6),
+            "no IPv6 route"
         );
         assert_eq!(
             sys.anchor("jailer/89abcdef0123").unwrap(),

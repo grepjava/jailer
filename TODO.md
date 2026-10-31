@@ -91,9 +91,8 @@ fail with a clear message.
 - [x] **Network for `run --vnet`**: an epair on jailer's own bridge
   (`jailer0`, 10.88.0.0/16), NAT out and `-p` published ports through pf
   anchors under `jailer/`; `--network none` for loopback only.
-- [ ] **Use Legion's `PodNetwork`** for `jailer0` instead of `net.rs`'s
-  near-copy, once its IPv6 twin addresses can be turned off or given
-  another prefix: today they would put `legion0`'s address on `jailer0`.
+- [x] **Legion's `PodNetwork`** makes `jailer0` and the pods' epairs
+  (Legion v0.1.4), IPv4 only and with a 1500-byte MTU.
 - [x] **Resource limits**: `-m`, `--cpus`, `--pids-limit` for `run` and
   `build`, as rctl rules (memory per process, as on a Legion node).
 - [x] **`--cpuset-cpus`** for `run` and `build`, set by legion-jail on
