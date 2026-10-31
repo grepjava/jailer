@@ -11,12 +11,13 @@ use clap::ValueEnum;
 
 use crate::check::{CheckReport, check_containerfile, check_image};
 use crate::containerfile::{
-    CommandForm, Containerfile, CopySpec, IgnoreMatcher, Instruction, expand_vars, glob_match,
+    Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, expand_vars,
+    glob_match,
 };
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
 use crate::registry::{Credentials, sha256};
-use crate::runtime::{JailRuntime, target};
+use crate::runtime::{BuildMount, JailRuntime, target};
 use crate::store::{CachedLayer, CachedStep, Image, Pin, Store, chain_ids, hex_of};
 use crate::{Error, Reference, users};
 
@@ -41,6 +42,8 @@ pub struct BuildOptions {
     pub strict_lint: bool,
     /// Run every step instead of reusing cached `RUN` results.
     pub no_cache: bool,
+    /// Contents of the secrets `RUN --mount=type=secret` can mount, by id.
+    pub secrets: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,9 @@ struct BuiltStage {
     shell: Vec<String>,
     /// Identifies the stage's filesystem so far, for the build cache.
     cache_key: String,
+    /// The root's state after the last diff, so the next one hashes only
+    /// what changed.
+    tree: Option<TreeState>,
 }
 
 pub async fn build(
@@ -142,6 +148,7 @@ pub async fn build(
                 descriptors: Vec::new(),
                 shell: Vec::new(),
                 cache_key: next_key("", &["scratch"]),
+                tree: None,
             }
         } else if let Some(prev) = find_stage(&completed_stages, &base_ref) {
             layer::copy_tree(&prev.root, &stage_root)?;
@@ -153,6 +160,7 @@ pub async fn build(
                 descriptors: prev.descriptors.clone(),
                 shell: prev.shell.clone(),
                 cache_key: prev.cache_key.clone(),
+                tree: None,
             }
         } else {
             println!("Step 0/{}: FROM {base_ref}", stage_def.instructions.len());
@@ -184,6 +192,7 @@ pub async fn build(
                 descriptors: base_img.layer_descriptors.clone(),
                 shell: Vec::new(),
                 cache_key: next_key("", &["from", &base_img.id]),
+                tree: None,
             }
         };
 
@@ -202,6 +211,7 @@ pub async fn build(
                 store,
                 &pin,
                 opts.no_cache,
+                &opts.secrets,
                 runtime,
                 &opts.context_dir,
                 &ignore,
@@ -302,6 +312,7 @@ async fn execute_instruction(
     store: &Arc<Store>,
     pin: &Pin,
     no_cache: bool,
+    secrets: &BTreeMap<String, Vec<u8>>,
     runtime: &JailRuntime,
     context_dir: &Path,
     ignore: &IgnoreMatcher,
@@ -397,16 +408,16 @@ async fn execute_instruction(
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Entrypoint(form) => {
-            stage.config.config.entrypoint = expand_form(form, &stage.shell, vars);
+            stage.config.config.entrypoint = form.to_argv(&stage.shell);
             stage.config.config.cmd.clear();
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Cmd(form) => {
-            stage.config.config.cmd = expand_form(form, &stage.shell, vars);
+            stage.config.config.cmd = form.to_argv(&stage.shell);
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Copy(spec) => {
-            let before = TreeState::capture(&stage.root)?;
+            let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
             apply_copy(
                 context_dir,
                 ignore,
@@ -421,7 +432,7 @@ async fn execute_instruction(
             stage.cache_key = copy_key(stage, &sp.raw);
         }
         Instruction::Add(spec) => {
-            let before = TreeState::capture(&stage.root)?;
+            let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
             apply_copy(
                 context_dir,
                 ignore,
@@ -435,19 +446,10 @@ async fn execute_instruction(
             commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
             stage.cache_key = copy_key(stage, &sp.raw);
         }
-        Instruction::Run(form) => {
-            let argv = match form {
-                CommandForm::Shell(s) => {
-                    let mut sh = if stage.shell.is_empty() {
-                        vec!["/bin/sh".to_owned(), "-c".to_owned()]
-                    } else {
-                        stage.shell.clone()
-                    };
-                    sh.push(s.clone());
-                    sh
-                }
-                CommandForm::Exec(v) => v.iter().map(|a| expand_vars(a, vars)).collect(),
-            };
+        Instruction::Run(form, run_opts) => {
+            // As in Docker, `$VAR` in RUN, CMD and ENTRYPOINT is left to the
+            // shell: build args and ENV reach it through the environment.
+            let argv = form.to_argv(&stage.shell);
             let mut run_env = stage.config.config.env.clone();
             for (k, v) in vars {
                 if !run_env
@@ -457,6 +459,16 @@ async fn execute_instruction(
                     run_env.push(format!("{k}={v}"));
                 }
             }
+            let mounts = RunMounts::prepare(
+                store,
+                context_dir,
+                completed_stages,
+                secrets,
+                tmp_dir,
+                step_no,
+                run_opts,
+                sp.line,
+            )?;
             let key = next_key(
                 &stage.cache_key,
                 &[
@@ -465,6 +477,7 @@ async fn execute_instruction(
                     &serde_json::to_string(&run_env)?,
                     &stage.config.config.user,
                     &stage.config.config.working_dir,
+                    &mounts.key,
                 ],
             );
             let cached = if no_cache {
@@ -478,7 +491,7 @@ async fn execute_instruction(
                     record_history(&mut stage.config, &sp.raw, step.layer.is_none());
                 }
                 _ => {
-                    let before = TreeState::capture(&stage.root)?;
+                    let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
                     runtime
                         .run_build_step(
                             &stage.root,
@@ -486,8 +499,11 @@ async fn execute_instruction(
                             &run_env,
                             &stage.config.config.user,
                             &stage.config.config.working_dir,
+                            &mounts.mounts,
+                            run_opts.no_network,
                         )
                         .await?;
+                    drop(mounts);
                     let layer =
                         commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
                     store.record_step(&key, &CachedStep { layer })?;
@@ -496,6 +512,183 @@ async fn execute_instruction(
             stage.cache_key = key;
         }
     }
+    Ok(())
+}
+
+/// A `RUN` step's mounts, resolved to host paths, and what about them
+/// belongs in the step's cache key. Temporary copies are removed on drop.
+struct RunMounts {
+    mounts: Vec<BuildMount>,
+    key: String,
+    temp: Vec<PathBuf>,
+}
+
+impl RunMounts {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        store: &Store,
+        context_dir: &Path,
+        completed_stages: &[BuiltStage],
+        secrets: &BTreeMap<String, Vec<u8>>,
+        tmp_dir: &Path,
+        step_no: usize,
+        opts: &RunOptions,
+        line: usize,
+    ) -> Result<Self, Error> {
+        let mut out = RunMounts {
+            mounts: Vec::new(),
+            key: if opts.no_network {
+                "network=none".to_owned()
+            } else {
+                String::new()
+            },
+            temp: Vec::new(),
+        };
+        for (i, m) in opts.mounts.iter().enumerate() {
+            let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
+            match m {
+                RunMount::Cache {
+                    id,
+                    target,
+                    read_only,
+                    mode,
+                    uid,
+                    gid,
+                } => {
+                    let dir = store.dir().join("run-cache").join(next_key("", &[id]));
+                    if !dir.exists() {
+                        std::fs::create_dir_all(&dir)?;
+                        set_owner_mode(&dir, *uid, *gid, *mode)?;
+                    }
+                    out.key.push_str(&format!("\0cache {id} {target}"));
+                    out.mounts.push(BuildMount::Nullfs {
+                        source: dir,
+                        target: target.clone(),
+                        read_only: *read_only,
+                    });
+                }
+                RunMount::Bind {
+                    from,
+                    source,
+                    target,
+                    rw,
+                } => {
+                    let (root, origin) = match from {
+                        None => (context_dir, "context".to_owned()),
+                        Some(name) => {
+                            let st = find_stage(completed_stages, name).ok_or_else(|| {
+                                Error::Build(format!(
+                                    "line {line}: --mount from={name}: no earlier stage of that name"
+                                ))
+                            })?;
+                            (st.root.as_path(), st.cache_key.clone())
+                        }
+                    };
+                    let src = safe_join_in_root(root, source.trim_start_matches('/'))
+                        .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
+                    if std::fs::symlink_metadata(&src).is_err() {
+                        return Err(Error::Build(format!(
+                            "line {line}: --mount source {source:?} not found"
+                        )));
+                    }
+                    // A stage is named by its key; context files by their contents.
+                    let contents = if from.is_some() {
+                        origin
+                    } else {
+                        content_digest(&src)?
+                    };
+                    out.key
+                        .push_str(&format!("\0bind {source} {target} {rw} {contents}"));
+                    let mount_src = if *rw {
+                        if src.is_dir() {
+                            layer::copy_tree(&src, &scratch)?;
+                        } else {
+                            std::fs::copy(&src, &scratch)?;
+                        }
+                        out.temp.push(scratch);
+                        out.temp.last().cloned().unwrap()
+                    } else {
+                        src
+                    };
+                    out.mounts.push(BuildMount::Nullfs {
+                        source: mount_src,
+                        target: target.clone(),
+                        read_only: !rw,
+                    });
+                }
+                RunMount::Secret {
+                    id,
+                    target,
+                    required,
+                    mode,
+                    uid,
+                    gid,
+                } => {
+                    let Some(value) = secrets.get(id) else {
+                        if *required {
+                            return Err(Error::Build(format!(
+                                "line {line}: secret {id:?} is required: give `--secret id={id},src=<file>`"
+                            )));
+                        }
+                        continue;
+                    };
+                    std::fs::write(&scratch, value)?;
+                    out.temp.push(scratch.clone());
+                    set_owner_mode(&scratch, *uid, *gid, *mode)?;
+                    out.key.push_str(&format!("\0secret {id} {target}"));
+                    out.mounts.push(BuildMount::Nullfs {
+                        source: scratch,
+                        target: target.clone(),
+                        read_only: true,
+                    });
+                }
+                RunMount::Tmpfs { target, size } => {
+                    out.key.push_str(&format!("\0tmpfs {target}"));
+                    out.mounts.push(BuildMount::Tmpfs {
+                        target: target.clone(),
+                        size: *size,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for RunMounts {
+    fn drop(&mut self) {
+        for p in &self.temp {
+            let _ = layer::remove_tree(p);
+        }
+    }
+}
+
+/// A digest of a file's or directory tree's contents and modes.
+fn content_digest(path: &Path) -> Result<String, Error> {
+    if !path.is_dir() {
+        return Ok(sha256(&std::fs::read(path)?));
+    }
+    let state = TreeState::capture(path)?;
+    let mut text = String::new();
+    for (p, e) in &state.entries {
+        text.push_str(&format!(
+            "{p}\0{:?}\0{:o}\0{}\n",
+            e.kind, e.mode, e.digest_or_link
+        ));
+    }
+    Ok(sha256(text.as_bytes()))
+}
+
+#[cfg(unix)]
+fn set_owner_mode(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_mode(_: &Path, _: u32, _: u32, _: u32) -> Result<(), Error> {
     Ok(())
 }
 
@@ -510,7 +703,9 @@ fn commit_step_diff(
 ) -> Result<Option<CachedLayer>, Error> {
     let tar_out = tmp_dir.join(format!("step-{}-{step_no}.tar", stage.layers.len()));
     let gz_out = tmp_dir.join(format!("step-{}-{step_no}.tar.gz", stage.layers.len()));
-    match layer::create_diff_layer(before, &stage.root, &tar_out, &gz_out)? {
+    let (diff, after) = layer::create_diff_layer(before, &stage.root, &tar_out, &gz_out)?;
+    stage.tree = Some(after);
+    match diff {
         Some(art) => {
             let parent_hex = stage.layers.last().cloned();
             stage.config.rootfs.diff_ids.push(art.diff_id.clone());
@@ -842,17 +1037,6 @@ fn apply_perms(
     }
     let _ = (path, chown_ids, chmod);
     Ok(())
-}
-
-fn expand_form(
-    form: &CommandForm,
-    shell: &[String],
-    vars: &BTreeMap<String, String>,
-) -> Vec<String> {
-    match form {
-        CommandForm::Exec(v) => v.iter().map(|s| expand_vars(s, vars)).collect(),
-        CommandForm::Shell(_) => form.to_argv(shell),
-    }
 }
 
 fn set_env(env: &mut Vec<String>, key: &str, value: &str) {

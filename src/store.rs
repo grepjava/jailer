@@ -730,6 +730,91 @@ impl Store {
                 "{target_ref} is a localhost reference; give a registry destination (e.g. ghcr.io/me/app:tag)"
             )));
         }
+        let (manifest, _) = self.push_blobs(image_ref, target_ref, creds).await?;
+        self.client
+            .push_manifest(target_ref, &manifest, creds)
+            .await
+    }
+
+    /// Pushes an image index to `target` naming one image per platform.
+    /// Each source is a local image, pushed by digest into the target's
+    /// repository, or an image or index already in that repository.
+    pub async fn push_index(
+        &self,
+        target: &Reference,
+        sources: &[String],
+        creds: Option<&Credentials>,
+    ) -> Result<String, Error> {
+        if target.is_local() {
+            return Err(Error::Reference(format!(
+                "{target} is a localhost reference; give a registry destination (e.g. ghcr.io/me/app:tag)"
+            )));
+        }
+        let mut entries: Vec<Descriptor> = Vec::new();
+        for src in sources {
+            let found = if self.get(src)?.is_some() {
+                let (manifest, platform) = self.push_blobs(src, target, creds).await?;
+                let bytes = serde_json::to_vec_pretty(&manifest)?;
+                let by_digest = Reference {
+                    tag: None,
+                    digest: Some(sha256(&bytes)),
+                    ..target.clone()
+                };
+                let digest = self
+                    .client
+                    .push_manifest(&by_digest, &manifest, creds)
+                    .await?;
+                vec![Descriptor {
+                    media_type: OCI_MANIFEST.to_owned(),
+                    digest,
+                    size: bytes.len() as u64,
+                    platform: Some(platform),
+                    annotations: BTreeMap::new(),
+                }]
+            } else {
+                let r = Reference::parse(src)?;
+                if r.registry != target.registry || r.repository != target.repository {
+                    return Err(Error::Reference(format!(
+                        "{src} is neither a local image nor in {}/{}: push it there first",
+                        target.registry, target.repository
+                    )));
+                }
+                self.client.describe(&r, creds).await?
+            };
+            for d in found {
+                let p = d.platform.as_ref().ok_or_else(|| {
+                    Error::Unsupported(format!("{src}: an index entry without a platform"))
+                })?;
+                if entries.iter().any(|e| e.platform == d.platform) {
+                    return Err(Error::Unsupported(format!(
+                        "two images for {}/{}: give one per platform",
+                        p.os, p.architecture
+                    )));
+                }
+                entries.push(d);
+            }
+        }
+        let index = Document {
+            schema_version: 2,
+            media_type: OCI_INDEX.to_owned(),
+            manifests: Some(entries),
+            config: None,
+            layers: Vec::new(),
+            annotations: BTreeMap::new(),
+        };
+        self.client
+            .push_document(target, serde_json::to_vec_pretty(&index)?, OCI_INDEX, creds)
+            .await
+    }
+
+    /// Uploads `image_ref`'s layer and config blobs to `target_ref`'s
+    /// repository, returning its manifest and platform.
+    async fn push_blobs(
+        &self,
+        image_ref: &str,
+        target_ref: &Reference,
+        creds: Option<&Credentials>,
+    ) -> Result<(Manifest, Platform), Error> {
         let mut image = self
             .get(image_ref)?
             .ok_or_else(|| Error::NotFound(format!("{image_ref}: image not found")))?;
@@ -751,12 +836,19 @@ impl Store {
         self.client
             .push_blob(target_ref, &manifest.config.digest, &config_blob, creds)
             .await?;
-
-        let digest = self
-            .client
-            .push_manifest(target_ref, &manifest, creds)
-            .await?;
-        Ok(digest)
+        let platform = Platform {
+            architecture: if image.config.architecture.is_empty() {
+                oci::arch().to_owned()
+            } else {
+                image.config.architecture.clone()
+            },
+            os: if image.config.os.is_empty() {
+                "freebsd".to_owned()
+            } else {
+                image.config.os.clone()
+            },
+        };
+        Ok((manifest, platform))
     }
 
     /// Ensures all layer blobs and the config blob for `image` exist in
@@ -1020,9 +1112,59 @@ impl Store {
         Ok(found)
     }
 
+    /// Removes build cache entries whose layer is gone (all of them with
+    /// `all_cache`), then the layers and blobs no image or cache entry
+    /// uses. Returns the number of layers removed.
+    pub async fn prune(&self, all_cache: bool) -> Result<usize, Error> {
+        let _held = self.hold().await?;
+        let cache_dir = self.dir.join("cache");
+        if cache_dir.exists() {
+            for e in std::fs::read_dir(&cache_dir)? {
+                let path = e?.path();
+                let keep = !all_cache
+                    && std::fs::read(&path)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<CachedStep>(&b).ok())
+                        .is_some_and(|c| match &c.layer {
+                            Some(l) => self.has_layer(&l.chain).unwrap_or(false),
+                            None => true,
+                        });
+                if !keep {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+        let images = self.images()?;
+        Ok(self.prune_held(&images).await?.len())
+    }
+
+    /// Layers and blobs the build cache names.
+    fn cached_names(&self) -> Result<BTreeSet<String>, Error> {
+        let mut names = BTreeSet::new();
+        let dir = self.dir.join("cache");
+        if !dir.exists() {
+            return Ok(names);
+        }
+        for e in std::fs::read_dir(&dir)? {
+            let Ok(bytes) = std::fs::read(e?.path()) else {
+                continue;
+            };
+            if let Ok(CachedStep { layer: Some(l) }) = serde_json::from_slice(&bytes) {
+                names.extend(hex_of(&l.descriptor.digest).map(str::to_owned));
+                names.insert(l.chain);
+            }
+        }
+        Ok(names)
+    }
+
     async fn prune_held(&self, images: &[Image]) -> Result<Vec<String>, Error> {
-        self.prune_blobs(images)?;
-        let used: BTreeSet<String> = images.iter().flat_map(|i| i.layers.clone()).collect();
+        let cached = self.cached_names()?;
+        self.prune_blobs(images, &cached)?;
+        let used: BTreeSet<String> = images
+            .iter()
+            .flat_map(|i| i.layers.clone())
+            .chain(cached)
+            .collect();
         match &self.mode {
             StorageMode::Zfs(root) => {
                 let sys = self.sys.clone();
@@ -1075,9 +1217,9 @@ impl Store {
     }
 
     /// Removes cached blobs that no remaining image's manifest, config or
-    /// layer descriptors name.
-    fn prune_blobs(&self, images: &[Image]) -> Result<(), Error> {
-        let mut used = BTreeSet::new();
+    /// layer descriptors name, nor the build cache.
+    fn prune_blobs(&self, images: &[Image], cached: &BTreeSet<String>) -> Result<(), Error> {
+        let mut used = cached.clone();
         for i in images {
             for d in [&i.id, &i.digest]
                 .into_iter()

@@ -266,6 +266,7 @@ CMD ["--serve"]
             creds: None,
             strict_lint: true,
             no_cache: false,
+            secrets: BTreeMap::new(),
         },
     )
     .await
@@ -338,4 +339,135 @@ CMD ["--serve"]
     drop(pin);
     assert!(!store.remove("demo:1.0").await.unwrap());
     assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn manifest_push_publishes_one_image_per_platform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(ctx.join("bin")).unwrap();
+    std::fs::write(ctx.join("bin/app"), "#!/bin/sh\n").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM scratch\nCOPY bin/app /app\nENTRYPOINT [\"/app\"]\n",
+    )
+    .unwrap();
+
+    let (addr, _) = start_mock_registry().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+    let creds = Credentials {
+        username: "me".to_owned(),
+        password: "secret".to_owned(),
+    };
+    let open = |dir: &str| {
+        let sys = Arc::new(FakeSys::new(false));
+        let client = Client::new().unwrap().plain_http(&host);
+        let store =
+            Arc::new(Store::open(sys.clone(), None, &tmp.path().join(dir), client).unwrap());
+        let runtime = JailRuntime::new(
+            sys,
+            store.clone(),
+            RuntimeConfig {
+                state_dir: tmp.path().join(format!("{dir}-containers")),
+                dataset: None,
+                shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            },
+        )
+        .unwrap();
+        (store, runtime)
+    };
+
+    // A build for this host, and the same image marked as the other architecture
+    let (store, runtime) = open("store");
+    let native = build(
+        &store,
+        &runtime,
+        &BuildOptions {
+            context_dir: ctx.clone(),
+            containerfile: None,
+            tag: "app:native".to_owned(),
+            build_args: BTreeMap::new(),
+            target: None,
+            backend: BuildBackend::Native,
+            creds: None,
+            strict_lint: false,
+            no_cache: false,
+            secrets: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap()
+    .image;
+    let other_arch = if jailer::oci::arch() == "amd64" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let mut config = native.config.clone();
+    config.architecture = other_arch.to_owned();
+    let pin = store.pin().unwrap();
+    let other = store
+        .register_built_image(
+            &pin,
+            &Reference::parse_local_tag("app:other").unwrap(),
+            config,
+            native.layers.clone(),
+            native.layer_descriptors.clone(),
+        )
+        .await
+        .unwrap();
+    drop(pin);
+
+    // Two local images
+    let target = Reference::parse(&format!("{host}/me/app:1.0")).unwrap();
+    let sources = ["app:native".to_owned(), "app:other".to_owned()];
+    let index_digest = store
+        .push_index(&target, &sources, Some(&creds))
+        .await
+        .unwrap();
+    let (digest, doc) = store
+        .client()
+        .document(&target, "1.0", Some(&creds))
+        .await
+        .unwrap();
+    assert_eq!(digest, index_digest);
+    let archs: Vec<_> = doc
+        .manifests
+        .unwrap()
+        .iter()
+        .map(|d| d.platform.clone().unwrap().architecture)
+        .collect();
+    assert_eq!(archs, [jailer::oci::arch(), other_arch]);
+
+    // A local image and one already in the repository
+    let other_tag = Reference::parse(&format!("{host}/me/app:other")).unwrap();
+    store
+        .push("app:other", &other_tag, Some(&creds))
+        .await
+        .unwrap();
+    let mixed = Reference::parse(&format!("{host}/me/app:mixed")).unwrap();
+    let sources = ["app:native".to_owned(), other_tag.to_string()];
+    store
+        .push_index(&mixed, &sources, Some(&creds))
+        .await
+        .unwrap();
+
+    // One image per platform
+    let dup = ["app:native".to_owned(), "app:native".to_owned()];
+    let err = store
+        .push_index(&mixed, &dup, Some(&creds))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("two images for"), "{err}");
+
+    // A node pulls the entry for its own architecture
+    let (fresh, _) = open("fresh");
+    for r in [&target, &mixed] {
+        let pulled = fresh
+            .pull(&r.to_string(), Some(&creds), "me")
+            .await
+            .unwrap();
+        assert_eq!(pulled.id, native.id);
+        assert_ne!(pulled.id, other.id);
+    }
 }

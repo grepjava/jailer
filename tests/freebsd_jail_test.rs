@@ -212,3 +212,84 @@ CMD ["default-arg"]
         String::from_utf8_lossy(&check_out.stderr)
     );
 }
+
+#[test]
+fn run_mounts_reach_the_step_but_not_the_image() {
+    if !is_root() {
+        eprintln!("skipping run_mounts_reach_the_step_but_not_the_image (requires root)");
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(ctx.join("data")).unwrap();
+    std::fs::write(ctx.join("data/a.txt"), "original\n").unwrap();
+    std::fs::write(ctx.join("tok.txt"), "s3cr3t-value").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        r#"FROM docker.io/freebsd/freebsd-runtime:15.1
+RUN --mount=type=cache,target=/var/cache/thing sh -c 'echo run >> /var/cache/thing/log; n=0; while read l; do n=$((n+1)); done < /var/cache/thing/log; echo $n > /count'
+RUN --mount=type=bind,source=data,target=/data,rw sh -c 'cat /data/a.txt > /bound; echo scribble > /data/a.txt'
+RUN --mount=type=secret,id=tok sh -c 'v=$(cat /run/secrets/tok); echo ${#v} > /secretlen'
+RUN --mount=type=tmpfs,target=/scratch sh -c 'df -t tmpfs /scratch >/dev/null && echo yes > /tmpfs'
+RUN --network=none sh -c 'ifconfig -l > /ifs'
+CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
+"#,
+    )
+    .unwrap();
+
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .current_dir(&ctx)
+            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    let build = [
+        "build",
+        "--no-cache",
+        "--secret",
+        "id=tok,src=tok.txt",
+        "-t",
+        "m:1",
+        ".",
+    ];
+    jailer(&build);
+    assert_eq!(
+        jailer(&["run", "m:1"]),
+        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0"
+    );
+    // The cache mount keeps its contents; the rw bind left the context alone.
+    jailer(&build);
+    assert!(jailer(&["run", "m:1"]).starts_with("count=2 "));
+    assert_eq!(
+        std::fs::read_to_string(ctx.join("data/a.txt")).unwrap(),
+        "original\n"
+    );
+    // The secret's value is in no layer.
+    jailer(&["export", "m:1", tmp.path().join("m.tar").to_str().unwrap()]);
+    let layers = Command::new("sh")
+        .arg("-c")
+        .arg("mkdir x && tar xf m.tar -C x && for l in x/blobs/sha256/*; do tar xzf $l -O 2>/dev/null; done")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(!String::from_utf8_lossy(&layers).contains("s3cr3t-value"));
+}

@@ -101,6 +101,10 @@ pub enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// A secret for `RUN --mount=type=secret`: id=ID,src=FILE or id=ID,env=VAR
+        #[arg(long = "secret", value_name = "id=ID,src=FILE")]
+        secrets: Vec<String>,
+
         /// Registry credentials for pulling base images (USER[:PASSWORD])
         #[arg(long, value_name = "USER[:PASSWORD]")]
         creds: Option<String>,
@@ -200,6 +204,10 @@ pub enum Commands {
         refs: Vec<String>,
     },
 
+    /// Publish or inspect multi-architecture image indexes
+    #[command(subcommand)]
+    Manifest(ManifestCommand),
+
     /// Produce an offline OCI archive (`app.tar`) for `legion image load`
     Export {
         /// Output tar archive path
@@ -277,6 +285,13 @@ pub enum Commands {
         reference: String,
     },
 
+    /// Remove layers and blobs no image or build cache entry uses
+    Prune {
+        /// Also clear the build cache
+        #[arg(long)]
+        cache: bool,
+    },
+
     /// List local containers
     Ps {
         /// Show all containers (default shows just running)
@@ -341,6 +356,30 @@ pub enum Commands {
     },
 }
 
+/// Reads `--secret id=ID,src=FILE` and `--secret id=ID,env=VAR` values.
+fn parse_secrets(specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for spec in specs {
+        let kv: BTreeMap<&str, &str> = spec.split(',').filter_map(|p| p.split_once('=')).collect();
+        let id = kv
+            .get("id")
+            .with_context(|| format!("--secret {spec:?}: give id=ID"))?;
+        let value = match (kv.get("src").or(kv.get("source")), kv.get("env")) {
+            (Some(path), None) => {
+                std::fs::read(path).with_context(|| format!("--secret {id}: reading {path}"))?
+            }
+            (None, Some(var)) => std::env::var(var)
+                .with_context(|| format!("--secret {id}: ${var} is not set"))?
+                .into_bytes(),
+            _ => bail!("--secret {spec:?}: give one of src=FILE or env=VAR"),
+        };
+        if out.insert((*id).to_owned(), value).is_some() {
+            bail!("--secret {id} given twice");
+        }
+    }
+    Ok(out)
+}
+
 /// Jails can only be created or entered by root; fail before pulling anything.
 fn require_root(what: &str) -> Result<()> {
     #[cfg(unix)]
@@ -350,6 +389,42 @@ fn require_root(what: &str) -> Result<()> {
     #[cfg(not(unix))]
     let _ = what;
     Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ManifestCommand {
+    /// Push an index naming one image per platform, e.g. an amd64 and an
+    /// arm64 build of the same app
+    Push {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Registry reference to push the index to (e.g. ghcr.io/me/app:1.0)
+        target: String,
+
+        /// Local images, or images already pushed to the target's repository
+        #[arg(required = true)]
+        sources: Vec<String>,
+    },
+
+    /// Print the manifest or index a registry holds for a reference
+    Inspect {
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Image reference
+        reference: String,
+    },
 }
 
 fn default_state_dir() -> PathBuf {
@@ -489,6 +564,7 @@ async fn main() -> Result<()> {
             backend,
             strict,
             no_cache,
+            secrets,
             creds,
             authfile,
             context,
@@ -523,6 +599,7 @@ async fn main() -> Result<()> {
                     creds: resolved_creds,
                     strict_lint: *strict,
                     no_cache: *no_cache,
+                    secrets: parse_secrets(secrets)?,
                 },
             )
             .await?;
@@ -667,6 +744,41 @@ async fn main() -> Result<()> {
                 .push(&source_image, &target_ref, resolved_creds.as_ref())
                 .await?;
             println!("Pushed {} ({digest})", target_ref);
+            Ok(())
+        }
+
+        Commands::Manifest(ManifestCommand::Push {
+            creds,
+            authfile,
+            target,
+            sources,
+        }) => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let target_ref = Reference::parse(target)?;
+            let resolved_creds =
+                resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            let digest = store
+                .push_index(&target_ref, sources, resolved_creds.as_ref())
+                .await?;
+            println!("Pushed {target_ref} ({digest})");
+            Ok(())
+        }
+
+        Commands::Manifest(ManifestCommand::Inspect {
+            creds,
+            authfile,
+            reference,
+        }) => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let resolved_creds =
+                resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let (digest, doc) = store
+                .client()
+                .document(&r, r.target(), resolved_creds.as_ref())
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            eprintln!("{digest}");
             Ok(())
         }
 
@@ -847,6 +959,13 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+
+        Commands::Prune { cache } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let n = store.prune(*cache).await?;
+            println!("Removed {n} layer(s)");
             Ok(())
         }
 

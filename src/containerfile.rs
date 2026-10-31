@@ -53,6 +53,59 @@ impl CommandForm {
     }
 }
 
+/// `RUN` flags: `--mount=...` (repeatable) and `--network=...`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    pub mounts: Vec<RunMount>,
+    /// `--network=none` runs the step without network.
+    pub no_network: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMount {
+    /// A directory kept between builds, never part of a layer.
+    Cache {
+        id: String,
+        target: String,
+        read_only: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    /// The build context, or an earlier stage with `from`; read-only unless
+    /// `rw`, whose writes are discarded.
+    Bind {
+        from: Option<String>,
+        source: String,
+        target: String,
+        rw: bool,
+    },
+    /// A file from `build --secret`, never part of a layer.
+    Secret {
+        id: String,
+        target: String,
+        required: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    Tmpfs {
+        target: String,
+        size: Option<u64>,
+    },
+}
+
+impl RunMount {
+    pub fn target(&self) -> &str {
+        match self {
+            RunMount::Cache { target, .. }
+            | RunMount::Bind { target, .. }
+            | RunMount::Secret { target, .. }
+            | RunMount::Tmpfs { target, .. } => target,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopySpec {
     pub from: Option<String>,
@@ -73,7 +126,7 @@ pub enum Instruction {
     User(String),
     Copy(CopySpec),
     Add(CopySpec),
-    Run(CommandForm),
+    Run(CommandForm, RunOptions),
     Cmd(CommandForm),
     Entrypoint(CommandForm),
     Label(Vec<(String, String)>),
@@ -262,7 +315,10 @@ fn parse_instruction(verb: &str, rest: &str, line_no: usize) -> Result<Instructi
         "USER" => Ok(Instruction::User(unquote(rest.trim()))),
         "COPY" => Ok(Instruction::Copy(parse_copy(rest, line_no, true)?)),
         "ADD" => Ok(Instruction::Add(parse_copy(rest, line_no, false)?)),
-        "RUN" => Ok(Instruction::Run(parse_command_form(rest))),
+        "RUN" => {
+            let (opts, command) = parse_run_flags(rest, line_no)?;
+            Ok(Instruction::Run(parse_command_form(command), opts))
+        }
         "CMD" => Ok(Instruction::Cmd(parse_command_form(rest))),
         "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command_form(rest))),
         "EXPOSE" => Ok(Instruction::Expose(tokenize_words(rest))),
@@ -288,6 +344,153 @@ fn parse_instruction(verb: &str, rest: &str, line_no: usize) -> Result<Instructi
             "line {line_no}: unknown Containerfile instruction `{other}`"
         ))),
     }
+}
+
+/// Splits `--mount=...` and `--network=...` off the front of a `RUN`.
+fn parse_run_flags(rest: &str, line_no: usize) -> Result<(RunOptions, &str), Error> {
+    let mut opts = RunOptions::default();
+    let mut rest = rest.trim_start();
+    while rest.starts_with("--") {
+        let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        rest = tail.trim_start();
+        if let Some(spec) = flag.strip_prefix("--mount=") {
+            opts.mounts.push(parse_mount(spec, line_no)?);
+        } else if let Some(net) = flag.strip_prefix("--network=") {
+            opts.no_network = match net {
+                "none" => true,
+                "default" | "host" => false,
+                other => {
+                    return Err(Error::Build(format!(
+                        "line {line_no}: --network={other}: use none, default or host"
+                    )));
+                }
+            };
+        } else {
+            return Err(Error::Build(format!(
+                "line {line_no}: unsupported RUN flag `{flag}`"
+            )));
+        }
+    }
+    if rest.is_empty() {
+        return Err(Error::Build(format!(
+            "line {line_no}: `RUN` needs a command"
+        )));
+    }
+    Ok((opts, rest))
+}
+
+fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
+    let bad = |msg: String| Error::Build(format!("line {line_no}: --mount={spec}: {msg}"));
+    let mut kv: BTreeMap<&str, &str> = BTreeMap::new();
+    for part in spec.split(',').filter(|p| !p.is_empty()) {
+        let (k, v) = part.split_once('=').unwrap_or((part, "true"));
+        let k = match k {
+            "dst" | "destination" => "target",
+            "src" => "source",
+            "readonly" => "ro",
+            "readwrite" => "rw",
+            k => k,
+        };
+        if kv.insert(k, v).is_some() {
+            return Err(bad(format!("`{k}` given twice")));
+        }
+    }
+    let flag = |kv: &BTreeMap<&str, &str>, k: &str| -> Result<bool, Error> {
+        match kv.get(k).copied() {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(v) => Err(bad(format!("`{k}={v}`: give true or false"))),
+        }
+    };
+    let num = |kv: &BTreeMap<&str, &str>, k: &str, radix: u32, def: u32| -> Result<u32, Error> {
+        kv.get(k).map_or(Ok(def), |v| {
+            u32::from_str_radix(v, radix).map_err(|_| bad(format!("`{k}={v}` is not a number")))
+        })
+    };
+    let target = kv.get("target").map(|t| (*t).to_owned());
+    let need_target = || {
+        target
+            .clone()
+            .ok_or_else(|| bad("give target=<path in the container>".to_owned()))
+    };
+    let kind = kv.get("type").copied().unwrap_or("bind");
+    let allowed: &[&str] = match kind {
+        "cache" => &[
+            "type", "target", "id", "ro", "sharing", "mode", "uid", "gid",
+        ],
+        "bind" => &["type", "target", "source", "from", "rw", "ro"],
+        "secret" => &["type", "target", "id", "required", "mode", "uid", "gid"],
+        "tmpfs" => &["type", "target", "size"],
+        other => return Err(bad(format!("type={other} is not supported"))),
+    };
+    if let Some(k) = kv.keys().find(|k| !allowed.contains(k)) {
+        return Err(bad(format!("`{k}` does not apply to type={kind}")));
+    }
+    Ok(match kind {
+        "cache" => {
+            let target = need_target()?;
+            RunMount::Cache {
+                id: kv
+                    .get("id")
+                    .map_or_else(|| target.clone(), |v| (*v).to_owned()),
+                target,
+                read_only: flag(&kv, "ro")?,
+                mode: num(&kv, "mode", 8, 0o755)?,
+                uid: num(&kv, "uid", 10, 0)?,
+                gid: num(&kv, "gid", 10, 0)?,
+            }
+        }
+        "bind" => RunMount::Bind {
+            from: kv.get("from").map(|v| (*v).to_owned()),
+            source: kv
+                .get("source")
+                .map_or_else(|| ".".to_owned(), |v| (*v).to_owned()),
+            target: need_target()?,
+            rw: flag(&kv, "rw")?,
+        },
+        "secret" => {
+            let id = kv
+                .get("id")
+                .map(|v| (*v).to_owned())
+                .or_else(|| {
+                    target
+                        .as_deref()
+                        .and_then(|t| t.rsplit('/').next())
+                        .map(str::to_owned)
+                })
+                .ok_or_else(|| bad("give id=<secret id>".to_owned()))?;
+            RunMount::Secret {
+                target: target
+                    .clone()
+                    .unwrap_or_else(|| format!("/run/secrets/{id}")),
+                id,
+                required: flag(&kv, "required")?,
+                mode: num(&kv, "mode", 8, 0o400)?,
+                uid: num(&kv, "uid", 10, 0)?,
+                gid: num(&kv, "gid", 10, 0)?,
+            }
+        }
+        _ => RunMount::Tmpfs {
+            target: need_target()?,
+            size: kv
+                .get("size")
+                .map(|v| parse_size(v).ok_or_else(|| bad(format!("size={v}"))))
+                .transpose()?,
+        },
+    })
+}
+
+/// `1024`, `64k`, `512m`, `2g` (optionally with a trailing `b`) in bytes.
+fn parse_size(v: &str) -> Option<u64> {
+    let lower = v.to_ascii_lowercase();
+    let s = lower.strip_suffix('b').unwrap_or(&lower);
+    let (num, mult) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1u64 << 10),
+        'm' => (&s[..s.len() - 1], 1 << 20),
+        'g' => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 fn parse_command_form(rest: &str) -> CommandForm {
@@ -624,6 +827,70 @@ CMD ["--serve"]
         assert!(ig.is_ignored("build.log"));
         assert!(!ig.is_ignored("keep.log"));
         assert!(!ig.is_ignored("src/main.rs"));
+    }
+
+    #[test]
+    fn run_flags() {
+        let parse = |s: &str| parse_instruction("RUN", s, 1);
+        let Instruction::Run(CommandForm::Shell(cmd), opts) = parse(
+            "--mount=type=cache,target=/var/cache/pkg --mount=type=secret,id=tok \
+             --mount=type=bind,from=builder,source=/out,target=/in,rw \
+             --mount=type=tmpfs,dst=/scratch,size=64m --network=none pkg install -y curl",
+        )
+        .unwrap() else {
+            panic!("not a shell-form RUN")
+        };
+        assert_eq!(cmd, "pkg install -y curl");
+        assert!(opts.no_network);
+        assert_eq!(
+            opts.mounts,
+            [
+                RunMount::Cache {
+                    id: "/var/cache/pkg".to_owned(),
+                    target: "/var/cache/pkg".to_owned(),
+                    read_only: false,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+                RunMount::Secret {
+                    id: "tok".to_owned(),
+                    target: "/run/secrets/tok".to_owned(),
+                    required: false,
+                    mode: 0o400,
+                    uid: 0,
+                    gid: 0,
+                },
+                RunMount::Bind {
+                    from: Some("builder".to_owned()),
+                    source: "/out".to_owned(),
+                    target: "/in".to_owned(),
+                    rw: true,
+                },
+                RunMount::Tmpfs {
+                    target: "/scratch".to_owned(),
+                    size: Some(64 << 20),
+                },
+            ]
+        );
+        let Instruction::Run(CommandForm::Exec(argv), _) =
+            parse("--network=host [\"/bin/echo\", \"hi\"]").unwrap()
+        else {
+            panic!("not an exec-form RUN")
+        };
+        assert_eq!(argv, ["/bin/echo", "hi"]);
+
+        for bad in [
+            "--mount=type=cache echo",
+            "--mount=type=ssh,target=/x echo",
+            "--mount=type=tmpfs,target=/x,from=a echo",
+            "--mount=type=cache,target=/x,ro=maybe echo",
+            "--network=bridge echo",
+            "--privileged echo",
+            "--mount=type=tmpfs,target=/x",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

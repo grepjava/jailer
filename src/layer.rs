@@ -311,23 +311,68 @@ pub enum EntryKind {
 #[derive(Debug, Clone, Default)]
 pub struct TreeState {
     pub entries: BTreeMap<String, EntryMeta>,
+    /// Each file's stat fingerprint when it was hashed.
+    stamps: BTreeMap<String, Stamp>,
+}
+
+/// What changes whenever a file's contents could have: a write updates
+/// ctime, which programs cannot set back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    ino: u64,
+}
+
+impl Stamp {
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            ino: meta.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
 }
 
 impl TreeState {
     /// Captures the state of all files, directories, and symlinks under `root`.
     pub fn capture(root: &Path) -> Result<Self, Error> {
-        let mut entries = BTreeMap::new();
+        Self::capture_from(root, None)
+    }
+
+    /// Like `capture`, but reuses `prev`'s digest for files whose stat
+    /// fingerprint has not changed since `prev` was taken of the same tree.
+    pub fn capture_from(root: &Path, prev: Option<&TreeState>) -> Result<Self, Error> {
+        let mut state = Self::default();
+        // A file changed within a second of this capture could change again
+        // without its stamp changing on a filesystem with coarse timestamps,
+        // so its stamp is not kept and it is hashed again next time.
+        let racy_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+            - 1;
         if root.exists() {
-            walk_capture(root, root, &mut entries)?;
+            walk_capture(root, root, prev, racy_after, &mut state)?;
         }
-        Ok(Self { entries })
+        Ok(state)
     }
 }
 
 fn walk_capture(
     root: &Path,
     dir: &Path,
-    out: &mut BTreeMap<String, EntryMeta>,
+    prev: Option<&TreeState>,
+    racy_after: i64,
+    out: &mut TreeState,
 ) -> Result<(), Error> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(|e| e.file_name());
@@ -347,7 +392,7 @@ fn walk_capture(
             let link = std::fs::read_link(&full)?
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.insert(
+            out.entries.insert(
                 rel_str,
                 EntryMeta {
                     kind: EntryKind::Symlink,
@@ -359,7 +404,7 @@ fn walk_capture(
                 },
             );
         } else if meta.is_dir() {
-            out.insert(
+            out.entries.insert(
                 rel_str,
                 EntryMeta {
                     kind: EntryKind::Dir,
@@ -370,10 +415,24 @@ fn walk_capture(
                     digest_or_link: String::new(),
                 },
             );
-            walk_capture(root, &full, out)?;
+            walk_capture(root, &full, prev, racy_after, out)?;
         } else if meta.is_file() {
-            let digest = file_sha256(&full)?;
-            out.insert(
+            let stamp = Stamp::of(&meta);
+            let reused = prev.and_then(|p| {
+                let same = stamp.is_some() && p.stamps.get(&rel_str) == stamp.as_ref();
+                same.then(|| p.entries.get(&rel_str))
+                    .flatten()
+                    .filter(|e| e.kind == EntryKind::File)
+                    .map(|e| e.digest_or_link.clone())
+            });
+            let digest = match reused {
+                Some(d) => d,
+                None => file_sha256(&full)?,
+            };
+            if let Some(stamp) = stamp.filter(|s| s.ctime.0 < racy_after) {
+                out.stamps.insert(rel_str.clone(), stamp);
+            }
+            out.entries.insert(
                 rel_str,
                 EntryMeta {
                     kind: EntryKind::File,
@@ -437,14 +496,15 @@ fn normalize_rel(p: &Path) -> String {
 
 /// Computes the filesystem difference between `before` and the current
 /// `after_root`, writes an uncompressed tar to `tar_out` and a gzip-compressed
-/// blob to `gz_out`, and returns the layer digests (`None` if nothing changed).
+/// blob to `gz_out`, and returns the layer digests (`None` if nothing changed)
+/// with the state of `after_root`, to start the next step's diff from.
 pub fn create_diff_layer(
     before: &TreeState,
     after_root: &Path,
     tar_out: &Path,
     gz_out: &Path,
-) -> Result<Option<LayerArtifact>, Error> {
-    let after = TreeState::capture(after_root)?;
+) -> Result<(Option<LayerArtifact>, TreeState), Error> {
+    let after = TreeState::capture_from(after_root, Some(before))?;
     let mut deleted: Vec<String> = Vec::new();
     for old_path in before.entries.keys() {
         if !after.entries.contains_key(old_path) {
@@ -468,7 +528,7 @@ pub fn create_diff_layer(
     }
 
     if deleted.is_empty() && changed.is_empty() {
-        return Ok(None);
+        return Ok((None, after));
     }
 
     // Ensure parent directories of changed or deleted entries are included
@@ -530,7 +590,8 @@ pub fn create_diff_layer(
         builder.finish()?;
     }
 
-    compress_and_hash_tar(tar_out, gz_out).map(Some)
+    let art = compress_and_hash_tar(tar_out, gz_out)?;
+    Ok((Some(art), after))
 }
 
 /// Packs an entire root directory `root` into an OCI layer (`tar_out` and
@@ -655,6 +716,7 @@ mod tests {
         let gz_out = t.path().join("layer.tar.gz");
         let art = create_diff_layer(&before, &root, &tar_out, &gz_out)
             .unwrap()
+            .0
             .expect("changes present");
 
         // Verify decompression matches diff_id
@@ -677,5 +739,26 @@ mod tests {
             std::fs::read_to_string(target.join("usr/local/bin/app")).unwrap(),
             "#!/bin/sh\necho hi\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_from_rehashes_a_rewrite_of_the_same_size() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("f"), "aaaa").unwrap();
+        std::fs::write(t.path().join("g"), "keep").unwrap();
+        // Past the racy window, so the stamps are kept.
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let first = TreeState::capture(t.path()).unwrap();
+        assert!(first.stamps.contains_key("f"));
+
+        std::fs::write(t.path().join("f"), "bbbb").unwrap();
+        let second = TreeState::capture_from(t.path(), Some(&first)).unwrap();
+        let fresh = TreeState::capture(t.path()).unwrap();
+        assert_ne!(second.entries["f"], first.entries["f"]);
+        assert_eq!(second.entries, fresh.entries);
+        // The rewritten file is racy now; the untouched one keeps its stamp.
+        assert!(!second.stamps.contains_key("f"));
+        assert!(second.stamps.contains_key("g"));
     }
 }

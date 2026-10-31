@@ -16,7 +16,7 @@ jailer export app.tar       # Produce an offline OCI archive
 
 Legion pulls OCI images, stores their layers on ZFS, and runs containers as jails, intentionally leaving image building out of the cluster daemon. `jailer` fills the local development and CI workflow while matching Legion's exact runtime semantics:
 
-- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from`, `--chown`, `--chmod`, `.containerignore`), OCI layer differ (with `.wh.` whiteouts and FreeBSD file flags), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
+- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from`, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret and tmpfs mounts, `RUN --network=none`, `.containerignore`, and a build cache), OCI layer differ (with `.wh.` whiteouts and FreeBSD file flags), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
 - **Local testing aligned with Legion's runtime:** `jailer run` executes images using the same jail setup as `legion-jail`:
   - ZFS snapshot/clone layers (`<dataset>/<chain>@layer`) with an automatic plain-directory fallback when ZFS is unavailable.
   - `/etc/passwd` and `/etc/group` user & supplementary group resolution inside the jail.
@@ -39,9 +39,12 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
 | `jailer push [source-image] <registry/repo:tag>` | Push an image to an OCI registry (Docker Hub, GHCR, Harbor, etc.) |
 | `jailer export [image] <output.tar>` | Export an offline OCI archive for `legion image load` |
 | `jailer check [image-or-dir]` | Validate a `Containerfile` and/or built image against Legion's runtime |
+| `jailer manifest push <registry/repo:tag> <source>...` | Publish one name for several architectures (an OCI image index) |
+| `jailer manifest inspect <reference>` | Show the manifest or index a registry holds |
 | `jailer pull <reference>` | Pull an image from an OCI registry into the local store |
 | `jailer load <archive.tar>` | Load an OCI archive into the local store |
 | `jailer images` / `jailer rmi <ref>` | List or remove local images |
+| `jailer prune [--cache]` | Free layers nothing uses; `--cache` also clears the build cache |
 | `jailer ps` / `jailer logs` / `jailer exec` / `jailer stop` / `jailer rm` | Manage detached test containers |
 
 ## Building on FreeBSD

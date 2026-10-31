@@ -5,14 +5,11 @@ people building images for Legion.
 
 ## 1. Must have
 
-- [ ] **Multi-architecture images.** Legion runs on amd64 and aarch64 nodes
-  and picks its architecture from an image index. jailer pushes one
-  architecture per name, so its images run only on matching nodes.
-  Jails share the host kernel, so cross-building is out: build on each
-  architecture, then combine.
-  *Done when* `jailer manifest create <name> <img-amd64> <img-arm64>` and
-  `jailer manifest push <name> <registry/repo:tag>` publish an OCI index
-  that Legion nodes of both architectures pull.
+- [x] **Multi-architecture images.** `jailer manifest push <target>
+  <source>...` publishes an OCI index naming one image per platform, from
+  local images and images already pushed from other architectures' build
+  hosts. Tested against a mock registry; still to try against a real one
+  (GHCR, Docker Hub) and on an arm64 host.
 
 - [ ] **Packaging.** buildah is `pkg install buildah`; jailer has to be
   built from source. Add a port (`sysutils/jailer`) and release binaries
@@ -22,36 +19,31 @@ people building images for Legion.
 
 ## 2. Build speed
 
-- [ ] **Stop rehashing the whole root filesystem on every step.** Each
-  `COPY` and `RUN` hashes every file before and after it runs: a build
-  with 6 s of work takes about 24 s. Skip files whose size, mtime and
-  inode did not change, or use `zfs diff` between snapshots in ZFS mode.
-  *Done when* a step's overhead is under a second on
-  `freebsd-runtime:15.1`.
+- [x] **Stop rehashing the whole root filesystem on every step.** Each
+  step now starts from the previous step's state and hashes only files
+  whose size, mtime, ctime or inode changed. A build with 6 s of work
+  went from 24 s to 6.8 s (release build); a fully cached one takes 0.6 s.
 
-- [ ] **Keep the build cache across `rmi`.** Cached layers live only while
-  some image uses them, so a multi-stage build's builder stage (the
-  expensive `cargo build` or `go build`) is lost at the next `rmi` of
-  anything. Keep the layers that cache entries name, and add
-  `jailer prune [--cache]` with a size limit to reclaim them.
-  *Done when* a Rust project rebuilds its builder stage from cache after
-  an unrelated `rmi`.
+- [x] **Keep the build cache across `rmi`.** Layers the cache names are
+  kept, builder stages included, until `jailer prune --cache`.
+- [ ] **A size limit for the build cache**, evicting least recently used
+  entries, so it need not be cleared by hand.
 
-- [ ] **`RUN --mount=type=cache`.** Lets `pkg`, cargo and npm keep their
-  downloads between builds without putting them in the image. Today
-  `RUN --mount=...` is passed to `/bin/sh` and fails with exit 127.
-  *Done when* `RUN --mount=type=cache,target=/var/cache/pkg pkg install ...`
-  reuses downloads across builds and leaves nothing in the layer.
+- [x] **`RUN --mount=type=cache`.** A host directory kept between builds,
+  never in a layer.
 
 ## 3. Containerfile compatibility
 
 Containerfiles written for Docker or Podman should build unchanged, or
 fail with a clear message.
 
-- [ ] **`RUN --mount=type=secret` and `build --secret id=...,src=...`** for
-  build-time credentials (private package repos, git tokens) that stay out
-  of the image.
-- [ ] **`RUN --mount=type=bind`**, and `RUN --network=none|host`.
+- [x] **`RUN --mount=type=secret` and `build --secret id=...,src=...`**
+  (or `env=VAR`).
+- [x] **`RUN --mount=type=bind`** (context or `from=<stage>`, `rw` writes
+  discarded), **`type=tmpfs`**, and `RUN --network=none|host`.
+- [ ] **`RUN --mount=type=bind,from=<image>`** and **`type=ssh`**.
+- [ ] **`.containerignore` for context bind mounts.** A `RUN` bind mount of
+  the context shows ignored files too (Docker hides them).
 - [ ] **Heredocs** in `RUN` and `COPY` (`RUN <<EOF ... EOF`).
 - [ ] **`ADD <url>`**, with `--checksum=sha256:...`. Today it fails with
   "source not found".

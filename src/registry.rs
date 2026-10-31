@@ -16,7 +16,7 @@ use reqwest::header::{
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::oci::{self, Document, Manifest};
+use crate::oci::{self, Descriptor, Document, ImageConfig, Manifest, Platform};
 use crate::{Error, Reference};
 
 fn token_key(
@@ -305,15 +305,27 @@ impl Client {
         manifest: &Manifest,
         creds: Option<&Credentials>,
     ) -> Result<String, Error> {
-        let bytes = serde_json::to_vec_pretty(manifest)?;
-        let digest = sha256(&bytes);
-        let target = r.target();
-        let url = self.url(r, &format!("manifests/{target}"));
         let content_type = if manifest.media_type.is_empty() {
             oci::OCI_MANIFEST
         } else {
             &manifest.media_type
         };
+        self.push_document(r, serde_json::to_vec_pretty(manifest)?, content_type, creds)
+            .await
+    }
+
+    /// Pushes a manifest or index, already serialized, to `r` and returns
+    /// its digest.
+    pub async fn push_document(
+        &self,
+        r: &Reference,
+        bytes: Vec<u8>,
+        content_type: &str,
+        creds: Option<&Credentials>,
+    ) -> Result<String, Error> {
+        let digest = sha256(&bytes);
+        let target = r.target();
+        let url = self.url(r, &format!("manifests/{target}"));
         let key = token_key(r, creds, true);
         let send = |auth: Option<String>| {
             let mut req = self
@@ -454,12 +466,59 @@ impl Client {
         Ok((digest, doc.into_manifest()?))
     }
 
-    async fn document(
+    /// The manifest or index `target` names in `r`'s repository, and its
+    /// digest.
+    pub async fn document(
         &self,
         r: &Reference,
         target: &str,
         creds: Option<&Credentials>,
     ) -> Result<(String, Document), Error> {
+        let (digest, bytes) = self.document_bytes(r, target, creds).await?;
+        Ok((digest, Document::parse(&bytes)?))
+    }
+
+    /// Index entries for `r`: an index's own entries, or one entry for a
+    /// single manifest, its platform read from the image config.
+    pub async fn describe(
+        &self,
+        r: &Reference,
+        creds: Option<&Credentials>,
+    ) -> Result<Vec<Descriptor>, Error> {
+        let (digest, bytes) = self.document_bytes(r, r.target(), creds).await?;
+        let doc = Document::parse(&bytes)?;
+        if let Some(manifests) = doc.manifests {
+            return Ok(manifests);
+        }
+        let media_type = if doc.media_type.is_empty() {
+            oci::OCI_MANIFEST.to_owned()
+        } else {
+            doc.media_type.clone()
+        };
+        let manifest = doc.into_manifest()?;
+        let tmp = tempfile::NamedTempFile::new()?;
+        self.blob(r, &manifest.config.digest, tmp.path(), creds)
+            .await?;
+        let config: ImageConfig = serde_json::from_slice(&std::fs::read(tmp.path())?)
+            .map_err(|e| Error::Unsupported(format!("{r}: the image config: {e}")))?;
+        Ok(vec![Descriptor {
+            media_type,
+            digest,
+            size: bytes.len() as u64,
+            platform: Some(Platform {
+                architecture: config.architecture,
+                os: config.os,
+            }),
+            annotations: BTreeMap::new(),
+        }])
+    }
+
+    async fn document_bytes(
+        &self,
+        r: &Reference,
+        target: &str,
+        creds: Option<&Credentials>,
+    ) -> Result<(String, Vec<u8>), Error> {
         let bytes = self
             .get(
                 r,
@@ -479,7 +538,7 @@ impl Client {
                 got: digest,
             });
         }
-        Ok((digest, Document::parse(&bytes)?))
+        Ok((digest, bytes.to_vec()))
     }
 
     /// Writes the blob `digest` to `dest`, checking it.

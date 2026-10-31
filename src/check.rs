@@ -73,7 +73,7 @@ pub fn check_containerfile(cf: &Containerfile) -> CheckReport {
                     ),
                 );
             }
-            Instruction::Run(cmd) => {
+            Instruction::Run(cmd, _) => {
                 let text = match cmd {
                     crate::containerfile::CommandForm::Shell(s) => s.clone(),
                     crate::containerfile::CommandForm::Exec(v) => v.join(" "),

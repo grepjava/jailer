@@ -738,6 +738,7 @@ impl JailRuntime {
     /// Executes a `RUN` build instruction inside a temporary FreeBSD jail
     /// rooted at `root`, using the same `jail-shim` user/env/workdir logic as
     /// `jailer run`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_build_step(
         &self,
         root: &Path,
@@ -745,6 +746,8 @@ impl JailRuntime {
         env: &[String],
         user: &str,
         work_dir: &str,
+        mounts: &[BuildMount],
+        no_network: bool,
     ) -> Result<(), Error> {
         let id = new_id();
         let step_dir = self.dir.join(format!("build-{id}"));
@@ -768,7 +771,11 @@ impl JailRuntime {
             image: "build".to_owned(),
             created: state::now(),
             labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
+            annotations: if no_network {
+                BTreeMap::from([("org.freebsd.jail.vnet".to_owned(), "new".to_owned())])
+            } else {
+                BTreeMap::new()
+            },
             parent: None,
             jail: jail_name.clone(),
             root: root.to_path_buf(),
@@ -794,10 +801,14 @@ impl JailRuntime {
         self.sys
             .mount_devfs(&dev.to_string_lossy(), DEVFS_RULESET)?;
 
-        let jid_res = self.create_jail(&rec);
+        let mut mounted = Vec::new();
+        let jid_res = self
+            .mount_build(root, mounts, &mut mounted)
+            .and_then(|()| self.create_jail(&rec));
         let jid = match jid_res {
             Ok(j) => j,
             Err(e) => {
+                self.release_build_mounts(&mounted);
                 let _ = self.sys.unmount(&dev.to_string_lossy());
                 if !had_resolv {
                     let _ = std::fs::remove_file(&resolv_target);
@@ -822,6 +833,7 @@ impl JailRuntime {
         let status_res = cmd.status().await;
 
         let _ = self.sys.jail_remove(&jail_name);
+        self.release_build_mounts(&mounted);
         let _ = self.sys.unmount(&dev.to_string_lossy());
         if !had_resolv {
             let _ = std::fs::remove_file(&resolv_target);
@@ -838,6 +850,90 @@ impl JailRuntime {
         }
         Ok(())
     }
+}
+
+impl JailRuntime {
+    /// Mounts a build step's mounts under `root`, recording each mount point
+    /// and the first directory or file made for it, to undo afterwards.
+    fn mount_build(
+        &self,
+        root: &Path,
+        mounts: &[BuildMount],
+        mounted: &mut Vec<(PathBuf, Option<PathBuf>)>,
+    ) -> Result<(), Error> {
+        for m in mounts {
+            let (dest, file) = match m {
+                BuildMount::Nullfs { source, target, .. } => (target, source.is_file()),
+                BuildMount::Tmpfs { target, .. } => (target, false),
+            };
+            let made = first_missing(root, dest);
+            let at = target(root, dest, file)?;
+            mounted.push((at.clone(), made));
+            let at = at.to_string_lossy();
+            match m {
+                BuildMount::Nullfs {
+                    source, read_only, ..
+                } => self
+                    .sys
+                    .mount_nullfs(&source.to_string_lossy(), &at, *read_only)?,
+                BuildMount::Tmpfs { size, .. } => self.sys.mount_tmpfs(&at, *size, 0o1777)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Unmounts a build step's mounts, last first, and removes the mount
+    /// points made for them that the step left empty.
+    fn release_build_mounts(&self, mounted: &[(PathBuf, Option<PathBuf>)]) {
+        for (at, made) in mounted.iter().rev() {
+            let _ = self.sys.unmount(&at.to_string_lossy());
+            let Some(made) = made else { continue };
+            let mut cur = at.clone();
+            loop {
+                let removed = match std::fs::symlink_metadata(&cur) {
+                    Ok(m) if m.is_dir() => std::fs::remove_dir(&cur).is_ok(),
+                    Ok(m) if m.is_file() && m.len() == 0 => std::fs::remove_file(&cur).is_ok(),
+                    _ => false,
+                };
+                if !removed || cur == *made {
+                    break;
+                }
+                match cur.parent() {
+                    Some(p) => cur = p.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+/// The first missing path on the way from `root` to `dest` inside it.
+fn first_missing(root: &Path, dest: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for c in Path::new(dest).components() {
+        if let Component::Normal(name) = c {
+            path.push(name);
+            if std::fs::symlink_metadata(&path).is_err() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// A mount for one `RUN` step.
+#[derive(Debug, Clone)]
+pub enum BuildMount {
+    /// A host file or directory, mounted with nullfs at `target`.
+    Nullfs {
+        source: PathBuf,
+        target: String,
+        read_only: bool,
+    },
+    Tmpfs {
+        target: String,
+        size: Option<u64>,
+    },
 }
 
 fn records(dir: &Path) -> Result<Vec<Record>, Error> {

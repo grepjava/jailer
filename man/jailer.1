@@ -96,6 +96,7 @@ overwrites an existing
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -target Ar stage
 .Op Ar context
 .Xc
@@ -116,9 +117,55 @@ layers match an earlier build reuses that build's layer instead of
 running;
 .Fl -no-cache
 runs every step.
-Cached layers are kept while an image uses them; a multi-stage build's
-intermediate stages are cached until the next
-.Nm rmi .
+Cached layers are kept, also for a multi-stage build's intermediate
+stages, until
+.Nm prune Fl -cache .
+.Pp
+A
+.Cm RUN
+step may take, as in Docker,
+.Fl -network Ns = Ns Cm none
+to run without network, and mounts that are never part of a layer:
+.Bl -tag -width Ds
+.It Fl -mount Ns = Ns Cm type=cache , Ns Cm target Ns = Ns Ar path
+A directory kept between builds, for package and compiler caches.
+.Cm id
+names it (default
+.Ar path ) ;
+.Cm mode , uid , gid
+set it up when first made, and
+.Cm ro
+mounts it read-only.
+.It Fl -mount Ns = Ns Cm type=bind , Ns Cm target Ns = Ns Ar path
+The build context, or with
+.Cm from Ns = Ns Ar stage
+an earlier stage's files;
+.Cm source
+picks a path in it (default the whole).
+Read-only, unless
+.Cm rw ,
+whose writes are discarded.
+The step runs again when the mounted files change.
+.It Fl -mount Ns = Ns Cm type=secret , Ns Cm id Ns = Ns Ar id
+The secret given by
+.Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
+(or
+.Cm env Ns = Ns Ar var ) ,
+as a file at
+.Cm target
+(default
+.Pa /run/secrets/ Ns Ar id ) ,
+mode 0400 unless
+.Cm mode
+says otherwise.
+A missing secret is skipped, or fails the build with
+.Cm required .
+.It Fl -mount Ns = Ns Cm type=tmpfs , Ns Cm target Ns = Ns Ar path
+An empty memory file system, of at most
+.Cm size
+bytes
+.Pq e.g. Ql 64m .
+.El
 .Fl -strict
 fails the build when the compatibility check reports an error.
 .Fl -target
@@ -239,6 +286,33 @@ platform.
 Pull an image into the local store.
 .Fl -linux
 accepts a Linux image when the registry offers no FreeBSD one.
+.It Xo
+.Nm manifest push
+.Op Fl -authfile Ar path
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Ar target
+.Ar source ...
+.Xc
+Push an image index to
+.Ar target
+naming one image per platform, so that nodes of each architecture pull
+their own.
+Each
+.Ar source
+is a local image, pushed by digest into
+.Ar target Ns 's
+repository, or an image or index already in that repository, such as
+one pushed from a build host of another architecture.
+Two sources for the same platform are refused.
+.It Xo
+.Nm manifest inspect
+.Op Fl -authfile Ar path
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Ar reference
+.Xc
+Print the manifest or index a registry holds for
+.Ar reference ,
+and its digest on standard error.
 .It Nm load Oo Fl -name Ar ref Oc Ar archive.tar
 Load an OCI archive into the local store.
 .It Xo
@@ -257,7 +331,14 @@ or
 .It Nm images
 List local images.
 .It Nm rmi Ar reference
-Remove a local image, along with any layers and blobs no other image uses.
+Remove a local image, along with any layers and blobs no other image or
+build cache entry uses.
+.It Nm prune Op Fl -cache
+Remove build cache entries whose layer is gone, then the layers and blobs
+nothing uses.
+With
+.Fl -cache ,
+clear the build cache first, freeing the layers only it kept.
 .It Nm ps Op Fl a
 List running containers, or all with
 .Fl a .
@@ -306,6 +387,15 @@ jailer init
 jailer build --strict
 doas jailer run
 jailer push ghcr.io/me/app:1.0
+.Ed
+.Pp
+Publish one name for amd64 and arm64 nodes, building on each:
+.Bd -literal -offset indent
+arm64$ doas jailer build -t app:1.0
+arm64$ doas jailer push app:1.0 ghcr.io/me/app:1.0-arm64
+amd64$ doas jailer build -t app:1.0
+amd64$ doas jailer manifest push ghcr.io/me/app:1.0 \e
+           app:1.0 ghcr.io/me/app:1.0-arm64
 .Ed
 .Pp
 Produce an archive for an offline Legion node:
