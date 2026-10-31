@@ -327,8 +327,8 @@ an annotation on its manifest, which
 and
 .Nm export
 keep.
-Files in layers carry a fixed time, and the image config none, so the
-same build gives the same image;
+Files in layers carry a fixed time, and the image config its base
+image's time, so the same build gives the same image;
 .Fl -timestamp
 (or
 .Ev SOURCE_DATE_EPOCH )

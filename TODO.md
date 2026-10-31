@@ -8,8 +8,9 @@ people building images for Legion.
 - [x] **Multi-architecture images.** `jailer manifest push <target>
   <source>...` publishes an OCI index naming one image per platform, from
   local images and images already pushed from other architectures' build
-  hosts. Tested against a mock registry and Docker's `registry:2`; still
-  to try against GHCR or Docker Hub, and on an arm64 host.
+  hosts. Tested against a mock registry and Docker's `registry:2`, and
+  the test suite passes on arm64 (FreeBSD 15.1 VM); still to try against
+  GHCR, with the aarch64 tarball's upload.
 
 - [ ] **Packaging.** v0.4.0 is released with an amd64 tarball, built by
   `scripts/release.sh`, and the port in `ports/sysutils/jailer` builds
