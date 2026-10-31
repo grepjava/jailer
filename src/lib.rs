@@ -1,5 +1,7 @@
 //! `jailer`: a standalone FreeBSD OCI image builder, local jail test runner,
 //! compatibility checker, and registry publisher aligned with Legion's runtime.
+//! Images (references, the registry client, the store, layers) are Legion's
+//! own `legion-image`, and the system calls `legion-sys`.
 
 pub mod auth;
 pub mod build;
@@ -8,20 +10,32 @@ pub mod containerfile;
 pub mod init;
 pub mod layer;
 pub mod log;
-pub mod oci;
-pub mod reference;
-pub mod registry;
 pub mod runtime;
 pub mod shim;
 pub mod state;
 pub mod store;
-pub mod sys;
 pub mod users;
 
+pub use legion_image::oci;
+pub use legion_image::{Client, Credentials, Reference, registry_of};
 pub use oci::{Config, ImageConfig};
-pub use reference::{Reference, registry_of};
-pub use registry::{Client, Credentials};
 pub use store::{Image, StorageMode, Store, chain_ids};
+
+pub mod registry {
+    pub use legion_image::{Client, Credentials, sha256};
+}
+
+pub mod sys {
+    pub use legion_sys::*;
+
+    /// Whether this host has a ZFS pool to keep images in.
+    pub fn zfs_available() -> bool {
+        std::process::Command::new("zfs")
+            .args(["list", "-H", "-d", "0"])
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,4 +65,29 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Sys(#[from] sys::Error),
+}
+
+impl From<legion_image::Error> for Error {
+    fn from(e: legion_image::Error) -> Self {
+        use legion_image::Error as E;
+        match e {
+            E::Reference(s) => Error::Reference(s),
+            E::Registry(s) => Error::Registry(s),
+            E::NotFound(s) => Error::NotFound(s),
+            E::Digest {
+                what,
+                expected,
+                got,
+            } => Error::Digest {
+                what,
+                expected,
+                got,
+            },
+            E::Unsupported(s) => Error::Unsupported(s),
+            E::Extract(s) => Error::Extract(s),
+            E::Io(e) => Error::Io(e),
+            E::Json(e) => Error::Json(e),
+            E::Sys(e) => Error::Sys(e),
+        }
+    }
 }

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.jpg" alt="jailer — FreeBSD OCI image builder and local jail runner" width="100%">
+</p>
+
 # jailer
 
 `jailer` is a standalone FreeBSD OCI image builder, local jail test runner, compatibility checker, and registry publisher designed for [Legion](https://github.com/grepjava/legion) — and usable on any FreeBSD host without it.
@@ -66,7 +70,7 @@ cp -R ports/sysutils/jailer /usr/ports/sysutils/
 make -C /usr/ports/sysutils/jailer install clean
 ```
 
-Or from source, with Rust 1.85 or later: `cargo install --locked --path .`
+Or from source, with Rust 1.90 or later: `cargo install --locked --path .`
 
 ## Building on FreeBSD
 

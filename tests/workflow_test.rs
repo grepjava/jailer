@@ -16,7 +16,6 @@ use jailer::build::{BuildBackend, BuildOptions, build};
 use jailer::init::{InitOptions, Template, scaffold};
 use jailer::registry::{Client, Credentials, sha256};
 use jailer::runtime::{JailRuntime, RuntimeConfig};
-use jailer::store::Store;
 use jailer::sys::FakeSys;
 
 #[derive(Default)]
@@ -249,10 +248,10 @@ CMD ["--serve"]
     let (addr, _) = start_mock_registry().await;
     let registry_host = format!("127.0.0.1:{}", addr.port());
 
-    let sys = Arc::new(FakeSys::new(false));
+    let sys = Arc::new(FakeSys::new());
     let client = Client::new().unwrap().plain_http(&registry_host);
     let store_dir = tmp.path().join("store1");
-    let store = Arc::new(Store::open(sys.clone(), None, &store_dir, client).unwrap());
+    let store = Arc::new(jailer::store::open(sys.clone(), None, &store_dir, client).unwrap());
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
@@ -324,9 +323,10 @@ CMD ["--serve"]
         assert!(names.contains(&p.as_str().unwrap().to_owned()), "{p}");
     }
 
-    let sys2 = Arc::new(FakeSys::new(false));
+    let sys2 = Arc::new(FakeSys::new());
     let client2 = Client::new().unwrap().plain_http(&registry_host);
-    let store2 = Arc::new(Store::open(sys2, None, &tmp.path().join("store2"), client2).unwrap());
+    let store2 =
+        Arc::new(jailer::store::open(sys2, None, &tmp.path().join("store2"), client2).unwrap());
     let loaded = store2.load(&archive_path, None).await.unwrap();
     assert_eq!(loaded.id, built.image.id);
     assert_eq!(loaded.references, ["localhost/demo:1.0"]);
@@ -343,10 +343,10 @@ CMD ["--serve"]
         .unwrap();
     assert!(manifest_digest.starts_with("sha256:"));
 
-    let sys3 = Arc::new(FakeSys::new(true));
+    let sys3 = Arc::new(FakeSys::new());
     let client3 = Client::new().unwrap().plain_http(&registry_host);
     let store3 = Arc::new(
-        Store::open(
+        jailer::store::open(
             sys3,
             Some("zroot/test-jailer/images"),
             &tmp.path().join("store3"),
@@ -371,10 +371,10 @@ CMD ["--serve"]
     let blobs = store_dir.join("blobs/sha256");
     let pin = store.pin().unwrap();
     assert!(store.pin_image(&pin, "demo:1.0").await.unwrap().is_some());
-    assert!(store.remove("demo:1.0").await.unwrap());
+    assert!(jailer::store::remove(&store, "demo:1.0").await.unwrap());
     assert!(std::fs::read_dir(&blobs).unwrap().next().is_some());
     drop(pin);
-    assert!(!store.remove("demo:1.0").await.unwrap());
+    assert!(!jailer::store::remove(&store, "demo:1.0").await.unwrap());
     assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
 }
 
@@ -397,10 +397,11 @@ async fn manifest_push_publishes_one_image_per_platform() {
         password: "secret".to_owned(),
     };
     let open = |dir: &str| {
-        let sys = Arc::new(FakeSys::new(false));
+        let sys = Arc::new(FakeSys::new());
         let client = Client::new().unwrap().plain_http(&host);
-        let store =
-            Arc::new(Store::open(sys.clone(), None, &tmp.path().join(dir), client).unwrap());
+        let store = Arc::new(
+            jailer::store::open(sys.clone(), None, &tmp.path().join(dir), client).unwrap(),
+        );
         let runtime = JailRuntime::new(
             sys,
             store.clone(),
@@ -552,10 +553,11 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         addr.port()
     ));
 
-    let sys = Arc::new(FakeSys::new(false));
+    let sys = Arc::new(FakeSys::new());
     let client = Client::new().unwrap();
-    let store =
-        Arc::new(Store::open(sys.clone(), None, &tmp.path().join("store"), client).unwrap());
+    let store = Arc::new(
+        jailer::store::open(sys.clone(), None, &tmp.path().join("store"), client).unwrap(),
+    );
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
@@ -692,9 +694,9 @@ async fn cache_trim_drops_least_recently_used_layers() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
-    let sys = Arc::new(FakeSys::new(false));
+    let sys = Arc::new(FakeSys::new());
     let store = Arc::new(
-        Store::open(
+        jailer::store::open(
             sys.clone(),
             None,
             &tmp.path().join("store"),
@@ -741,19 +743,23 @@ async fn cache_trim_drops_least_recently_used_layers() {
         .await
         .unwrap()
         .image;
-        store
-            .record_step(
-                name,
-                &CachedStep {
-                    layer: Some(CachedLayer {
-                        chain: image.layers[0].clone(),
-                        diff_id: image.config.rootfs.diff_ids[0].clone(),
-                        descriptor: image.layer_descriptors[0].clone(),
-                    }),
-                },
-            )
-            .unwrap();
-        assert!(store.remove(&format!("{name}:1")).await.unwrap());
+        jailer::store::record_step(
+            &store,
+            name,
+            &CachedStep {
+                layer: Some(CachedLayer {
+                    chain: image.layers[0].clone(),
+                    diff_id: image.config.rootfs.diff_ids[0].clone(),
+                    descriptor: image.layer_descriptors[0].clone(),
+                }),
+            },
+        )
+        .unwrap();
+        assert!(
+            jailer::store::remove(&store, &format!("{name}:1"))
+                .await
+                .unwrap()
+        );
         built.push(image);
     }
     std::fs::File::options()
@@ -765,10 +771,13 @@ async fn cache_trim_drops_least_recently_used_layers() {
     let layer = |i: usize| store.dir().join("layers").join(&built[i].layers[0]);
     assert!(layer(0).exists() && layer(1).exists());
 
-    assert_eq!(store.trim_cache(u64::MAX).await.unwrap(), 0);
+    assert_eq!(
+        jailer::store::trim_cache(&store, u64::MAX).await.unwrap(),
+        0
+    );
     let b_size = built[1].layer_descriptors[0].size;
-    assert_eq!(store.trim_cache(b_size).await.unwrap(), 1);
+    assert_eq!(jailer::store::trim_cache(&store, b_size).await.unwrap(), 1);
     assert!(!layer(0).exists() && layer(1).exists());
-    assert_eq!(store.trim_cache(0).await.unwrap(), 1);
+    assert_eq!(jailer::store::trim_cache(&store, 0).await.unwrap(), 1);
     assert!(!layer(1).exists());
 }

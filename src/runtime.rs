@@ -217,7 +217,7 @@ impl JailRuntime {
 
         let image = self
             .images
-            .get(&spec.image)?
+            .find(&spec.image)?
             .ok_or_else(|| Error::NotFound(format!("{}: image not known", spec.image)))?;
         let linux = image.config.os == "linux" || spec.linux;
         if image.config.os == "linux" && !spec.linux && !self.images.runs("linux") {
@@ -438,14 +438,14 @@ impl JailRuntime {
         std::fs::create_dir_all(&dir)?;
         let image = self
             .images
-            .get(&rec.image)?
+            .find(&rec.image)?
             .ok_or_else(|| Error::NotFound(format!("{}: image not known", rec.image)))?;
         if let Err(e) = self
             .images
             .prepare_rootfs(&image, &rec.root, rec.dataset.as_deref())
         {
             let _ = std::fs::remove_dir_all(&dir);
-            return Err(e);
+            return Err(e.into());
         }
         state::write(&dir, RECORD, &rec)?;
         Ok(rec)

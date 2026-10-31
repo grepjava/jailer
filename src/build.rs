@@ -309,7 +309,9 @@ pub async fn build(
         final_config.rootfs.diff_ids.push(art.diff_id.clone());
         let chains = chain_ids(&final_config.rootfs.diff_ids);
         let chain_hex = hex_of(chains.last().unwrap())?.to_owned();
-        let desc = store.commit_built_layer(&pin, None, &chain_hex, &tar_out, &gz_out, &art)?;
+        let desc = store
+            .commit_built_layer(&pin, None, &chain_hex, &tar_out, &gz_out, &art)
+            .await?;
         final_layers.push(chain_hex);
         final_descriptors.push(desc);
     }
@@ -333,7 +335,7 @@ pub async fn build(
         .await?;
     drop(pin);
     if let Some(max) = opts.cache_max {
-        store.trim_cache(max).await?;
+        crate::store::trim_cache(store, max).await?;
     }
 
     Ok(BuildResult { image, report })
@@ -501,7 +503,7 @@ async fn execute_instruction(
                 sp.line,
             )?;
             drop(extras);
-            commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
+            commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw).await?;
             stage.cache_key = copy_key(stage, &sp.raw);
         }
         Instruction::Run(form, run_opts) => {
@@ -538,7 +540,7 @@ async fn execute_instruction(
             let cached = if no_cache {
                 None
             } else {
-                store.cached_step(pin, &key).await?
+                crate::store::cached_step(store, pin, &key).await?
             };
             match cached {
                 Some(step) if apply_cached(store, stage, tmp_dir, step.layer.as_ref())? => {
@@ -560,8 +562,9 @@ async fn execute_instruction(
                         .await?;
                     drop(mounts);
                     let layer =
-                        commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
-                    store.record_step(&key, &CachedStep { layer })?;
+                        commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)
+                            .await?;
+                    crate::store::record_step(store, &key, &CachedStep { layer })?;
                 }
             }
             stage.cache_key = key;
@@ -878,7 +881,7 @@ fn set_owner_mode(_: &Path, _: u32, _: u32, _: u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn commit_step_diff(
+async fn commit_step_diff(
     store: &Arc<Store>,
     pin: &Pin,
     stage: &mut BuiltStage,
@@ -897,14 +900,16 @@ fn commit_step_diff(
             stage.config.rootfs.diff_ids.push(art.diff_id.clone());
             let chains = chain_ids(&stage.config.rootfs.diff_ids);
             let chain_hex = hex_of(chains.last().unwrap())?.to_owned();
-            let desc = store.commit_built_layer(
-                pin,
-                parent_hex.as_deref(),
-                &chain_hex,
-                &tar_out,
-                &gz_out,
-                &art,
-            )?;
+            let desc = store
+                .commit_built_layer(
+                    pin,
+                    parent_hex.as_deref(),
+                    &chain_hex,
+                    &tar_out,
+                    &gz_out,
+                    &art,
+                )
+                .await?;
             let _ = std::fs::remove_file(&tar_out);
             let _ = std::fs::remove_file(&gz_out);
             stage.layers.push(chain_hex.clone());
@@ -1427,5 +1432,5 @@ async fn build_with_buildah(
     if !status.success() {
         return Err(Error::Build(format!("buildah push failed ({status})")));
     }
-    store.load(&archive, Some(&tag_ref)).await
+    Ok(store.load(&archive, Some(&tag_ref)).await?)
 }

@@ -10,8 +10,8 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::reference::registry_of;
 use crate::registry::Credentials;
+use crate::registry_of;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AuthFile {

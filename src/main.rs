@@ -500,7 +500,7 @@ fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
         return Some(ds.clone());
     }
     #[cfg(target_os = "freebsd")]
-    if unsafe { libc::geteuid() } == 0 && sys.zfs_available() {
+    if unsafe { libc::geteuid() } == 0 && jailer::sys::zfs_available() {
         // Auto-detect the top-level pool (typically `zroot`)
         if let Ok(list) = sys.zfs_list("zroot")
             && !list.is_empty()
@@ -526,7 +526,8 @@ fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, Jai
 
     let images_dir = state_dir.join("images");
     let store = Arc::new(
-        Store::open(sys.clone(), images_zfs.as_deref(), &images_dir, client)?.with_linux(linux),
+        jailer::store::open(sys.clone(), images_zfs.as_deref(), &images_dir, client)?
+            .with_linux(linux),
     );
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jailer"));
     let runtime = JailRuntime::new(
@@ -704,7 +705,7 @@ async fn main() -> Result<()> {
             };
 
             // Pull automatically if the image is not in the local store and not a localhost ref.
-            if store.get(&image_ref)?.is_none() {
+            if store.find(&image_ref)?.is_none() {
                 let r = Reference::parse(&image_ref)?;
                 if !r.is_local() {
                     let creds = resolve_credentials(&r.registry, None, None)?;
@@ -790,7 +791,7 @@ async fn main() -> Result<()> {
                 [only] => {
                     // If `only` already names an image in the store, push it directly;
                     // otherwise push the current directory's built image to `only`.
-                    if store.get(only)?.is_some() {
+                    if store.find(only)?.is_some() {
                         (only.clone(), only.clone())
                     } else {
                         (default_local_image_for_cwd(), only.clone())
@@ -900,7 +901,7 @@ async fn main() -> Result<()> {
             } else {
                 target.clone()
             };
-            if let Some(img) = store.get(&img_lookup)? {
+            if let Some(img) = store.find(&img_lookup)? {
                 let tmp = tempfile::Builder::new()
                     .prefix("check")
                     .tempdir_in(store.dir().join("tmp"))?;
@@ -1026,14 +1027,14 @@ async fn main() -> Result<()> {
 
         Commands::Prune { cache } => {
             let (_, store, _) = open_context(&cli, true)?;
-            let n = store.prune(*cache).await?;
+            let n = jailer::store::prune(&store, *cache).await?;
             println!("Removed {n} layer(s)");
             Ok(())
         }
 
         Commands::Rmi { reference } => {
             let (_, store, _) = open_context(&cli, true)?;
-            if store.remove(reference).await? {
+            if jailer::store::remove(&store, reference).await? {
                 println!("Removed {reference}");
             } else {
                 bail!("image {reference:?} not found");

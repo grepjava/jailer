@@ -2,7 +2,7 @@
 name = "jailer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "Build, test, and publish FreeBSD jail OCI images for Legion"
 license = "BSD-2-Clause"
 repository = "https://github.com/grepjava/jailer"
@@ -15,6 +15,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1.1"
 futures = "0.3"
 getrandom = "0.3"
+legion-image = { git = "https://github.com/grepjava/legion", branch = "image-share" }
+legion-sys = { git = "https://github.com/grepjava/legion", branch = "image-share" }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
@@ -23,7 +25,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "json",
 ] }
-ruzstd = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
