@@ -33,7 +33,13 @@ pub struct Cli {
     pub zfs_root: Option<String>,
 
     /// Use plain directory storage instead of ZFS
-    #[arg(long, env = "JAILER_NO_ZFS", global = true)]
+    /// (`JAILER_NO_ZFS=1`, `yes` or `true`)
+    #[arg(
+        long,
+        env = "JAILER_NO_ZFS",
+        global = true,
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
     pub no_zfs: bool,
 
     /// Talk to this registry over plain HTTP instead of HTTPS
@@ -711,6 +717,19 @@ fn print_report(report: &CheckReport) {
     }
 }
 
+/// Which of an image's `names` the `query` that found it gives, in the
+/// order the store looks: a local name, then a registry reference.
+fn name_given(names: &[String], query: &str) -> Option<String> {
+    [
+        Reference::parse_local_tag(query).ok(),
+        Reference::parse(query).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|r| r.to_string())
+    .find(|n| names.contains(n))
+}
+
 fn default_local_image_for_cwd() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let name = detect_app_name(&cwd).to_ascii_lowercase();
@@ -854,7 +873,7 @@ async fn run() -> Result<()> {
                 &BuildOptions {
                     context_dir: context.clone(),
                     containerfile: file.clone(),
-                    tag,
+                    tag: tag.clone(),
                     build_args: parsed_args,
                     target: target.clone(),
                     backend: *backend,
@@ -884,12 +903,9 @@ async fn run() -> Result<()> {
             .await?;
 
             print_report(&res.report);
-            let name = res
-                .image
-                .references
-                .first()
-                .map(String::as_str)
-                .unwrap_or("");
+            // The image may carry other names too, of builds that gave the
+            // same config.
+            let name = Reference::parse_local_tag(&tag)?;
             println!("Built {} ({})", name, res.image.id);
             Ok(())
         }
@@ -1035,6 +1051,14 @@ async fn run() -> Result<()> {
                 }
                 (None, [img, out]) => (img.clone(), PathBuf::from(out)),
                 _ => bail!("usage: jailer export [IMAGE] <OUTPUT.tar>"),
+            };
+            // The archive names the image as it was asked for, not by
+            // whichever of its names came first.
+            let name = match name {
+                Some(n) => Some(n.clone()),
+                None => store
+                    .find(&image_ref)?
+                    .and_then(|img| name_given(&img.references, &image_ref)),
             };
             let img = store.export(&image_ref, &out_path, name.as_deref()).await?;
             let shown = name
@@ -1508,4 +1532,29 @@ async fn containers(cli: &Cli) -> Result<()> {
 #[cfg(not(unix))]
 async fn containers(_: &Cli) -> Result<()> {
     bail!("containers run in jails, which need FreeBSD")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_given;
+
+    #[test]
+    fn an_export_names_the_image_as_asked() {
+        let names = vec![
+            "localhost/app/gz:1".to_owned(),
+            "localhost/app/zst:1".to_owned(),
+            "docker.io/library/app:1".to_owned(),
+        ];
+        let given = |q| name_given(&names, q);
+        assert_eq!(given("app/zst:1").as_deref(), Some("localhost/app/zst:1"));
+        assert_eq!(
+            given("localhost/app/gz:1").as_deref(),
+            Some("localhost/app/gz:1")
+        );
+        assert_eq!(
+            given("docker.io/app:1").as_deref(),
+            Some("docker.io/library/app:1")
+        );
+        assert_eq!(given("d2253fcb1642"), None);
+    }
 }

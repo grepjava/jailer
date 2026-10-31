@@ -73,7 +73,8 @@ fail with a clear message.
 - [x] **Clearer pull errors**: "not found, or access denied".
 - [x] **Podman interop.** `export` also writes Docker's `manifest.json`, as
   `docker save` does. `docker load` (Docker 29) loads it, and `docker
-  pull` takes pushed images, zstd ones too; `podman load` is untried.
+  pull` takes pushed images, zstd ones too; `podman load` (Podman 5.8 on
+  FreeBSD 15) loads gzip and zstd archives and runs them.
 - [x] **Image signing**: `push --sign-key`, `sign`, `verify` and `key
   generate`, signatures as cosign makes them with a key pair (no
   transparency log, no keyless signing). cosign 2.4 and 3.0 verify
@@ -84,6 +85,11 @@ fail with a clear message.
   client are Legion's `legion-image`, and containers and `RUN` steps
   Legion's `legion-jail` (v0.1.1): `jailer run` gets Legion's security
   defaults, and `--vnet` runs a pod as a node does.
+- [ ] **Same config, different layers.** Legion's store keeps one image
+  per config digest, so a gzip and a zstd build of one Containerfile
+  (same diff_ids, so same config) become one image: the later build's
+  layers replace the earlier's under both tags, and the record's manifest
+  digest stays the first build's. Needs a change in `legion-image`.
 
 ## 5. Later
 
