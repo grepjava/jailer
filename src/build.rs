@@ -11,7 +11,7 @@ use clap::ValueEnum;
 
 use crate::check::{CheckReport, check_containerfile, check_image};
 use crate::containerfile::{
-    Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, expand_vars,
+    self, Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, expand_vars,
     glob_match,
 };
 use crate::layer::{self, TreeState};
@@ -42,6 +42,10 @@ pub struct BuildOptions {
     pub strict_lint: bool,
     /// Run every step instead of reusing cached `RUN` results.
     pub no_cache: bool,
+    /// Flatten the image, base included, into one layer.
+    pub squash: bool,
+    /// After the build, trim the build cache to this many bytes.
+    pub cache_max: Option<u64>,
     /// Contents of the secrets `RUN --mount=type=secret` can mount, by id.
     pub secrets: BTreeMap<String, Vec<u8>>,
 }
@@ -90,6 +94,9 @@ pub async fn build(
     };
 
     let cf = Containerfile::parse_file(&cf_path)?;
+    for w in &cf.warnings {
+        eprintln!("warning: {w}");
+    }
     let mut report = check_containerfile(&cf);
 
     if opts.backend == BuildBackend::Buildah {
@@ -116,21 +123,59 @@ pub async fn build(
         .prefix("build")
         .tempdir_in(store.dir().join("tmp"))?;
 
+    // Docker's automatic platform args, known to `FROM` and to an `ARG`
+    // without a default. jailer builds for this host's platform only.
+    let platform = format!("freebsd/{}", oci::arch());
+    let predefined: BTreeMap<String, String> = [
+        ("BUILDPLATFORM", platform.as_str()),
+        ("TARGETPLATFORM", platform.as_str()),
+        ("BUILDOS", "freebsd"),
+        ("TARGETOS", "freebsd"),
+        ("BUILDARCH", oci::arch()),
+        ("TARGETARCH", oci::arch()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let mut build_args = predefined.clone();
+    build_args.extend(opts.build_args.clone());
+
     let mut global_vars = BTreeMap::new();
     for (k, def) in &cf.global_args {
-        if let Some(v) = opts.build_args.get(k).or(def.as_ref()) {
+        if let Some(v) = build_args.get(k).or(def.as_ref()) {
             global_vars.insert(k.clone(), v.clone());
         }
     }
+    let mut from_vars = predefined;
+    from_vars.extend(global_vars.clone());
 
     // Keeps the base images and new layers from a concurrent `rmi`.
     let pin = store.pin()?;
+    let env = BuildEnv {
+        store,
+        pin: &pin,
+        opts,
+        runtime,
+        ignore: &ignore,
+        build_args: &build_args,
+        tmp_dir: build_tmp.path(),
+    };
     let mut completed_stages: Vec<BuiltStage> = Vec::new();
     let mut cleanup_guard = StageCleanup(Vec::new());
 
     for stage_def in &cf.stages {
         let mut vars = global_vars.clone();
-        let base_ref = expand_vars(&stage_def.base, &vars);
+        let base_ref = expand_vars(&stage_def.base, &from_vars);
+        if let Some(p) = &stage_def.platform {
+            let p = expand_vars(p, &from_vars);
+            let mut parts = p.split('/');
+            if parts.next() != Some("freebsd") || parts.next() != Some(oci::arch()) {
+                return Err(Error::Build(format!(
+                    "line {}: FROM --platform={p}: jailer builds for {platform}, this host's platform; build {p} images on such a host and combine them with `jailer manifest push`",
+                    stage_def.line
+                )));
+            }
+        }
         let stage_root = build_tmp.path().join(format!("stage-{}", stage_def.index));
         std::fs::create_dir_all(&stage_root)?;
         cleanup_guard.0.push(stage_root.clone());
@@ -204,26 +249,17 @@ pub async fn build(
         }
 
         let total = stage_def.instructions.len();
+        // The base's ONBUILD triggers run first, and are not passed on.
+        let triggers = std::mem::take(&mut built.config.config.on_build);
+        for trigger in &triggers {
+            println!("Step 0/{total}: ONBUILD {trigger}");
+            let sp = containerfile::parse_trigger(trigger, stage_def.line)?;
+            execute_instruction(env, &completed_stages, &mut built, &mut vars, &sp, 0).await?;
+        }
         for (idx, sp) in stage_def.instructions.iter().enumerate() {
             let step_no = idx + 1;
             println!("Step {step_no}/{total}: {}", sp.raw);
-            execute_instruction(
-                store,
-                &pin,
-                opts.no_cache,
-                &opts.secrets,
-                runtime,
-                &opts.context_dir,
-                &ignore,
-                &opts.build_args,
-                &completed_stages,
-                &mut built,
-                &mut vars,
-                sp,
-                build_tmp.path(),
-                step_no,
-            )
-            .await?;
+            execute_instruction(env, &completed_stages, &mut built, &mut vars, sp, step_no).await?;
         }
 
         let reached_target = opts
@@ -255,6 +291,15 @@ pub async fn build(
     let mut final_config = final_stage.config;
     let mut final_layers = final_stage.layers;
     let mut final_descriptors = final_stage.descriptors;
+    if opts.squash && !final_layers.is_empty() {
+        final_layers.clear();
+        final_descriptors.clear();
+        final_config.rootfs.diff_ids.clear();
+        for h in &mut final_config.history {
+            h.empty_layer = true;
+        }
+        record_history(&mut final_config, "jailer build --squash", false);
+    }
     if final_layers.is_empty() {
         let tar_out = build_tmp.path().join("scratch.tar");
         let gz_out = build_tmp.path().join("scratch.tar.gz");
@@ -284,6 +329,10 @@ pub async fn build(
             final_descriptors,
         )
         .await?;
+    drop(pin);
+    if let Some(max) = opts.cache_max {
+        store.trim_cache(max).await?;
+    }
 
     Ok(BuildResult { image, report })
 }
@@ -298,6 +347,19 @@ impl Drop for StageCleanup {
     }
 }
 
+/// What every step of a build shares.
+#[derive(Clone, Copy)]
+struct BuildEnv<'a> {
+    store: &'a Arc<Store>,
+    pin: &'a Pin,
+    opts: &'a BuildOptions,
+    runtime: &'a JailRuntime,
+    ignore: &'a IgnoreMatcher,
+    /// `--build-arg` values over Docker's automatic ones.
+    build_args: &'a BTreeMap<String, String>,
+    tmp_dir: &'a Path,
+}
+
 fn find_stage<'a>(stages: &'a [BuiltStage], name_or_idx: &str) -> Option<&'a BuiltStage> {
     if let Ok(idx) = name_or_idx.parse::<usize>() {
         return stages.get(idx);
@@ -307,23 +369,24 @@ fn find_stage<'a>(stages: &'a [BuiltStage], name_or_idx: &str) -> Option<&'a Bui
         .find(|s| s.name.as_deref() == Some(name_or_idx))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute_instruction(
-    store: &Arc<Store>,
-    pin: &Pin,
-    no_cache: bool,
-    secrets: &BTreeMap<String, Vec<u8>>,
-    runtime: &JailRuntime,
-    context_dir: &Path,
-    ignore: &IgnoreMatcher,
-    cli_build_args: &BTreeMap<String, String>,
+    env: BuildEnv<'_>,
     completed_stages: &[BuiltStage],
     stage: &mut BuiltStage,
     vars: &mut BTreeMap<String, String>,
     sp: &crate::containerfile::SpannedInstruction,
-    tmp_dir: &Path,
     step_no: usize,
 ) -> Result<(), Error> {
+    let BuildEnv {
+        store,
+        pin,
+        opts,
+        runtime,
+        ignore,
+        build_args: cli_build_args,
+        tmp_dir,
+    } = env;
+    let (no_cache, context_dir) = (opts.no_cache, opts.context_dir.as_path());
     match &sp.instruction {
         Instruction::Arg { name, default } => {
             if let Some(val) = cli_build_args.get(name) {
@@ -404,7 +467,11 @@ async fn execute_instruction(
             stage.shell = sh.clone();
             record_history(&mut stage.config, &sp.raw, true);
         }
-        Instruction::Healthcheck(_) | Instruction::Onbuild(_) => {
+        Instruction::Healthcheck(_) => {
+            record_history(&mut stage.config, &sp.raw, true);
+        }
+        Instruction::Onbuild(trigger) => {
+            stage.config.config.on_build.push(trigger.clone());
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Entrypoint(form) => {
@@ -416,7 +483,9 @@ async fn execute_instruction(
             stage.config.config.cmd = form.to_argv(&stage.shell);
             record_history(&mut stage.config, &sp.raw, true);
         }
-        Instruction::Copy(spec) => {
+        Instruction::Copy(spec) | Instruction::Add(spec) => {
+            let is_add = matches!(sp.instruction, Instruction::Add(_));
+            let extras = CopyExtras::prepare(spec, vars, tmp_dir, is_add, sp.line).await?;
             let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
             apply_copy(
                 context_dir,
@@ -425,24 +494,11 @@ async fn execute_instruction(
                 stage,
                 vars,
                 spec,
-                false,
+                is_add,
+                &extras.files,
                 sp.line,
             )?;
-            commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
-            stage.cache_key = copy_key(stage, &sp.raw);
-        }
-        Instruction::Add(spec) => {
-            let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
-            apply_copy(
-                context_dir,
-                ignore,
-                completed_stages,
-                stage,
-                vars,
-                spec,
-                true,
-                sp.line,
-            )?;
+            drop(extras);
             commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)?;
             stage.cache_key = copy_key(stage, &sp.raw);
         }
@@ -459,16 +515,8 @@ async fn execute_instruction(
                     run_env.push(format!("{k}={v}"));
                 }
             }
-            let mounts = RunMounts::prepare(
-                store,
-                context_dir,
-                completed_stages,
-                secrets,
-                tmp_dir,
-                step_no,
-                run_opts,
-                sp.line,
-            )?;
+            let mounts =
+                RunMounts::prepare(env, completed_stages, step_no, run_opts, sp.line).await?;
             let key = next_key(
                 &stage.cache_key,
                 &[
@@ -524,17 +572,21 @@ struct RunMounts {
 }
 
 impl RunMounts {
-    #[allow(clippy::too_many_arguments)]
-    fn prepare(
-        store: &Store,
-        context_dir: &Path,
+    async fn prepare(
+        env: BuildEnv<'_>,
         completed_stages: &[BuiltStage],
-        secrets: &BTreeMap<String, Vec<u8>>,
-        tmp_dir: &Path,
         step_no: usize,
         opts: &RunOptions,
         line: usize,
     ) -> Result<Self, Error> {
+        let BuildEnv {
+            store,
+            pin,
+            ignore,
+            tmp_dir,
+            ..
+        } = env;
+        let (context_dir, secrets) = (env.opts.context_dir.as_path(), &env.opts.secrets);
         let mut out = RunMounts {
             mounts: Vec::new(),
             key: if opts.no_network {
@@ -574,24 +626,66 @@ impl RunMounts {
                     rw,
                 } => {
                     let (root, origin) = match from {
-                        None => (context_dir, "context".to_owned()),
-                        Some(name) => {
-                            let st = find_stage(completed_stages, name).ok_or_else(|| {
-                                Error::Build(format!(
-                                    "line {line}: --mount from={name}: no earlier stage of that name"
-                                ))
-                            })?;
-                            (st.root.as_path(), st.cache_key.clone())
-                        }
+                        None => (context_dir.to_path_buf(), "context".to_owned()),
+                        Some(name) => match find_stage(completed_stages, name) {
+                            Some(st) => (st.root.clone(), st.cache_key.clone()),
+                            None => {
+                                let image = match store.pin_image(pin, name).await? {
+                                    Some(img) => img,
+                                    None => {
+                                        println!("Pulling {name} for --mount from={name}...");
+                                        store.pull(name, env.opts.creds.as_ref(), "root").await?;
+                                        store.pin_image(pin, name).await?.ok_or_else(|| {
+                                            Error::Build(format!(
+                                                "line {line}: image {name} was removed during the build"
+                                            ))
+                                        })?
+                                    }
+                                };
+                                let image_root = scratch.with_extension("image");
+                                out.temp.push(image_root.clone());
+                                store.prepare_rootfs(&image, &image_root, None)?;
+                                (image_root, format!("image {}", image.id))
+                            }
+                        },
                     };
-                    let src = safe_join_in_root(root, source.trim_start_matches('/'))
+                    let src = safe_join_in_root(&root, source.trim_start_matches('/'))
                         .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
-                    if std::fs::symlink_metadata(&src).is_err() {
+                    let rel = src
+                        .strip_prefix(context_dir)
+                        .unwrap_or(&src)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if std::fs::symlink_metadata(&src).is_err()
+                        || (from.is_none() && ignore.is_ignored(&rel))
+                    {
                         return Err(Error::Build(format!(
                             "line {line}: --mount source {source:?} not found"
                         )));
                     }
-                    // A stage is named by its key; context files by their contents.
+                    // As in Docker, the step does not see what .containerignore
+                    // leaves out of the context, and `rw` writes are discarded:
+                    // both mount a copy.
+                    let src =
+                        if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
+                        {
+                            let skip = |rel: &str| ignore.is_ignored(rel);
+                            copy_context_dir(context_dir, &src, &scratch, &skip, None, None)?;
+                            out.temp.push(scratch.clone());
+                            scratch
+                        } else if *rw {
+                            if src.is_dir() {
+                                layer::copy_tree(&src, &scratch)?;
+                            } else {
+                                std::fs::copy(&src, &scratch)?;
+                            }
+                            out.temp.push(scratch.clone());
+                            scratch
+                        } else {
+                            src
+                        };
+                    // A stage or image is named by its id; context files by
+                    // their contents.
                     let contents = if from.is_some() {
                         origin
                     } else {
@@ -599,19 +693,8 @@ impl RunMounts {
                     };
                     out.key
                         .push_str(&format!("\0bind {source} {target} {rw} {contents}"));
-                    let mount_src = if *rw {
-                        if src.is_dir() {
-                            layer::copy_tree(&src, &scratch)?;
-                        } else {
-                            std::fs::copy(&src, &scratch)?;
-                        }
-                        out.temp.push(scratch);
-                        out.temp.last().cloned().unwrap()
-                    } else {
-                        src
-                    };
                     out.mounts.push(BuildMount::Nullfs {
-                        source: mount_src,
+                        source: src,
                         target: target.clone(),
                         read_only: !rw,
                     });
@@ -661,6 +744,23 @@ impl Drop for RunMounts {
             let _ = layer::remove_tree(p);
         }
     }
+}
+
+/// Whether `ignore` leaves out anything below `dir`, a context directory.
+fn any_ignored(context_dir: &Path, dir: &Path, ignore: &IgnoreMatcher) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let p = e.path();
+        let rel = p
+            .strip_prefix(context_dir)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        ignore.is_ignored(&rel)
+            || (!p.is_symlink() && p.is_dir() && any_ignored(context_dir, &p, ignore))
+    })
 }
 
 /// A digest of a file's or directory tree's contents and modes.
@@ -782,6 +882,124 @@ fn apply_cached(
     Ok(true)
 }
 
+/// Files a `COPY` or `ADD` takes from outside the context and stages:
+/// here-documents and, for `ADD`, downloads. Removed on drop.
+struct CopyExtras {
+    _dir: Option<tempfile::TempDir>,
+    files: Vec<PathBuf>,
+}
+
+impl CopyExtras {
+    async fn prepare(
+        spec: &CopySpec,
+        vars: &BTreeMap<String, String>,
+        tmp_dir: &Path,
+        is_add: bool,
+        line: usize,
+    ) -> Result<Self, Error> {
+        let urls: Vec<String> = spec
+            .sources
+            .iter()
+            .map(|s| expand_vars(s, vars))
+            .filter(|s| is_add && is_url(s))
+            .collect();
+        if spec.checksum.is_some() && (urls.len() != 1 || spec.sources.len() != 1) {
+            return Err(Error::Build(format!(
+                "line {line}: ADD --checksum needs exactly one http(s) source"
+            )));
+        }
+        if urls.is_empty() && spec.heredocs.is_empty() {
+            return Ok(Self {
+                _dir: None,
+                files: Vec::new(),
+            });
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("copy")
+            .tempdir_in(tmp_dir)?;
+        let mut files = Vec::new();
+        for (i, h) in spec.heredocs.iter().enumerate() {
+            let name = Path::new(&h.name).file_name().ok_or_else(|| {
+                Error::Build(format!("line {line}: here-document name {:?}", h.name))
+            })?;
+            let sub = dir.path().join(format!("h{i}"));
+            std::fs::create_dir(&sub)?;
+            let path = sub.join(name);
+            let text = if h.expand {
+                expand_vars(&h.body, vars)
+            } else {
+                h.body.clone()
+            };
+            std::fs::write(&path, text)?;
+            set_mode(&path, 0o644)?;
+            files.push(path);
+        }
+        for (i, url) in urls.iter().enumerate() {
+            let name = url
+                .split(['?', '#'])
+                .next()
+                .and_then(|u| u.rsplit('/').next())
+                .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+                .unwrap_or("download");
+            let sub = dir.path().join(format!("u{i}"));
+            std::fs::create_dir(&sub)?;
+            let path = sub.join(name);
+            download(url, &path, spec.checksum.as_deref(), line).await?;
+            set_mode(&path, 0o600)?;
+            files.push(path);
+        }
+        Ok(Self {
+            _dir: Some(dir),
+            files,
+        })
+    }
+}
+
+fn is_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Fetches `url` to `path`, checking its digest if `checksum` is given.
+async fn download(
+    url: &str,
+    path: &Path,
+    checksum: Option<&str>,
+    line: usize,
+) -> Result<(), Error> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let fail = |e: String| Error::Build(format!("line {line}: ADD {url}: {e}"));
+    let mut resp = reqwest::get(url).await.map_err(|e| fail(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(fail(format!("HTTP {}", resp.status())));
+    }
+    let mut file = std::fs::File::create(path)?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| fail(e.to_string()))? {
+        hasher.update(&chunk);
+        file.write_all(&chunk)?;
+    }
+    let got = format!("sha256:{:x}", hasher.finalize());
+    if let Some(want) = checksum
+        && want != got
+    {
+        return Err(fail(format!("checksum is {got}, expected {want}")));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u32) -> Result<(), Error> {
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_copy(
     context_dir: &Path,
@@ -790,7 +1008,8 @@ fn apply_copy(
     stage: &mut BuiltStage,
     vars: &BTreeMap<String, String>,
     spec: &CopySpec,
-    extract_archives: bool,
+    is_add: bool,
+    extras: &[PathBuf],
     line_no: usize,
 ) -> Result<(), Error> {
     let (src_root, use_ignore) = match &spec.from {
@@ -804,6 +1023,15 @@ fn apply_copy(
         }
         None => (context_dir, true),
     };
+    let exclude = IgnoreMatcher::parse(
+        &spec
+            .exclude
+            .iter()
+            .map(|p| expand_vars(p, vars))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let skip = |rel: &str| (use_ignore && ignore.is_ignored(rel)) || exclude.is_ignored(rel);
 
     let chown_ids = match &spec.chown {
         Some(ch) => {
@@ -828,63 +1056,87 @@ fn apply_copy(
         };
         format!("{}/{}", wd.trim_end_matches('/'), dest_expanded)
     };
-    let dest_is_dir_hint =
-        dest_expanded.ends_with('/') || dest_expanded == "." || spec.sources.len() > 1;
+    let dest_is_dir_hint = dest_expanded.ends_with('/')
+        || dest_expanded == "."
+        || spec.parents
+        || spec.sources.len() + spec.heredocs.len() > 1;
+    let dst_base = safe_join_in_root(&stage.root, &dest_in_container)?;
+    let place_file = |src: &Path, dst_base: &Path| -> Result<(), Error> {
+        let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
+            std::fs::create_dir_all(dst_base)?;
+            dst_base.join(
+                src.file_name()
+                    .ok_or_else(|| Error::Build(format!("line {line_no}: invalid source")))?,
+            )
+        } else {
+            if let Some(parent) = dst_base.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            dst_base.to_path_buf()
+        };
+        copy_single_entry(src, &final_dst, chown_ids, spec.chmod)
+    };
 
-    let mut matched_sources = Vec::new();
+    // Each match, with the path `--parents` keeps for it.
+    let mut matched_sources: Vec<(PathBuf, PathBuf)> = Vec::new();
     for raw_src in &spec.sources {
         let src_pat = expand_vars(raw_src, vars);
-        let matches = resolve_source_paths(src_root, &src_pat, line_no)?;
+        if is_add && is_url(&src_pat) {
+            continue;
+        }
+        // With `--parents`, `a/./b` keeps only the path below `a`.
+        let (pivot, pattern) = match src_pat.split_once("/./") {
+            Some((pivot, rest)) if spec.parents => (pivot.to_owned(), format!("{pivot}/{rest}")),
+            _ => (String::new(), src_pat.clone()),
+        };
+        let pivot_root = safe_join_in_root(src_root, pivot.trim_start_matches('/'))
+            .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
+        let matches = resolve_source_paths(src_root, &pattern, line_no)?;
         if matches.is_empty() {
             return Err(Error::Build(format!(
                 "line {line_no}: source {src_pat:?} not found"
             )));
         }
-        matched_sources.extend(matches);
+        for m in matches {
+            let rel = m.strip_prefix(src_root).unwrap_or(&m);
+            if skip(&rel.to_string_lossy().replace('\\', "/")) {
+                continue;
+            }
+            let kept = m.strip_prefix(&pivot_root).unwrap_or(rel).to_path_buf();
+            matched_sources.push((m, kept));
+        }
     }
 
-    for src_path in matched_sources {
-        let rel_to_src = src_path.strip_prefix(src_root).unwrap_or(&src_path);
-        let rel_str = rel_to_src.to_string_lossy().replace('\\', "/");
-        if use_ignore && ignore.is_ignored(&rel_str) {
-            continue;
-        }
+    for (src_path, kept) in matched_sources {
         let meta = std::fs::symlink_metadata(&src_path)?;
         if meta.is_dir() {
-            let dst_dir = safe_join_in_root(&stage.root, &dest_in_container)?;
             copy_context_dir(
                 src_root,
                 &src_path,
-                &dst_dir,
-                use_ignore.then_some(ignore),
+                &if spec.parents {
+                    dst_base.join(&kept)
+                } else {
+                    dst_base.clone()
+                },
+                &skip,
                 chown_ids,
                 spec.chmod,
             )?;
+        } else if is_add && is_archive_name(&src_path) {
+            std::fs::create_dir_all(&dst_base)?;
+            let tmp_tar = tempfile::NamedTempFile::new()?;
+            layer::decompress(&src_path, "", tmp_tar.path())?;
+            layer::extract(tmp_tar.path(), &dst_base)?;
+        } else if spec.parents {
+            let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
+            std::fs::create_dir_all(&parent)?;
+            copy_single_entry(&src_path, &dst_base.join(&kept), chown_ids, spec.chmod)?;
         } else {
-            if extract_archives && is_archive_name(&src_path) {
-                let dst_dir = safe_join_in_root(&stage.root, &dest_in_container)?;
-                std::fs::create_dir_all(&dst_dir)?;
-                let tmp_tar = tempfile::NamedTempFile::new()?;
-                layer::decompress(&src_path, "", tmp_tar.path())?;
-                layer::extract(tmp_tar.path(), &dst_dir)?;
-                continue;
-            }
-            let dst_base = safe_join_in_root(&stage.root, &dest_in_container)?;
-            let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
-                std::fs::create_dir_all(&dst_base)?;
-                dst_base.join(
-                    src_path
-                        .file_name()
-                        .ok_or_else(|| Error::Build(format!("line {line_no}: invalid source")))?,
-                )
-            } else {
-                if let Some(parent) = dst_base.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                dst_base
-            };
-            copy_single_entry(&src_path, &final_dst, chown_ids, spec.chmod)?;
+            place_file(&src_path, &dst_base)?;
         }
+    }
+    for extra in extras {
+        place_file(extra, &dst_base)?;
     }
     Ok(())
 }
@@ -894,44 +1146,40 @@ fn is_archive_name(p: &Path) -> bool {
     s.ends_with(".tar") || s.ends_with(".tar.gz") || s.ends_with(".tgz") || s.ends_with(".tar.zst")
 }
 
+/// The paths a source names, with wildcards allowed in any component.
 fn resolve_source_paths(
     src_root: &Path,
     pattern: &str,
     line_no: usize,
 ) -> Result<Vec<PathBuf>, Error> {
     let trimmed = pattern.trim_start_matches('/');
-    if trimmed.is_empty() || trimmed == "." {
-        return Ok(vec![src_root.to_path_buf()]);
-    }
-    let clean = safe_join_in_root(src_root, trimmed)
+    safe_join_in_root(src_root, trimmed)
         .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
-    if !trimmed.contains(['*', '?']) {
-        if std::fs::symlink_metadata(&clean).is_ok() {
-            return Ok(vec![clean]);
+    let mut found = vec![src_root.to_path_buf()];
+    for comp in trimmed.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        let mut next = Vec::new();
+        for dir in &found {
+            if comp.contains(['*', '?', '[']) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                let mut names: Vec<PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| glob_match(comp, n)))
+                    .map(|e| e.path())
+                    .collect();
+                names.sort();
+                next.extend(names);
+            } else {
+                let p = dir.join(comp);
+                if std::fs::symlink_metadata(&p).is_ok() {
+                    next.push(p);
+                }
+            }
         }
-        return Ok(Vec::new());
+        found = next;
     }
-    let Some(parent) = clean.parent() else {
-        return Ok(Vec::new());
-    };
-    let Some(file_pat) = clean.file_name().and_then(|f| f.to_str()) else {
-        return Ok(Vec::new());
-    };
-    if !parent.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut matches = Vec::new();
-    for entry in std::fs::read_dir(parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if let Some(s) = name.to_str()
-            && glob_match(file_pat, s)
-        {
-            matches.push(entry.path());
-        }
-    }
-    matches.sort();
-    Ok(matches)
+    Ok(found)
 }
 
 fn safe_join_in_root(root: &Path, rel: &str) -> Result<PathBuf, Error> {
@@ -954,7 +1202,7 @@ fn copy_context_dir(
     context_root: &Path,
     src_dir: &Path,
     dst_dir: &Path,
-    ignore: Option<&IgnoreMatcher>,
+    skip: &dyn Fn(&str) -> bool,
     chown_ids: Option<(u32, u32)>,
     chmod: Option<u32>,
 ) -> Result<(), Error> {
@@ -965,15 +1213,13 @@ fn copy_context_dir(
         let path = entry.path();
         let rel = path.strip_prefix(context_root).unwrap_or(&path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if let Some(ig) = ignore
-            && ig.is_ignored(&rel_str)
-        {
+        if skip(&rel_str) {
             continue;
         }
         let target = dst_dir.join(entry.file_name());
         let meta = std::fs::symlink_metadata(&path)?;
         if meta.is_dir() {
-            copy_context_dir(context_root, &path, &target, ignore, chown_ids, chmod)?;
+            copy_context_dir(context_root, &path, &target, skip, chown_ids, chmod)?;
         } else {
             copy_single_entry(&path, &target, chown_ids, chmod)?;
         }

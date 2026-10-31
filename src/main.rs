@@ -101,6 +101,19 @@ pub enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// Flatten the image, base included, into one layer
+        #[arg(long)]
+        squash: bool,
+
+        /// Keep cached layers that no image uses to about this size (e.g. 10g, or `none`)
+        #[arg(
+            long,
+            env = "JAILER_CACHE_MAX",
+            default_value = "10g",
+            value_name = "SIZE"
+        )]
+        cache_max: String,
+
         /// A secret for `RUN --mount=type=secret`: id=ID,src=FILE or id=ID,env=VAR
         #[arg(long = "secret", value_name = "id=ID,src=FILE")]
         secrets: Vec<String>,
@@ -564,6 +577,8 @@ async fn main() -> Result<()> {
             backend,
             strict,
             no_cache,
+            squash,
+            cache_max,
             secrets,
             creds,
             authfile,
@@ -599,6 +614,13 @@ async fn main() -> Result<()> {
                     creds: resolved_creds,
                     strict_lint: *strict,
                     no_cache: *no_cache,
+                    squash: *squash,
+                    cache_max: match cache_max.as_str() {
+                        "none" => None,
+                        v => Some(jailer::containerfile::parse_size(v).ok_or_else(|| {
+                            anyhow::anyhow!("--cache-max {v:?}: give a size such as 10g, or none")
+                        })?),
+                    },
                     secrets: parse_secrets(secrets)?,
                 },
             )

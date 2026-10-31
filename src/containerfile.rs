@@ -11,6 +11,20 @@ pub struct Containerfile {
     /// `ARG` instructions before the first `FROM`.
     pub global_args: Vec<(String, Option<String>)>,
     pub stages: Vec<Stage>,
+    /// Things the parser accepted but does not act on.
+    pub warnings: Vec<String>,
+}
+
+/// A here-document given to `RUN`, `COPY` or `ADD` (`<<EOF ... EOF`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    pub name: String,
+    /// The text, without leading tabs for `<<-`.
+    pub body: String,
+    /// False when the delimiter was quoted: the text is taken as is.
+    pub expand: bool,
+    /// The lines as written, through the closing delimiter.
+    raw: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +126,15 @@ pub struct CopySpec {
     pub chown: Option<String>,
     pub chmod: Option<u32>,
     pub sources: Vec<String>,
+    /// Files written from here-documents, named by their delimiters.
+    pub heredocs: Vec<Heredoc>,
     pub destination: String,
+    /// `--exclude` patterns, matched against paths below each source.
+    pub exclude: Vec<String>,
+    /// `--parents`: keep each source's path below the destination.
+    pub parents: bool,
+    /// `ADD --checksum=sha256:...` for a URL source.
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,17 +168,43 @@ impl Containerfile {
     }
 
     pub fn parse(input: &str) -> Result<Self, Error> {
-        let logical = join_logical_lines(input);
+        let mut warnings = Vec::new();
+        let mut escape = '\\';
+        for (line_no, key, value) in parser_directives(input) {
+            match key.as_str() {
+                "escape" => {
+                    escape = match value.as_str() {
+                        "\\" => '\\',
+                        "`" => '`',
+                        other => {
+                            return Err(Error::Build(format!(
+                                "line {line_no}: `# escape={other}`: use \\ or `"
+                            )));
+                        }
+                    }
+                }
+                "syntax" => warnings.push(format!(
+                    "line {line_no}: `# syntax={value}` is ignored: jailer parses the Containerfile itself"
+                )),
+                _ => {}
+            }
+        }
+        let logical = join_logical_lines(input, escape)?;
         let mut global_args = Vec::new();
         let mut stages: Vec<Stage> = Vec::new();
 
-        for (line_no, raw) in logical {
+        for Logical {
+            line: line_no,
+            text: raw,
+            heredocs,
+        } in logical
+        {
             let Some((verb, rest)) = split_verb(&raw) else {
                 continue;
             };
             let verb_upper = verb.to_ascii_uppercase();
             if verb_upper == "FROM" {
-                let (platform, from_spec, alias) = parse_from(rest, line_no)?;
+                let (platform, from_spec, alias) = parse_from(rest, line_no, escape)?;
                 let idx = stages.len();
                 stages.push(Stage {
                     index: idx,
@@ -178,7 +226,7 @@ impl Containerfile {
                     "line {line_no}: instruction `{verb_upper}` must appear after `FROM`"
                 )));
             }
-            let instruction = parse_instruction(&verb_upper, rest, line_no)?;
+            let instruction = parse_instruction(&verb_upper, rest, line_no, escape, heredocs)?;
             stages
                 .last_mut()
                 .expect("stage")
@@ -199,47 +247,188 @@ impl Containerfile {
         Ok(Self {
             global_args,
             stages,
+            warnings,
         })
     }
 }
 
-/// Joins lines ending with `\` while tracking the starting line number (1-based)
-/// and stripping comment lines.
-fn join_logical_lines(input: &str) -> Vec<(usize, String)> {
+/// Parses a base image's `ONBUILD` trigger, run as if at `line`.
+pub fn parse_trigger(trigger: &str, line: usize) -> Result<SpannedInstruction, Error> {
+    let (verb, rest) = split_verb(trigger)
+        .ok_or_else(|| Error::Build(format!("line {line}: empty ONBUILD trigger")))?;
+    if verb.eq_ignore_ascii_case("ONBUILD") {
+        return Err(Error::Build(format!(
+            "base image's `ONBUILD {trigger}`: ONBUILD cannot be nested"
+        )));
+    }
+    let instruction =
+        parse_instruction(&verb.to_ascii_uppercase(), rest, line, '\\', Vec::new())
+            .map_err(|e| Error::Build(format!("base image's `ONBUILD {trigger}`: {e}")))?;
+    Ok(SpannedInstruction {
+        line,
+        raw: trigger.to_owned(),
+        instruction,
+    })
+}
+
+/// The `# key=value` lines at the top of the file, before any blank line,
+/// comment or instruction, with lowercased keys.
+fn parser_directives(input: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    for (idx, line) in input.lines().enumerate() {
+        let Some((key, value)) = line
+            .trim()
+            .strip_prefix('#')
+            .and_then(|l| l.split_once('='))
+        else {
+            break;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+            break;
+        }
+        out.push((idx + 1, key.to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    out
+}
+
+/// One instruction: its first line number, its text with continuation
+/// lines joined, and the here-documents that follow it.
+struct Logical {
+    line: usize,
+    text: String,
+    heredocs: Vec<Heredoc>,
+}
+
+/// Joins lines ending with the escape character, drops comment lines, and
+/// reads the bodies of the here-documents `RUN`, `COPY` and `ADD` open.
+fn join_logical_lines(input: &str, escape: char) -> Result<Vec<Logical>, Error> {
+    let lines: Vec<&str> = input.lines().map(|l| l.trim_end_matches('\r')).collect();
     let mut out = Vec::new();
     let mut current = String::new();
     let mut start_line = 1usize;
+    let mut idx = 0;
 
-    for (idx, raw_line) in input.lines().enumerate() {
-        let line_no = idx + 1;
-        let line = raw_line.trim_end_matches('\r');
+    while idx < lines.len() {
+        let line = lines[idx];
+        idx += 1;
         let trimmed = line.trim();
         if current.is_empty() {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            start_line = line_no;
+            start_line = idx;
         } else if trimmed.starts_with('#') {
             // Comment line inside a multi-line continuation is skipped.
             continue;
         }
-        if let Some(without_bs) = line.trim_end().strip_suffix('\\') {
+        if let Some(without_escape) = line.trim_end().strip_suffix(escape) {
             if !current.is_empty() {
                 current.push(' ');
             }
-            current.push_str(without_bs.trim());
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-                current.push_str(trimmed);
-                out.push((start_line, std::mem::take(&mut current)));
-            } else {
-                out.push((start_line, trimmed.to_owned()));
+            current.push_str(without_escape.trim());
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+        let text = std::mem::take(&mut current);
+        let mut heredocs = Vec::new();
+        let verb = text.split_whitespace().next().unwrap_or("");
+        if ["RUN", "COPY", "ADD"].contains(&verb.to_ascii_uppercase().as_str()) {
+            for (name, strip_tabs, expand) in heredoc_markers(&text) {
+                let mut body = String::new();
+                let mut raw = String::new();
+                loop {
+                    let Some(l) = lines.get(idx) else {
+                        return Err(Error::Build(format!(
+                            "line {start_line}: here-document `{name}` is not closed"
+                        )));
+                    };
+                    idx += 1;
+                    raw.push_str(l);
+                    raw.push('\n');
+                    let l = if strip_tabs {
+                        l.trim_start_matches('\t')
+                    } else {
+                        l
+                    };
+                    if l == name {
+                        break;
+                    }
+                    body.push_str(l);
+                    body.push('\n');
+                }
+                heredocs.push(Heredoc {
+                    name,
+                    body,
+                    expand,
+                    raw,
+                });
             }
         }
+        out.push(Logical {
+            line: start_line,
+            text,
+            heredocs,
+        });
     }
     if !current.is_empty() {
-        out.push((start_line, current));
+        out.push(Logical {
+            line: start_line,
+            text: current,
+            heredocs: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+/// The here-documents a line opens, in order: words outside quotes of the
+/// form `<<NAME`, `<<-NAME`, `<<"NAME"` or `<<'NAME'`, as name, whether
+/// leading tabs are stripped, and whether the text is expanded.
+fn heredoc_markers(text: &str) -> Vec<(String, bool, bool)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for c in text.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                continue;
+            }
+            None => {}
+        }
+        word.push(c);
+    }
+    words.push(word);
+    let mut out = Vec::new();
+    for w in words {
+        let Some(rest) = w.strip_prefix("<<") else {
+            continue;
+        };
+        let (strip_tabs, rest) = match rest.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let (name, expand) = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) if rest.len() >= 2 && rest.ends_with(q) => {
+                (&rest[1..rest.len() - 1], false)
+            }
+            _ => (rest, true),
+        };
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-./".contains(c))
+        {
+            out.push((name.to_owned(), strip_tabs, expand));
+        }
     }
     out
 }
@@ -256,8 +445,9 @@ fn split_verb(line: &str) -> Option<(&str, &str)> {
 fn parse_from(
     rest: &str,
     line_no: usize,
+    escape: char,
 ) -> Result<(Option<String>, String, Option<String>), Error> {
-    let tokens = tokenize_words(rest);
+    let tokens = tokenize_words(rest, escape);
     let mut idx = 0;
     let mut platform = None;
     while idx < tokens.len() && tokens[idx].starts_with("--") {
@@ -301,32 +491,50 @@ fn parse_arg(rest: &str, line_no: usize) -> Result<(String, Option<String>), Err
     }
 }
 
-fn parse_instruction(verb: &str, rest: &str, line_no: usize) -> Result<Instruction, Error> {
+fn parse_instruction(
+    verb: &str,
+    rest: &str,
+    line_no: usize,
+    escape: char,
+    heredocs: Vec<Heredoc>,
+) -> Result<Instruction, Error> {
+    if !heredocs.is_empty() && !matches!(verb, "RUN" | "COPY" | "ADD") {
+        return Err(Error::Build(format!(
+            "line {line_no}: here-documents are for RUN, COPY and ADD"
+        )));
+    }
     match verb {
         "ARG" => {
             let (name, default) = parse_arg(rest, line_no)?;
             Ok(Instruction::Arg { name, default })
         }
-        "ENV" => Ok(Instruction::Env(parse_key_values(rest, line_no, "ENV")?)),
+        "ENV" => Ok(Instruction::Env(parse_key_values(
+            rest, line_no, "ENV", escape,
+        )?)),
         "LABEL" => Ok(Instruction::Label(parse_key_values(
-            rest, line_no, "LABEL",
+            rest, line_no, "LABEL", escape,
         )?)),
         "WORKDIR" => Ok(Instruction::Workdir(unquote(rest.trim()))),
         "USER" => Ok(Instruction::User(unquote(rest.trim()))),
-        "COPY" => Ok(Instruction::Copy(parse_copy(rest, line_no, true)?)),
-        "ADD" => Ok(Instruction::Add(parse_copy(rest, line_no, false)?)),
+        "COPY" => Ok(Instruction::Copy(parse_copy(
+            rest, line_no, true, escape, heredocs,
+        )?)),
+        "ADD" => Ok(Instruction::Add(parse_copy(
+            rest, line_no, false, escape, heredocs,
+        )?)),
         "RUN" => {
             let (opts, command) = parse_run_flags(rest, line_no)?;
-            Ok(Instruction::Run(parse_command_form(command), opts))
+            let form = run_heredocs(parse_command_form(command), heredocs, line_no)?;
+            Ok(Instruction::Run(form, opts))
         }
         "CMD" => Ok(Instruction::Cmd(parse_command_form(rest))),
         "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command_form(rest))),
-        "EXPOSE" => Ok(Instruction::Expose(tokenize_words(rest))),
+        "EXPOSE" => Ok(Instruction::Expose(tokenize_words(rest, escape))),
         "VOLUME" => {
             if let Some(arr) = try_parse_json_array(rest) {
                 Ok(Instruction::Volume(arr))
             } else {
-                Ok(Instruction::Volume(tokenize_words(rest)))
+                Ok(Instruction::Volume(tokenize_words(rest, escape)))
             }
         }
         "STOPSIGNAL" => Ok(Instruction::Stopsignal(unquote(rest.trim()))),
@@ -339,11 +547,63 @@ fn parse_instruction(verb: &str, rest: &str, line_no: usize) -> Result<Instructi
             })?;
             Ok(Instruction::Shell(arr))
         }
-        "ONBUILD" => Ok(Instruction::Onbuild(rest.trim().to_owned())),
+        "ONBUILD" => {
+            let trigger = rest.trim();
+            let Some((inner, inner_rest)) = split_verb(trigger) else {
+                return Err(Error::Build(format!(
+                    "line {line_no}: `ONBUILD` needs an instruction"
+                )));
+            };
+            let inner = inner.to_ascii_uppercase();
+            if matches!(inner.as_str(), "ONBUILD" | "FROM" | "MAINTAINER") {
+                return Err(Error::Build(format!(
+                    "line {line_no}: `ONBUILD {inner}` is not allowed"
+                )));
+            }
+            parse_instruction(&inner, inner_rest, line_no, escape, Vec::new())?;
+            Ok(Instruction::Onbuild(trigger.to_owned()))
+        }
         other => Err(Error::Build(format!(
             "line {line_no}: unknown Containerfile instruction `{other}`"
         ))),
     }
+}
+
+/// Gives a shell-form `RUN` its here-documents. A command that is only a
+/// here-document runs its text, with the interpreter a `#!` line names;
+/// otherwise the shell reads the here-documents itself.
+fn run_heredocs(
+    form: CommandForm,
+    heredocs: Vec<Heredoc>,
+    line_no: usize,
+) -> Result<CommandForm, Error> {
+    if heredocs.is_empty() {
+        return Ok(form);
+    }
+    let CommandForm::Shell(cmd) = form else {
+        return Err(Error::Build(format!(
+            "line {line_no}: here-documents need the shell form of `RUN`"
+        )));
+    };
+    let only = cmd.trim();
+    if heredocs.len() == 1 && only.starts_with("<<") && !only.contains(char::is_whitespace) {
+        let h = &heredocs[0];
+        if let Some(rest) = h.body.strip_prefix("#!") {
+            let (interp, script) = rest.split_once('\n').unwrap_or((rest, ""));
+            return Ok(CommandForm::Shell(format!(
+                "{} <<'{name}'\n{script}{name}\n",
+                interp.trim(),
+                name = h.name
+            )));
+        }
+        return Ok(CommandForm::Shell(h.body.clone()));
+    }
+    let mut text = cmd;
+    text.push('\n');
+    for h in &heredocs {
+        text.push_str(&h.raw);
+    }
+    Ok(CommandForm::Shell(text))
 }
 
 /// Splits `--mount=...` and `--network=...` off the front of a `RUN`.
@@ -481,7 +741,8 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
 }
 
 /// `1024`, `64k`, `512m`, `2g` (optionally with a trailing `b`) in bytes.
-fn parse_size(v: &str) -> Option<u64> {
+/// A size such as `512`, `64k`, `100m` or `10g` (a trailing `b` is allowed).
+pub fn parse_size(v: &str) -> Option<u64> {
     let lower = v.to_ascii_lowercase();
     let s = lower.strip_suffix('b').unwrap_or(&lower);
     let (num, mult) = match s.chars().last()? {
@@ -510,58 +771,98 @@ fn try_parse_json_array(s: &str) -> Option<Vec<String>> {
     }
 }
 
-fn parse_copy(rest: &str, line_no: usize, allow_from: bool) -> Result<CopySpec, Error> {
-    let mut tokens = tokenize_words(rest);
-    let mut from = None;
-    let mut chown = None;
-    let mut chmod = None;
-
-    while tokens.first().is_some_and(|t| t.starts_with("--")) {
-        let flag = tokens.remove(0);
-        if allow_from && let Some(v) = flag.strip_prefix("--from=") {
-            from = Some(v.to_owned());
-        } else if let Some(v) = flag.strip_prefix("--chown=") {
-            chown = Some(v.to_owned());
-        } else if let Some(v) = flag.strip_prefix("--chmod=") {
-            let mode = u32::from_str_radix(v, 8)
-                .ok()
-                .filter(|m| *m <= 0o7777)
-                .ok_or_else(|| {
-                    Error::Build(format!("line {line_no}: invalid --chmod mode `{v}`"))
-                })?;
-            chmod = Some(mode);
-        } else {
-            return Err(Error::Build(format!(
-                "line {line_no}: unsupported flag `{flag}`"
-            )));
+fn parse_copy(
+    rest: &str,
+    line_no: usize,
+    is_copy: bool,
+    escape: char,
+    heredocs: Vec<Heredoc>,
+) -> Result<CopySpec, Error> {
+    let what = if is_copy { "COPY" } else { "ADD" };
+    let bad = |msg: String| Error::Build(format!("line {line_no}: {what} {msg}"));
+    let switch = |flag: &str, v: Option<&str>| match v {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(v) => Err(bad(format!("--{flag}={v}: give true or false"))),
+    };
+    let mut spec = CopySpec {
+        from: None,
+        chown: None,
+        chmod: None,
+        sources: Vec::new(),
+        heredocs,
+        destination: String::new(),
+        exclude: Vec::new(),
+        parents: false,
+        checksum: None,
+    };
+    let mut rest = rest.trim_start();
+    while rest.starts_with("--") {
+        let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        rest = tail.trim_start();
+        let (name, value) = match flag[2..].split_once('=') {
+            Some((n, v)) => (n, Some(unquote(v))),
+            None => (&flag[2..], None),
+        };
+        let need = || {
+            value
+                .clone()
+                .ok_or_else(|| bad(format!("--{name} needs a value")))
+        };
+        match name {
+            "from" if is_copy => spec.from = Some(need()?),
+            "chown" => spec.chown = Some(need()?),
+            "chmod" => {
+                let v = need()?;
+                let mode = u32::from_str_radix(&v, 8)
+                    .ok()
+                    .filter(|m| *m <= 0o7777)
+                    .ok_or_else(|| bad(format!("invalid --chmod mode `{v}`")))?;
+                spec.chmod = Some(mode);
+            }
+            "exclude" => spec.exclude.push(need()?),
+            "parents" if is_copy => spec.parents = switch(name, value.as_deref())?,
+            // Layers are always rebuilt from content here, so `--link`
+            // changes nothing.
+            "link" => {
+                switch(name, value.as_deref())?;
+            }
+            "checksum" if !is_copy => {
+                let v = need()?;
+                let hex = v.strip_prefix("sha256:").unwrap_or("");
+                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(bad(format!("--checksum={v}: give sha256:<64 hex digits>")));
+                }
+                spec.checksum = Some(v.to_ascii_lowercase());
+            }
+            _ => return Err(bad(format!("does not support `{flag}`"))),
         }
     }
 
-    if tokens.len() < 2 {
-        return Err(Error::Build(format!(
-            "line {line_no}: requires at least one source and a destination"
-        )));
+    let mut words = try_parse_json_array(rest).unwrap_or_else(|| tokenize_words(rest, escape));
+    // Words naming here-documents stand for the files `spec.heredocs` holds.
+    words.retain(|w| !(w.starts_with("<<") && w.len() > 2));
+    if words.is_empty() || words.len() + spec.heredocs.len() < 2 {
+        return Err(bad(
+            "requires at least one source and a destination".to_owned()
+        ));
     }
-    let destination = tokens.pop().unwrap();
-    Ok(CopySpec {
-        from,
-        chown,
-        chmod,
-        sources: tokens,
-        destination,
-    })
+    spec.destination = words.pop().unwrap();
+    spec.sources = words;
+    Ok(spec)
 }
 
 fn parse_key_values(
     rest: &str,
     line_no: usize,
     what: &str,
+    escape: char,
 ) -> Result<Vec<(String, String)>, Error> {
     let rest = rest.trim();
     if rest.is_empty() {
         return Err(Error::Build(format!("line {line_no}: empty `{what}`")));
     }
-    let tokens = tokenize_words(rest);
+    let tokens = tokenize_words(rest, escape);
     if tokens.first().is_some_and(|t| !t.contains('=')) {
         // Legacy `ENV KEY value with spaces` form
         let Some((k, v)) = split_verb(rest) else {
@@ -583,7 +884,7 @@ fn parse_key_values(
     Ok(out)
 }
 
-fn tokenize_words(s: &str) -> Vec<String> {
+fn tokenize_words(s: &str, escape: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut chars = s.chars().peekable();
@@ -594,7 +895,7 @@ fn tokenize_words(s: &str) -> Vec<String> {
             Some(q) => {
                 if c == q {
                     quote = None;
-                } else if c == '\\' && q == '"' {
+                } else if c == escape && q == '"' {
                     if let Some(next) = chars.next() {
                         cur.push(next);
                     }
@@ -609,7 +910,7 @@ fn tokenize_words(s: &str) -> Vec<String> {
                     if !cur.is_empty() {
                         out.push(std::mem::take(&mut cur));
                     }
-                } else if c == '\\' {
+                } else if c == escape {
                     if let Some(next) = chars.next() {
                         cur.push(next);
                     }
@@ -778,9 +1079,39 @@ fn glob_rec(p: &[char], t: &[char]) -> bool {
         (None, None) => true,
         (Some('*'), _) => glob_rec(&p[1..], t) || (!t.is_empty() && glob_rec(p, &t[1..])),
         (Some('?'), Some(c)) if *c != '/' => glob_rec(&p[1..], &t[1..]),
+        (Some('['), Some(c)) if *c != '/' => match glob_class(&p[1..], *c) {
+            Some((hit, rest)) => hit && glob_rec(rest, &t[1..]),
+            None => *c == '[' && glob_rec(&p[1..], &t[1..]),
+        },
         (Some(pc), Some(tc)) if pc == tc => glob_rec(&p[1..], &t[1..]),
         _ => false,
     }
+}
+
+/// Matches `c` against a `[...]` class whose text follows the `[`: whether
+/// it matched and the pattern after the `]`, or None if the class is not
+/// closed.
+fn glob_class(p: &[char], c: char) -> Option<(bool, &[char])> {
+    let (negated, mut i) = match p.first() {
+        Some('^' | '!') => (true, 1),
+        _ => (false, 0),
+    };
+    let mut hit = false;
+    let mut first = true;
+    while let Some(&lo) = p.get(i) {
+        if lo == ']' && !first {
+            return Some((hit != negated, &p[i + 1..]));
+        }
+        first = false;
+        if p.get(i + 1) == Some(&'-') && p.get(i + 2).is_some_and(|hi| *hi != ']') {
+            hit |= (lo..=p[i + 2]).contains(&c);
+            i += 3;
+        } else {
+            hit |= lo == c;
+            i += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -831,7 +1162,7 @@ CMD ["--serve"]
 
     #[test]
     fn run_flags() {
-        let parse = |s: &str| parse_instruction("RUN", s, 1);
+        let parse = |s: &str| parse_instruction("RUN", s, 1, '\\', Vec::new());
         let Instruction::Run(CommandForm::Shell(cmd), opts) = parse(
             "--mount=type=cache,target=/var/cache/pkg --mount=type=secret,id=tok \
              --mount=type=bind,from=builder,source=/out,target=/in,rw \
@@ -897,17 +1228,158 @@ CMD ["--serve"]
     fn chmod_modes() {
         for (v, want) in [("0", 0), ("0000", 0), ("755", 0o755), ("04755", 0o4755)] {
             assert_eq!(
-                parse_copy(&format!("--chmod={v} a /b"), 1, true)
-                    .unwrap()
-                    .chmod,
+                copy(&format!("--chmod={v} a /b")).unwrap().chmod,
                 Some(want)
             );
         }
         for v in ["", "8", "10000", "u+x"] {
+            assert!(copy(&format!("--chmod={v} a /b")).is_err(), "{v}");
+        }
+    }
+
+    fn copy(rest: &str) -> Result<CopySpec, Error> {
+        parse_copy(rest, 1, true, '\\', Vec::new())
+    }
+
+    fn only_stage(text: &str) -> Vec<Instruction> {
+        let cf = Containerfile::parse(text).unwrap();
+        cf.stages[0]
+            .instructions
+            .iter()
+            .map(|i| i.instruction.clone())
+            .collect()
+    }
+
+    #[test]
+    fn copy_flags_and_json_form() {
+        let spec = copy("--exclude=*.md --exclude=tmp --parents --link a/./b c /d/").unwrap();
+        assert_eq!(spec.exclude, ["*.md", "tmp"]);
+        assert!(spec.parents);
+        assert_eq!(spec.sources, ["a/./b", "c"]);
+        assert_eq!(spec.destination, "/d/");
+        let spec = copy(r#"--chown=1:1 ["a b", "/c d/"]"#).unwrap();
+        assert_eq!(spec.sources, ["a b"]);
+        assert_eq!(spec.destination, "/c d/");
+        assert!(copy("--checksum=sha256:00 a /b").is_err());
+        assert!(copy("--parents=maybe a /b").is_err());
+        let sum = format!("sha256:{}", "A".repeat(64));
+        let add = parse_copy(
+            &format!("--checksum={sum} https://x/y /z"),
+            1,
+            false,
+            '\\',
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(add.checksum, Some(sum.to_ascii_lowercase()));
+        assert!(parse_copy("--parents a /b", 1, false, '\\', Vec::new()).is_err());
+    }
+
+    #[test]
+    fn heredocs() {
+        let ins = only_stage(
+            "FROM scratch
+RUN <<EOF
+echo one
+# not a comment here
+EOF
+RUN <<-EOT
+\techo two
+\tEOT
+RUN python3 <<'PY' > /out && cat <<A <<B
+print(1)
+PY
+a $x
+A
+b
+B
+RUN <<EOF
+#!/usr/local/bin/python3
+print(3)
+EOF
+COPY --chmod=600 <<cfg.ini <<\"raw.txt\" /etc/app/
+k=$v
+cfg.ini
+$kept
+raw.txt
+RUN echo $((1<<2)) \"<<NOT\"
+",
+        );
+        let shell = |i: usize| match &ins[i] {
+            Instruction::Run(CommandForm::Shell(s), _) => s.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shell(0), "echo one\n# not a comment here\n");
+        assert_eq!(shell(1), "echo two\n");
+        assert_eq!(
+            shell(2),
+            "python3 <<'PY' > /out && cat <<A <<B\nprint(1)\nPY\na $x\nA\nb\nB\n"
+        );
+        assert_eq!(shell(3), "/usr/local/bin/python3 <<'EOF'\nprint(3)\nEOF\n");
+        let Instruction::Copy(spec) = &ins[4] else {
+            panic!("{:?}", ins[4]);
+        };
+        assert!(spec.sources.is_empty());
+        assert_eq!(spec.destination, "/etc/app/");
+        let docs: Vec<_> = spec
+            .heredocs
+            .iter()
+            .map(|h| (h.name.as_str(), h.body.as_str(), h.expand))
+            .collect();
+        assert_eq!(
+            docs,
+            [("cfg.ini", "k=$v\n", true), ("raw.txt", "$kept\n", false)]
+        );
+        assert_eq!(shell(5), "echo $((1<<2)) \"<<NOT\"");
+        assert!(Containerfile::parse("FROM scratch\nRUN <<EOF\necho\n").is_err());
+    }
+
+    #[test]
+    fn parser_directives() {
+        let cf = Containerfile::parse(
+            "# syntax=docker/dockerfile:1
+# escape=`
+FROM scratch
+COPY a\\b `
+  c /d
+",
+        )
+        .unwrap();
+        assert_eq!(cf.warnings.len(), 1);
+        let Instruction::Copy(spec) = &cf.stages[0].instructions[0].instruction else {
+            panic!();
+        };
+        assert_eq!(spec.sources, ["a\\b", "c"]);
+        // Directives only count before anything else.
+        let cf = Containerfile::parse("\n# escape=`\nFROM scratch\nRUN a \\\n b\n").unwrap();
+        assert_eq!(
+            cf.stages[0].instructions[0].instruction,
+            Instruction::Run(CommandForm::Shell("a b".into()), RunOptions::default())
+        );
+        assert!(Containerfile::parse("# escape=x\nFROM scratch\n").is_err());
+    }
+
+    #[test]
+    fn onbuild_triggers_are_checked() {
+        assert!(Containerfile::parse("FROM scratch\nONBUILD RUN make\n").is_ok());
+        for bad in ["ONBUILD ONBUILD RUN x", "ONBUILD FROM x", "ONBUILD BOGUS"] {
             assert!(
-                parse_copy(&format!("--chmod={v} a /b"), 1, true).is_err(),
-                "{v}"
+                Containerfile::parse(&format!("FROM scratch\n{bad}\n")).is_err(),
+                "{bad}"
             );
         }
+        assert!(parse_trigger("ONBUILD RUN x", 1).is_err());
+        assert_eq!(parse_trigger("COPY . /src", 3).unwrap().raw, "COPY . /src");
+    }
+
+    #[test]
+    fn glob_classes() {
+        assert!(glob_match("[ab]*.rs", "a1.rs"));
+        assert!(!glob_match("[ab]*.rs", "c1.rs"));
+        assert!(glob_match("v[0-9]", "v7"));
+        assert!(glob_match("v[!0-9]", "vx"));
+        assert!(!glob_match("v[^0-9]", "v1"));
+        assert!(glob_match("[]]", "]"));
+        assert!(glob_match("a[", "a["));
     }
 }

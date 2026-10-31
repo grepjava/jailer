@@ -46,6 +46,11 @@ ZFS dataset for image layers and container clones.
 It is created if missing.
 .It Fl -no-zfs
 Use plain directory storage even when ZFS is available.
+Image files keep their flags, so the state directory holds files marked
+.Cm schg ,
+as FreeBSD's base system does; to remove it by hand, run
+.Ql chflags -R noschg
+on it first.
 .It Fl -plain-http Ar host Ns Op : Ns Ar port
 Talk to this registry over HTTP instead of HTTPS.
 May be given more than once.
@@ -89,12 +94,14 @@ overwrites an existing
 .It Xo
 .Nm build
 .Op Fl -no-cache
+.Op Fl -squash
 .Op Fl -strict
 .Op Fl f Ar file
 .Op Fl t Ar name Ns Op : Ns Ar tag
 .Op Fl -authfile Ar path
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
+.Op Fl -cache-max Ar size
 .Op Fl -creds Ar user Ns Op : Ns Ar password
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -target Ar stage
@@ -119,7 +126,14 @@ running;
 runs every step.
 Cached layers are kept, also for a multi-stage build's intermediate
 stages, until
-.Nm prune Fl -cache .
+.Nm prune Fl -cache ,
+or until those no image uses outgrow
+.Ar size
+(compressed; default
+.Ql 10g ,
+or
+.Cm none
+for no limit), when a build drops the least recently used.
 .Pp
 A
 .Cm RUN
@@ -137,9 +151,11 @@ set it up when first made, and
 .Cm ro
 mounts it read-only.
 .It Fl -mount Ns = Ns Cm type=bind , Ns Cm target Ns = Ns Ar path
-The build context, or with
+The build context, less what
+.Pa .containerignore
+leaves out, or with
 .Cm from Ns = Ns Ar stage
-an earlier stage's files;
+an earlier stage's files, or an image's;
 .Cm source
 picks a path in it (default the whole).
 Read-only, unless
@@ -166,10 +182,62 @@ An empty memory file system, of at most
 bytes
 .Pq e.g. Ql 64m .
 .El
+.Pp
+Also as in Docker:
+.Bl -bullet -width Ds
+.It
+Here-documents.
+.Ql RUN <<EOF
+runs the lines up to
+.Ql EOF
+as a script, with the interpreter a
+.Ql #!
+line names;
+.Ql RUN cmd <<EOF
+gives them to the shell, and
+.Ql COPY <<name dest
+writes them to a file
+.Ar name .
+.It
+.Cm COPY Fl -exclude Ns = Ns Ar pattern ,
+.Fl -parents ,
+which keeps each source's path below the destination
+(or the part after
+.Ql /./ ) ,
+and
+.Fl -link ,
+accepted with no effect.
+Wildcards may appear in any part of a source path.
+.It
+.Cm ADD Ar url ,
+downloaded with mode 0600 and not unpacked, and checked with
+.Fl -checksum Ns = Ns Cm sha256: Ns Ar hex .
+.It
+.Cm ONBUILD ,
+whose instructions are kept in the image and run by builds that use it
+as a base.
+.It
+The
+.Ql # escape=
+parser directive;
+.Ql # syntax=
+is ignored with a warning.
+.It
+.Cm FROM Fl -platform
+and the
+.Ev BUILDPLATFORM , TARGETPLATFORM , TARGETOS
+and
+.Ev TARGETARCH
+arguments.
+jailer builds only for the host's platform, and refuses any other.
+.El
+.Pp
 .Fl -strict
 fails the build when the compatibility check reports an error.
 .Fl -target
 stops at the named stage.
+.Fl -squash
+flattens the image, its base included, into one layer.
 .Fl -backend Cm buildah
 delegates the build to
 .Xr buildah 1
@@ -266,6 +334,12 @@ by default the current project's image, to the registry reference
 .Xc
 Write an OCI archive suitable for
 .Ql legion image load .
+It also holds Docker's
+.Pa manifest.json ,
+for
+.Ql podman load
+and
+.Ql docker load .
 .Fl -name
 overrides the reference recorded in the archive.
 .It Nm check Op Ar target
@@ -368,6 +442,9 @@ Default for
 .It Ev JAILER_NO_ZFS
 Default for
 .Fl -no-zfs .
+.It Ev JAILER_CACHE_MAX
+Default for
+.Nm build Fl -cache-max .
 .El
 .Sh FILES
 .Bl -tag -width Ds

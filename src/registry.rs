@@ -132,14 +132,7 @@ impl Client {
         match resp.status() {
             s if s.is_success() => Ok(resp),
             StatusCode::NOT_FOUND => Err(Error::NotFound(format!("{r}: {path} not found"))),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Registry(format!(
-                "{r}: access denied{}",
-                if creds.is_none() {
-                    " (no credentials)"
-                } else {
-                    ""
-                }
-            ))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(denied(r, creds)),
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(Error::Registry(format!(
@@ -185,14 +178,7 @@ impl Client {
         match resp.status() {
             s if s.is_success() => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Registry(format!(
-                "{r}: access denied{}",
-                if creds.is_none() {
-                    " (no credentials)"
-                } else {
-                    ""
-                }
-            ))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(denied(r, creds)),
             s => Err(Error::Registry(format!("{url}: {s}"))),
         }
     }
@@ -356,14 +342,7 @@ impl Client {
         }
         match resp.status() {
             s if s.is_success() => Ok(digest),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Registry(format!(
-                "{r}: access denied{}",
-                if creds.is_none() {
-                    " (no credentials)"
-                } else {
-                    ""
-                }
-            ))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(denied(r, creds)),
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(Error::Registry(format!(
@@ -392,9 +371,7 @@ impl Client {
         {
             Some(rest) => rest,
             None => {
-                return basic.ok_or_else(|| {
-                    Error::Registry(format!("{r}: access denied (no credentials)"))
-                });
+                return basic.ok_or_else(|| denied(r, None));
             }
         };
         let params = parse_challenge(rest);
@@ -576,6 +553,15 @@ pub fn sha256(bytes: &[u8]) -> String {
 }
 
 /// `realm="...",service="...",scope="..."`.
+/// The error for a 401 or 403, which Docker Hub also gives for a
+/// repository that does not exist.
+fn denied(r: &Reference, creds: Option<&Credentials>) -> Error {
+    Error::Registry(match creds {
+        None => format!("{r}: not found, or access denied (no credentials given)"),
+        Some(c) => format!("{r}: not found, or access denied to {}", c.username),
+    })
+}
+
 fn parse_challenge(s: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut rest = s.trim();

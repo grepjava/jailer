@@ -586,6 +586,10 @@ impl Store {
             }
             pin.add(&[&l.chain, hex_of(&l.descriptor.digest)?])?;
         }
+        // The entry's mtime records its last use, for `trim_cache`.
+        if let Ok(f) = File::options().append(true).open(&path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
         Ok(Some(step))
     }
 
@@ -674,6 +678,26 @@ impl Store {
                 std::fs::copy(&src_blob, &dst_blob)?;
             }
         }
+
+        // Docker's archive manifest as well, as `docker save` writes it, so
+        // that `docker load` and `podman load` take the archive too.
+        let layer_paths = manifest
+            .layers
+            .iter()
+            .map(|d| Ok(format!("blobs/sha256/{}", hex_of(&d.digest)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let repo_tags: Vec<&str> = Some(ref_name.as_str())
+            .filter(|n| !n.contains('@'))
+            .into_iter()
+            .collect();
+        std::fs::write(
+            tmp.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!([{
+                "Config": format!("blobs/sha256/{}", hex_of(&manifest.config.digest)?),
+                "RepoTags": repo_tags,
+                "Layers": layer_paths,
+            }]))?,
+        )?;
 
         let mut annotations = BTreeMap::new();
         annotations.insert("org.opencontainers.image.ref.name".to_owned(), ref_name);
@@ -1136,6 +1160,66 @@ impl Store {
         }
         let images = self.images()?;
         Ok(self.prune_held(&images).await?.len())
+    }
+
+    /// Drops the least recently used build cache entries until the layers
+    /// only the cache keeps fit in `max` bytes, counted by compressed size,
+    /// then removes what nothing uses any more. Returns the entries dropped.
+    ///
+    /// On ZFS a layer stays while a later cached layer is cloned from it, so
+    /// the space used may stay above `max` until that one is dropped too.
+    pub async fn trim_cache(&self, max: u64) -> Result<usize, Error> {
+        let _held = self.hold().await?;
+        let Ok(listed) = std::fs::read_dir(self.dir.join("cache")) else {
+            return Ok(0);
+        };
+        let images = self.images()?;
+        let in_images: BTreeSet<&str> = images
+            .iter()
+            .flat_map(|i| i.layers.iter().map(String::as_str))
+            .collect();
+        // Per layer: its size, the last use of an entry naming it, and those
+        // entries.
+        let mut layers: BTreeMap<String, (u64, std::time::SystemTime, Vec<PathBuf>)> =
+            BTreeMap::new();
+        for e in listed {
+            let e = e?;
+            let path = e.path();
+            let Some(l) = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<CachedStep>(&b).ok())
+                .and_then(|c| c.layer)
+            else {
+                continue;
+            };
+            if in_images.contains(l.chain.as_str()) {
+                continue;
+            }
+            let used = e.metadata()?.modified()?;
+            let slot = layers
+                .entry(l.chain)
+                .or_insert((l.descriptor.size, used, Vec::new()));
+            slot.1 = slot.1.max(used);
+            slot.2.push(path);
+        }
+        let mut total: u64 = layers.values().map(|l| l.0).sum();
+        let mut by_age: Vec<_> = layers.into_values().collect();
+        by_age.sort_by_key(|l| l.1);
+        let mut dropped = 0;
+        for (size, _, paths) in by_age {
+            if total <= max {
+                break;
+            }
+            for p in paths {
+                std::fs::remove_file(p)?;
+                dropped += 1;
+            }
+            total -= size;
+        }
+        if dropped > 0 {
+            self.prune_held(&images).await?;
+        }
+        Ok(dropped)
     }
 
     /// Layers and blobs the build cache names.

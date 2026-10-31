@@ -286,6 +286,15 @@ pub struct Config {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub volumes: BTreeMap<String, serde_json::Value>,
+    /// `ONBUILD` instructions, run by builds that use the image as a base.
+    #[serde(
+        rename = "OnBuild",
+        alias = "onbuild",
+        default,
+        deserialize_with = "nullable",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub on_build: Vec<String>,
 }
 
 fn nullable<'de, D, T>(d: D) -> Result<T, D::Error>

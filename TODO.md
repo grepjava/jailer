@@ -26,8 +26,8 @@ people building images for Legion.
 
 - [x] **Keep the build cache across `rmi`.** Layers the cache names are
   kept, builder stages included, until `jailer prune --cache`.
-- [ ] **A size limit for the build cache**, evicting least recently used
-  entries, so it need not be cleared by hand.
+- [x] **A size limit for the build cache**: `build --cache-max` (default
+  10g, by compressed size) drops the least recently used cached layers.
 
 - [x] **`RUN --mount=type=cache`.** A host directory kept between builds,
   never in a layer.
@@ -41,34 +41,30 @@ fail with a clear message.
   (or `env=VAR`).
 - [x] **`RUN --mount=type=bind`** (context or `from=<stage>`, `rw` writes
   discarded), **`type=tmpfs`**, and `RUN --network=none|host`.
-- [ ] **`RUN --mount=type=bind,from=<image>`** and **`type=ssh`**.
-- [ ] **`.containerignore` for context bind mounts.** A `RUN` bind mount of
-  the context shows ignored files too (Docker hides them).
-- [ ] **Heredocs** in `RUN` and `COPY` (`RUN <<EOF ... EOF`).
-- [ ] **`ADD <url>`**, with `--checksum=sha256:...`. Today it fails with
-  "source not found".
-- [ ] **`ONBUILD`**: store the triggers in the image config and run them
-  when the image is used as a base. Today they are recorded in history
-  only.
-- [ ] **`FROM --platform`**: honour it, or reject a platform the host
-  cannot run. Today it is parsed and ignored.
-- [ ] **`COPY --exclude`, `--parents`, `--link`.**
-- [ ] **Wildcards anywhere in a source path** (`src/*/Cargo.toml`), not only
-  in the last component.
-- [ ] **Parser directives**: support `# escape=`; accept `# syntax=` with a
-  warning that it is ignored.
+- [x] **`RUN --mount=type=bind,from=<image>`**, and `.containerignore`
+  applied to context bind mounts.
+- [ ] **`RUN --mount=type=ssh`**, forwarding the SSH agent socket.
+- [x] **Heredocs** in `RUN`, `COPY` and `ADD`, including `#!` scripts.
+- [x] **`ADD <url>`**, with `--checksum=sha256:...`. Git URLs are not
+  supported.
+- [x] **`ONBUILD`**: triggers are kept in the image config and run when it
+  is used as a base.
+- [x] **`FROM --platform`** and the `BUILDPLATFORM`/`TARGET*` args: the
+  host's platform is accepted, any other refused (no emulation).
+- [x] **`COPY --exclude`, `--parents`** (with `/./`); `--link` is accepted
+  and changes nothing.
+- [x] **Wildcards anywhere in a source path**, and `[...]` classes.
+- [x] **Parser directives**: `# escape=`; `# syntax=` is ignored with a
+  warning.
 
 ## 4. Nice to have
 
-- [ ] **Clearer pull errors.** Docker Hub answers 401 for a repository that
-  does not exist; say "not found or access denied" instead of "access
-  denied (no credentials)".
-- [ ] **Podman interop.** `export --format docker-archive`, so an image can
-  go to `podman load` or `docker load` as well as `legion image load`.
+- [x] **Clearer pull errors**: "not found, or access denied".
+- [x] **Podman interop.** `export` also writes Docker's `manifest.json`, as
+  `docker save` does. Still to try with `podman load` and `docker load`.
 - [ ] **Image signing** with sigstore/cosign signatures on `push`.
-- [ ] **`build --squash`** to flatten the result into one layer.
-- [ ] **Man page note** that a `--no-zfs` state directory holds files with
-  the `schg` flag, so removing it by hand needs `chflags -R noschg` first.
+- [x] **`build --squash`** flattens the image into one layer.
+- [x] **Man page note** on `schg` files in a `--no-zfs` state directory.
 
 ## Not planned
 

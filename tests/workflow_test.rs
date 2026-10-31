@@ -59,6 +59,18 @@ async fn handle_registry(
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
 
+    // Plain files, for `ADD <url>`
+    if let Some(name) = path.strip_prefix("/files/") {
+        return Ok(Response::builder()
+            .status(if name == "data.bin" {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            })
+            .body(Full::new(Bytes::from_static(b"downloaded\n")))
+            .unwrap());
+    }
+
     // Check Bearer token flow
     if path == "/token" {
         let body = serde_json::json!({"token": "test-bearer-token"}).to_string();
@@ -266,6 +278,8 @@ CMD ["--serve"]
             creds: None,
             strict_lint: true,
             no_cache: false,
+            squash: false,
+            cache_max: None,
             secrets: BTreeMap::new(),
         },
     )
@@ -286,6 +300,28 @@ CMD ["--serve"]
         .export("demo:1.0", &archive_path, Some("localhost/demo:1.0"))
         .unwrap();
     assert!(archive_path.exists());
+    // Docker's manifest names files the archive holds.
+    let mut names = Vec::new();
+    let mut docker_manifest = serde_json::Value::Null;
+    for entry in tar::Archive::new(std::fs::File::open(&archive_path).unwrap())
+        .entries()
+        .unwrap()
+    {
+        let mut entry = entry.unwrap();
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let name = name.trim_start_matches("./").to_owned();
+        if name == "manifest.json" {
+            docker_manifest = serde_json::from_reader(&mut entry).unwrap();
+        }
+        names.push(name);
+    }
+    let m = &docker_manifest[0];
+    assert_eq!(m["RepoTags"], serde_json::json!(["localhost/demo:1.0"]));
+    let layers = m["Layers"].as_array().unwrap();
+    assert_eq!(layers.len(), built.image.layers.len());
+    for p in layers.iter().chain([&m["Config"]]) {
+        assert!(names.contains(&p.as_str().unwrap().to_owned()), "{p}");
+    }
 
     let sys2 = Arc::new(FakeSys::new(false));
     let client2 = Client::new().unwrap().plain_http(&registry_host);
@@ -392,6 +428,8 @@ async fn manifest_push_publishes_one_image_per_platform() {
             creds: None,
             strict_lint: false,
             no_cache: false,
+            squash: false,
+            cache_max: None,
             secrets: BTreeMap::new(),
         },
     )
@@ -470,4 +508,263 @@ async fn manifest_push_publishes_one_image_per_platform() {
         assert_eq!(pulled.id, native.id);
         assert_ne!(pulled.id, other.id);
     }
+}
+
+#[tokio::test]
+async fn copy_heredocs_parents_exclude_url_onbuild_and_platform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    for d in ["src/a", "src/b", "src/c", "docs/sub"] {
+        std::fs::create_dir_all(ctx.join(d)).unwrap();
+    }
+    for f in [
+        "src/a/Cargo.toml",
+        "src/b/Cargo.toml",
+        "docs/guide.txt",
+        "docs/README.md",
+        "docs/sub/x.md",
+        "onbuild.txt",
+    ] {
+        std::fs::write(ctx.join(f), f).unwrap();
+    }
+    let (addr, _) = start_mock_registry().await;
+    let sum = sha256(b"downloaded\n");
+    let write_cf = |text: String| std::fs::write(ctx.join("Containerfile"), text).unwrap();
+    write_cf(format!(
+        r#"# syntax=docker/dockerfile:1
+ARG NAME=world
+FROM --platform=$BUILDPLATFORM scratch
+ARG NAME
+ARG TARGETARCH
+ONBUILD COPY onbuild.txt /from-onbuild.txt
+COPY <<greeting.txt <<"raw.txt" /etc/
+hello $NAME on $TARGETARCH
+greeting.txt
+$NAME
+raw.txt
+COPY --parents src/*/Cargo.toml /parents/
+COPY src/[ab]/Cargo.toml /flat/
+COPY --exclude=*.md docs /docs/
+ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
+"#,
+        addr.port()
+    ));
+
+    let sys = Arc::new(FakeSys::new(false));
+    let client = Client::new().unwrap();
+    let store =
+        Arc::new(Store::open(sys.clone(), None, &tmp.path().join("store"), client).unwrap());
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        RuntimeConfig {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+        },
+    )
+    .unwrap();
+    let opts = |tag: &str| BuildOptions {
+        context_dir: ctx.clone(),
+        containerfile: None,
+        tag: tag.to_owned(),
+        build_args: BTreeMap::new(),
+        target: None,
+        backend: BuildBackend::Native,
+        creds: None,
+        strict_lint: false,
+        no_cache: false,
+        squash: false,
+        cache_max: None,
+        secrets: BTreeMap::new(),
+    };
+    let files = |image: &jailer::store::Image| {
+        let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
+        store.prepare_rootfs(image, &root, None).unwrap();
+        let mut out = BTreeMap::new();
+        let mut stack = vec![root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.insert(rel, std::fs::read_to_string(&p).unwrap());
+                }
+            }
+        }
+        out
+    };
+
+    let base = build(&store, &runtime, &opts("base:1"))
+        .await
+        .unwrap()
+        .image;
+    assert_eq!(
+        base.config.config.on_build,
+        ["COPY onbuild.txt /from-onbuild.txt"]
+    );
+    let got = files(&base);
+    let want: BTreeMap<String, String> = [
+        (
+            "etc/greeting.txt",
+            format!("hello world on {}\n", jailer::oci::arch()),
+        ),
+        ("etc/raw.txt", "$NAME\n".to_owned()),
+        ("parents/src/a/Cargo.toml", "src/a/Cargo.toml".to_owned()),
+        ("parents/src/b/Cargo.toml", "src/b/Cargo.toml".to_owned()),
+        ("flat/Cargo.toml", "src/b/Cargo.toml".to_owned()),
+        ("docs/guide.txt", "docs/guide.txt".to_owned()),
+        ("dl/data.bin", "downloaded\n".to_owned()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    assert_eq!(got, want);
+
+    // The base's trigger runs in the child's build and is not passed on.
+    write_cf("FROM base:1\nCOPY docs/guide.txt /guide.txt\n".to_owned());
+    let child = build(&store, &runtime, &opts("child:1"))
+        .await
+        .unwrap()
+        .image;
+    assert!(child.config.config.on_build.is_empty());
+    let got = files(&child);
+    assert_eq!(got["from-onbuild.txt"], "onbuild.txt");
+    assert_eq!(got["guide.txt"], "docs/guide.txt");
+
+    // `--squash` leaves the same files in one layer.
+    assert!(child.layers.len() > 1);
+    let squashed = build(
+        &store,
+        &runtime,
+        &BuildOptions {
+            squash: true,
+            ..opts("squashed:1")
+        },
+    )
+    .await
+    .unwrap()
+    .image;
+    assert_eq!(squashed.layers.len(), 1);
+    assert_eq!(squashed.config.rootfs.diff_ids.len(), 1);
+    assert_eq!(files(&squashed), got);
+
+    // Failures name the problem.
+    for (cf, msg) in [
+        (
+            "FROM --platform=linux/riscv64 scratch\n",
+            "jailer builds for freebsd/",
+        ),
+        (
+            &format!(
+                "FROM scratch\nADD --checksum=sha256:{} http://127.0.0.1:{}/files/data.bin /x\n",
+                "0".repeat(64),
+                addr.port()
+            ),
+            "checksum is sha256:",
+        ),
+        (
+            &format!(
+                "FROM scratch\nADD http://127.0.0.1:{}/files/gone /x\n",
+                addr.port()
+            ),
+            "HTTP 404",
+        ),
+    ] {
+        write_cf(cf.to_owned());
+        let err = build(&store, &runtime, &opts("bad:1")).await.unwrap_err();
+        assert!(err.to_string().contains(msg), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn cache_trim_drops_least_recently_used_layers() {
+    use jailer::store::{CachedLayer, CachedStep};
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    let sys = Arc::new(FakeSys::new(false));
+    let store = Arc::new(
+        Store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        RuntimeConfig {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+        },
+    )
+    .unwrap();
+
+    // Two one-layer images, each also named by a cache entry; `a` used longer ago.
+    let mut built = Vec::new();
+    for name in ["a", "b"] {
+        std::fs::write(ctx.join(name), name.repeat(1000)).unwrap();
+        let cf = ctx.join(format!("{name}.Containerfile"));
+        std::fs::write(&cf, format!("FROM scratch\nCOPY {name} /{name}\n")).unwrap();
+        let image = build(
+            &store,
+            &runtime,
+            &BuildOptions {
+                context_dir: ctx.clone(),
+                containerfile: Some(cf),
+                tag: format!("{name}:1"),
+                build_args: BTreeMap::new(),
+                target: None,
+                backend: BuildBackend::Native,
+                creds: None,
+                strict_lint: false,
+                no_cache: false,
+                squash: false,
+                cache_max: None,
+                secrets: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .image;
+        store
+            .record_step(
+                name,
+                &CachedStep {
+                    layer: Some(CachedLayer {
+                        chain: image.layers[0].clone(),
+                        diff_id: image.config.rootfs.diff_ids[0].clone(),
+                        descriptor: image.layer_descriptors[0].clone(),
+                    }),
+                },
+            )
+            .unwrap();
+        assert!(store.remove(&format!("{name}:1")).await.unwrap());
+        built.push(image);
+    }
+    std::fs::File::options()
+        .append(true)
+        .open(store.dir().join("cache/a"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let layer = |i: usize| store.dir().join("layers").join(&built[i].layers[0]);
+    assert!(layer(0).exists() && layer(1).exists());
+
+    assert_eq!(store.trim_cache(u64::MAX).await.unwrap(), 0);
+    let b_size = built[1].layer_descriptors[0].size;
+    assert_eq!(store.trim_cache(b_size).await.unwrap(), 1);
+    assert!(!layer(0).exists() && layer(1).exists());
+    assert_eq!(store.trim_cache(0).await.unwrap(), 1);
+    assert!(!layer(1).exists());
 }

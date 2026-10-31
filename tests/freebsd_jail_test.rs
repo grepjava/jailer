@@ -151,6 +151,59 @@ CMD ["default-arg"]
         "hello from nobody in /app: default-arg (legion-ready)"
     );
 
+    // A squashed build runs the same, from one layer
+    let squash_out = Command::new(bin)
+        .current_dir(&project_dir)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "build",
+            "--squash",
+            "-t",
+            "flat:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        squash_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&squash_out.stderr)
+    );
+    let flat_out = Command::new(bin)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "run",
+            "flat:1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&flat_out.stdout), stdout);
+    let flat_tar = tmp.path().join("flat.tar");
+    let status = Command::new(bin)
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--zfs-root",
+            &zfs_root,
+            "export",
+            "flat:1",
+            flat_tar.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let manifest = Command::new("tar")
+        .args(["xOf", flat_tar.to_str().unwrap(), "manifest.json"])
+        .output()
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+    assert_eq!(manifest[0]["Layers"].as_array().unwrap().len(), 1);
+
     // Verify RUN step artifact `/app/stamp.txt` inside the built image
     let stamp_out = Command::new(bin)
         .current_dir(&project_dir)
@@ -225,16 +278,33 @@ fn run_mounts_reach_the_step_but_not_the_image() {
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(ctx.join("data")).unwrap();
     std::fs::write(ctx.join("data/a.txt"), "original\n").unwrap();
+    std::fs::write(ctx.join("data/hidden.txt"), "ignored\n").unwrap();
+    std::fs::write(ctx.join(".containerignore"), "data/hidden.txt\n").unwrap();
     std::fs::write(ctx.join("tok.txt"), "s3cr3t-value").unwrap();
     std::fs::write(
         ctx.join("Containerfile"),
-        r#"FROM docker.io/freebsd/freebsd-runtime:15.1
+        r#"# syntax=docker/dockerfile:1
+FROM docker.io/freebsd/freebsd-runtime:15.1
 RUN --mount=type=cache,target=/var/cache/thing sh -c 'echo run >> /var/cache/thing/log; n=0; while read l; do n=$((n+1)); done < /var/cache/thing/log; echo $n > /count'
 RUN --mount=type=bind,source=data,target=/data,rw sh -c 'cat /data/a.txt > /bound; echo scribble > /data/a.txt'
 RUN --mount=type=secret,id=tok sh -c 'v=$(cat /run/secrets/tok); echo ${#v} > /secretlen'
 RUN --mount=type=tmpfs,target=/scratch sh -c 'df -t tmpfs /scratch >/dev/null && echo yes > /tmpfs'
 RUN --network=none sh -c 'ifconfig -l > /ifs'
-CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
+RUN --mount=type=bind,target=/ctx ls /ctx/data > /ctxls
+RUN --mount=type=bind,from=docker.io/freebsd/freebsd-runtime:15.1,source=/bin,target=/img test -x /img/sh && echo yes > /fromimg
+RUN <<EOF
+echo heredoc-$((1+1)) > /hd
+EOF
+RUN <<EOF
+#!/bin/sh -e
+echo shebang > /sb
+EOF
+RUN cat <<A > /two && cat <<'B' >> /two
+x-$((2+3))
+A
+y-$((2+3))
+B
+CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd sb two; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch /ctx /img; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
 "#,
     )
     .unwrap();
@@ -273,7 +343,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs; do printf '%s=%
     jailer(&build);
     assert_eq!(
         jailer(&["run", "m:1"]),
-        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0"
+        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0 ctxls=a.txt fromimg=yes hd=heredoc-2 sb=shebang two=x-5 y-$((2+3))="
     );
     // The cache mount keeps its contents; the rw bind left the context alone.
     jailer(&build);
