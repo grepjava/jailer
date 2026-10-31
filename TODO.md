@@ -11,12 +11,12 @@ people building images for Legion.
   hosts. Tested against a mock registry; still to try against a real one
   (GHCR, Docker Hub) and on an arm64 host.
 
-- [ ] **Packaging.** A port overlay in `ports/sysutils/jailer` and
-  `scripts/release.sh`, which builds release tarballs on FreeBSD hosts and
-  uploads them. Still to do: tag v0.1.0, publish the release, add the
-  port's `distinfo` (`make makesum`) and build it in a ports tree; then
-  submit the port to FreeBSD so that `pkg install jailer` works, and link
-  it from Legion's `docs/IMAGES.md`.
+- [ ] **Packaging.** v0.1.0 is released with an amd64 tarball, built by
+  `scripts/release.sh`, and the port overlay in `ports/sysutils/jailer`
+  builds, packages and installs (`make package`, portlint clean). Still to
+  do: an aarch64 tarball (run the script on an arm64 host), and submitting
+  the port to FreeBSD so that `pkg install jailer` works; then link it from
+  Legion's `docs/IMAGES.md`.
 
 ## 2. Build speed
 
