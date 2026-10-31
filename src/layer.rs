@@ -58,7 +58,7 @@ fn flags_text(flags: u32) -> String {
 }
 
 #[cfg(target_os = "freebsd")]
-fn file_flags(meta: &std::fs::Metadata) -> u32 {
+pub fn file_flags(meta: &std::fs::Metadata) -> u32 {
     use std::os::freebsd::fs::MetadataExt;
     FLAGS
         .iter()
@@ -66,8 +66,26 @@ fn file_flags(meta: &std::fs::Metadata) -> u32 {
 }
 
 #[cfg(not(target_os = "freebsd"))]
-fn file_flags(_: &std::fs::Metadata) -> u32 {
+pub fn file_flags(_: &std::fs::Metadata) -> u32 {
     0
+}
+
+/// Sets `path`'s file flags (not following a link).
+#[cfg(target_os = "freebsd")]
+pub fn set_flags(path: &Path, flags: u32) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Build(format!("a NUL in {}", path.display())))?;
+    // SAFETY: `c` is a valid NUL-terminated path.
+    if unsafe { libc::lchflags(c.as_ptr(), flags.into()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn set_flags(_: &Path, _: u32) -> Result<(), Error> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,14 +133,15 @@ impl TreeState {
 /// Names of hard-linked files by device and inode.
 type Inodes = HashMap<(u64, u64), Vec<String>>;
 
+/// A hard-linked file's device and inode.
 #[cfg(unix)]
-fn inode(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+pub fn inode(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     (meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
 }
 
 #[cfg(not(unix))]
-fn inode(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+pub fn inode(_: &std::fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 

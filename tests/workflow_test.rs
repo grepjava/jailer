@@ -666,9 +666,9 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert_eq!(squashed.config.rootfs.diff_ids.len(), 1);
     assert_eq!(files(&squashed), got);
 
-    // `COPY --from` an image, not a stage.
+    // `COPY --from` an image, not a stage, named by an ARG.
     write_cf(
-        "FROM scratch AS tools\nFROM scratch\nCOPY --from=base:1 /etc/raw.txt /docs/ /copied/\nCOPY --from=tools / /empty/\n"
+        "FROM scratch AS tools\nFROM scratch\nARG SRC=base:1\nCOPY --from=$SRC /etc/raw.txt /docs/ /copied/\nCOPY --from=tools / /empty/\n"
             .to_owned(),
     );
     let copied = build(&store, &runtime, &opts("copied:1"))

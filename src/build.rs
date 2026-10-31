@@ -3,7 +3,7 @@
 //! diffing layers) or via `buildah` when `--backend buildah` is selected,
 //! followed by Legion compatibility verification.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -526,6 +526,10 @@ async fn execute_instruction(
         }
         Instruction::Copy(spec) | Instruction::Add(spec) => {
             let is_add = matches!(sp.instruction, Instruction::Add(_));
+            let spec = &CopySpec {
+                from: spec.from.as_ref().map(|f| expand_vars(f, vars)),
+                ..spec.clone()
+            };
             let extras = CopyExtras::prepare(spec, vars, tmp_dir, is_add, sp.line).await?;
             let from_image = match &spec.from {
                 Some(name) if find_stage(completed_stages, name).is_none() => {
@@ -558,7 +562,7 @@ async fn execute_instruction(
             // shell: build args and ENV reach it through the environment.
             let argv = form.to_argv(&stage.shell);
             let mut run_env = stage.config.config.env.clone();
-            for (k, v) in vars {
+            for (k, v) in vars.iter() {
                 if !run_env
                     .iter()
                     .any(|e| e.split('=').next() == Some(k.as_str()))
@@ -567,7 +571,7 @@ async fn execute_instruction(
                 }
             }
             let mounts =
-                RunMounts::prepare(env, completed_stages, step_no, run_opts, sp.line).await?;
+                RunMounts::prepare(env, completed_stages, vars, step_no, run_opts, sp.line).await?;
             for e in &mounts.env {
                 let name = e.split('=').next().unwrap_or("");
                 run_env.retain(|x| x.split('=').next() != Some(name));
@@ -662,6 +666,7 @@ impl RunMounts {
     async fn prepare(
         env: BuildEnv<'_>,
         completed_stages: &[BuiltStage],
+        vars: &BTreeMap<String, String>,
         step_no: usize,
         opts: &RunOptions,
         line: usize,
@@ -713,7 +718,8 @@ impl RunMounts {
                     target,
                     rw,
                 } => {
-                    let (root, origin) = match from {
+                    let from = from.as_ref().map(|f| expand_vars(f, vars));
+                    let (root, origin) = match &from {
                         None => (context_dir.to_path_buf(), "context".to_owned()),
                         Some(name) => match find_stage(completed_stages, name) {
                             Some(st) => (st.root.clone(), st.cache_key.clone()),
@@ -746,7 +752,9 @@ impl RunMounts {
                         if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
                         {
                             let skip = |rel: &str| ignore.is_ignored(rel);
-                            copy_context_dir(context_dir, &src, &scratch, &skip, None, None)?;
+                            let copier = Copier::new(None, None, false);
+                            copier.dir(context_dir, &src, &scratch, &skip)?;
+                            copier.finish()?;
                             out.temp.push(scratch.clone());
                             scratch
                         } else if *rw {
@@ -1215,6 +1223,9 @@ fn apply_copy(
         || spec.parents
         || spec.sources.len() + spec.heredocs.len() > 1;
     let dst_base = safe_join_in_root(&stage.root, &dest_in_container)?;
+    // A stage's or an image's files keep their flags; the context's do not,
+    // as Docker keeps nothing of the host's.
+    let copier = Copier::new(chown_ids, spec.chmod, spec.from.is_some());
     let place_file = |src: &Path, dst_base: &Path| -> Result<(), Error> {
         let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
             std::fs::create_dir_all(dst_base)?;
@@ -1228,7 +1239,7 @@ fn apply_copy(
             }
             dst_base.to_path_buf()
         };
-        copy_single_entry(src, &final_dst, chown_ids, spec.chmod)
+        copier.entry(src, &final_dst)
     };
 
     // Each match, with the path `--parents` keeps for it.
@@ -1264,7 +1275,7 @@ fn apply_copy(
     for (src_path, kept) in matched_sources {
         let meta = std::fs::symlink_metadata(&src_path)?;
         if meta.is_dir() {
-            copy_context_dir(
+            copier.dir(
                 src_root,
                 &src_path,
                 &if spec.parents {
@@ -1273,8 +1284,6 @@ fn apply_copy(
                     dst_base.clone()
                 },
                 &skip,
-                chown_ids,
-                spec.chmod,
             )?;
         } else if is_add && is_archive_name(&src_path) {
             std::fs::create_dir_all(&dst_base)?;
@@ -1284,7 +1293,7 @@ fn apply_copy(
         } else if spec.parents {
             let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
             std::fs::create_dir_all(&parent)?;
-            copy_single_entry(&src_path, &dst_base.join(&kept), chown_ids, spec.chmod)?;
+            copier.entry(&src_path, &dst_base.join(&kept))?;
         } else {
             place_file(&src_path, &dst_base)?;
         }
@@ -1292,7 +1301,7 @@ fn apply_copy(
     for extra in extras {
         place_file(extra, &dst_base)?;
     }
-    Ok(())
+    copier.finish()
 }
 
 fn is_archive_name(p: &Path) -> bool {
@@ -1352,64 +1361,114 @@ fn safe_join_in_root(root: &Path, rel: &str) -> Result<PathBuf, Error> {
     Ok(out)
 }
 
-fn copy_context_dir(
-    context_root: &Path,
-    src_dir: &Path,
-    dst_dir: &Path,
-    skip: &dyn Fn(&str) -> bool,
-    chown_ids: Option<(u32, u32)>,
+/// Copies files for one `COPY`: owners and modes as it asks, the names
+/// of a hard-linked file linked again, and (from a stage or an image) file
+/// flags, set at the end, since they may refuse what follows.
+struct Copier {
+    chown: Option<(u32, u32)>,
     chmod: Option<u32>,
-) -> Result<(), Error> {
-    std::fs::create_dir_all(dst_dir)?;
-    apply_perms(dst_dir, chown_ids, chmod)?;
-    for entry in std::fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path.strip_prefix(context_root).unwrap_or(&path);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if skip(&rel_str) {
-            continue;
-        }
-        let target = dst_dir.join(entry.file_name());
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.is_dir() {
-            copy_context_dir(context_root, &path, &target, skip, chown_ids, chmod)?;
-        } else {
-            copy_single_entry(&path, &target, chown_ids, chmod)?;
-        }
-    }
-    Ok(())
+    keep_flags: bool,
+    /// The first copy of each hard-linked source file, by device and inode.
+    linked: std::cell::RefCell<HashMap<(u64, u64), PathBuf>>,
+    /// Flags to set when all is copied, in the order to set them.
+    flags: std::cell::RefCell<Vec<(PathBuf, u32)>>,
 }
 
-fn copy_single_entry(
-    src: &Path,
-    dst: &Path,
-    chown_ids: Option<(u32, u32)>,
-    chmod: Option<u32>,
-) -> Result<(), Error> {
-    let meta = std::fs::symlink_metadata(src)?;
-    if dst.exists() || std::fs::symlink_metadata(dst).is_ok() {
-        layer::remove_tree(dst)?;
-    }
-    if meta.file_type().is_symlink() {
-        #[cfg(unix)]
-        {
-            let link = std::fs::read_link(src)?;
-            std::os::unix::fs::symlink(link, dst)?;
-        }
-        #[cfg(windows)]
-        let _ = std::fs::copy(src, dst);
-    } else {
-        std::fs::copy(src, dst)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = chmod.unwrap_or_else(|| meta.permissions().mode() & 0o7777);
-            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))?;
+impl Copier {
+    fn new(chown: Option<(u32, u32)>, chmod: Option<u32>, keep_flags: bool) -> Self {
+        Copier {
+            chown,
+            chmod,
+            keep_flags,
+            linked: Default::default(),
+            flags: Default::default(),
         }
     }
-    apply_perms(dst, chown_ids, chmod)?;
-    Ok(())
+
+    /// Copies the tree `src_dir` to `dst_dir`, leaving out what `skip`
+    /// names (by path below `root`).
+    fn dir(
+        &self,
+        root: &Path,
+        src_dir: &Path,
+        dst_dir: &Path,
+        skip: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Error> {
+        std::fs::create_dir_all(dst_dir)?;
+        apply_perms(dst_dir, self.chown, self.chmod)?;
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if skip(&rel.to_string_lossy().replace('\\', "/")) {
+                continue;
+            }
+            let target = dst_dir.join(entry.file_name());
+            if std::fs::symlink_metadata(&path)?.is_dir() {
+                self.dir(root, &path, &target, skip)?;
+            } else {
+                self.entry(&path, &target)?;
+            }
+        }
+        // After its contents: a flag such as schg refuses them.
+        self.keep_flags_of(src_dir, dst_dir)
+    }
+
+    /// Copies the file or link `src` to `dst`, replacing what is there.
+    fn entry(&self, src: &Path, dst: &Path) -> Result<(), Error> {
+        let meta = std::fs::symlink_metadata(src)?;
+        if std::fs::symlink_metadata(dst).is_ok() {
+            layer::remove_tree(dst)?;
+        }
+        if meta.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                let link = std::fs::read_link(src)?;
+                std::os::unix::fs::symlink(link, dst)?;
+            }
+            #[cfg(windows)]
+            let _ = std::fs::copy(src, dst);
+        } else {
+            if let Some(key) = layer::inode(&meta) {
+                let first = self.linked.borrow().get(&key).cloned();
+                if let Some(first) = first {
+                    // The first copy has the owner, mode and flags.
+                    std::fs::hard_link(first, dst)?;
+                    return Ok(());
+                }
+                self.linked.borrow_mut().insert(key, dst.to_path_buf());
+            }
+            std::fs::copy(src, dst)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = self
+                    .chmod
+                    .unwrap_or_else(|| meta.permissions().mode() & 0o7777);
+                std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+        apply_perms(dst, self.chown, self.chmod)?;
+        self.keep_flags_of(src, dst)
+    }
+
+    fn keep_flags_of(&self, src: &Path, dst: &Path) -> Result<(), Error> {
+        if self.keep_flags {
+            let flags = layer::file_flags(&std::fs::symlink_metadata(src)?);
+            if flags != 0 {
+                self.flags.borrow_mut().push((dst.to_path_buf(), flags));
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets the flags kept: files before the directories holding them.
+    fn finish(&self) -> Result<(), Error> {
+        for (path, flags) in self.flags.borrow().iter() {
+            layer::set_flags(path, *flags)?;
+        }
+        Ok(())
+    }
 }
 
 fn apply_perms(

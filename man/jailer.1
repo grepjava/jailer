@@ -234,6 +234,11 @@ writes them to a file
 .It
 .Cm COPY Fl -from Ns = Ns Ar image ,
 naming an image rather than a stage; it is pulled if missing.
+.Fl -from
+may use build arguments, as may
+.Cm RUN Fl -mount Ns = Ns Cm type=bind,from= .
+A copy keeps hard links among the files it copies, and a copy from a
+stage or an image keeps their file flags too.
 .It
 .Cm COPY Fl -exclude Ns = Ns Ar pattern ,
 .Fl -parents ,

@@ -334,6 +334,29 @@ RUN echo x > /flagged && chflags schg /flagged && ln /bin/sh /bin/sh2 && /sbin/s
     let inode = |l: &str| l.split_whitespace().next().unwrap().to_owned();
     assert_eq!(inode(lines[1]), inode(lines[2]), "{seen}");
     assert_eq!(lines[3..], ["1", "built-inside-jail"]);
+
+    // COPY --from keeps a stage's or an image's flags and hard links.
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+ARG SRC=flags:1
+COPY --from=$SRC /flagged /bin/sh /bin/sh2 /copied/
+",
+    )
+    .unwrap();
+    cmd(&["build", "-t", "copied:1", flags_dir.to_str().unwrap()]);
+    let seen = cmd(&[
+        "run",
+        "--entrypoint",
+        "/bin/sh",
+        "copied:1",
+        "-c",
+        "ls -lo /copied/flagged; ls -i /copied/sh; ls -i /copied/sh2",
+    ]);
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines.len(), 3, "{seen}");
+    assert!(lines[0].contains(" schg"), "{seen}");
+    assert_eq!(inode(lines[1]), inode(lines[2]), "{seen}");
     assert_eq!(
         cmd(&["ps", "-a"]).lines().count(),
         1,
