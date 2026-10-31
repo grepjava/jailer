@@ -1,0 +1,322 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd October 31, 2026
+.Dt JAILER 1
+.Os FreeBSD
+.Sh NAME
+.Nm jailer
+.Nd build, test, and publish FreeBSD jail OCI images for Legion
+.Sh SYNOPSIS
+.Nm
+.Op Fl -state-dir Ar dir
+.Op Fl -zfs-root Ar dataset | Fl -no-zfs
+.Op Fl -plain-http Ar host Ns Op : Ns Ar port
+.Ar command
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+scaffolds
+.Pa Containerfile
+definitions, builds FreeBSD OCI container images, tests them locally in
+FreeBSD jails matching Legion's runtime, exports offline OCI archives, and
+pushes images to OCI distribution registries.
+.Pp
+Image layers are stored as ZFS datasets
+.Ar dataset Ns Pa /images/ Ns Ar chain Ns Pa @layer
+and containers as clones under
+.Ar dataset Ns Pa /jails .
+When run as root on a host with a
+.Ql zroot
+pool,
+.Ar dataset
+defaults to
+.Ql zroot/jailer ;
+otherwise plain directories under the state directory are used.
+.Pp
+The global options are:
+.Bl -tag -width Ds
+.It Fl -state-dir Ar dir
+Directory holding images and container state.
+Defaults to
+.Pa /var/db/jailer
+for root and
+.Pa ~/.local/share/jailer
+otherwise.
+.It Fl -zfs-root Ar dataset
+ZFS dataset for image layers and container clones.
+It is created if missing.
+.It Fl -no-zfs
+Use plain directory storage even when ZFS is available.
+.It Fl -plain-http Ar host Ns Op : Ns Ar port
+Talk to this registry over HTTP instead of HTTPS.
+May be given more than once.
+.El
+.Pp
+Commands that take
+.Fl -creds Ar user Ns Op : Ns Ar password
+or
+.Fl -authfile Ar path
+otherwise read credentials from the Docker or Podman
+.Pa auth.json
+files.
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Xo
+.Nm init
+.Op Fl f
+.Op Fl n Ar name
+.Op Fl r Ar release
+.Op Fl T Ar template
+.Op Ar dir
+.Xc
+Scaffold a
+.Pa Containerfile
+and
+.Pa .containerignore
+in
+.Ar dir
+.Pq default Pa \&. .
+.Ar template
+is one of
+.Cm rust , go , node , python , c , pkg
+or
+.Cm runtime ,
+and is detected from the project files when omitted.
+.Ar release
+is the FreeBSD base image tag, by default the host's release.
+.Fl f
+overwrites an existing
+.Pa Containerfile .
+.It Xo
+.Nm build
+.Op Fl -no-cache
+.Op Fl -strict
+.Op Fl f Ar file
+.Op Fl t Ar name Ns Op : Ns Ar tag
+.Op Fl -authfile Ar path
+.Op Fl -backend Cm native | buildah
+.Op Fl -build-arg Ar key Ns = Ns Ar value
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -target Ar stage
+.Op Ar context
+.Xc
+Build an image from
+.Ar file
+.Pq default Ar context Ns Pa /Containerfile
+and check it for compatibility with Legion.
+The image is tagged
+.Ar name : Ns Ar tag ,
+by default
+.Ql localhost/ Ns Ar dir Ns :latest .
+.Cm RUN
+steps execute in a jail and need root.
+A
+.Cm RUN
+step whose command, environment, user, working directory and preceding
+layers match an earlier build reuses that build's layer instead of
+running;
+.Fl -no-cache
+runs every step.
+Cached layers are kept while an image uses them; a multi-stage build's
+intermediate stages are cached until the next
+.Nm rmi .
+.Fl -strict
+fails the build when the compatibility check reports an error.
+.Fl -target
+stops at the named stage.
+.Fl -backend Cm buildah
+delegates the build to
+.Xr buildah 1
+and imports the result.
+.It Xo
+.Nm run
+.Op Fl dit
+.Op Fl -allow-mlock
+.Op Fl -linux
+.Op Fl -rm
+.Op Fl -vnet
+.Op Fl e Ar key Ns = Ns Ar value
+.Op Fl u Ar user Ns Op : Ns Ar group
+.Op Fl v Ar src : Ns Ar dst Ns Op :ro
+.Op Fl w Ar dir
+.Op Fl -entrypoint Ar path
+.Op Fl -hostname Ar name
+.Op Fl -name Ar name
+.Op Fl -param Ar key Ns = Ns Ar value
+.Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
+.Op Ar image Op Ar command ...
+.Xc
+Run
+.Ar image
+in a jail set up as Legion's runtime does: devfs ruleset 4,
+.Ql enforce_statfs=2 ,
+and the image's user resolved against its own
+.Pa /etc/passwd
+and
+.Pa /etc/group .
+Without
+.Ar image ,
+the current directory's built image is run; an image missing from the
+local store is pulled.
+Needs root.
+.Bl -tag -width Ds
+.It Fl d
+Run in the background and print the container ID.
+.It Fl i , Fl t
+Keep standard input open; allocate a pseudo-terminal.
+.It Fl e
+Set an environment variable.
+.It Fl u
+Run as
+.Ar user ,
+a name or UID, optionally with a group.
+.It Fl v
+Mount host path
+.Ar src
+at
+.Ar dst
+with
+.Xr nullfs 4 ,
+read-only with
+.Ql :ro .
+.It Fl w
+Working directory inside the container.
+.It Fl -rm
+Remove the container when it exits.
+.It Fl -vnet
+Give the jail its own network stack.
+.It Fl -allow-mlock
+Allow
+.Xr mlock 2 .
+.It Fl -sysv
+Enable the listed SysV IPC namespaces.
+.It Fl -param
+Pass a raw
+.Xr jail 8
+parameter.
+.It Fl -linux
+Run a Linux image through
+.Xr linux 4 ,
+mounting linprocfs, linsysfs, fdescfs and
+.Pa /dev/shm .
+.El
+.It Xo
+.Nm push
+.Op Fl -authfile Ar path
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Ar source
+.Ar target
+.Xc
+Push
+.Ar source ,
+by default the current project's image, to the registry reference
+.Ar target .
+.It Xo
+.Nm export
+.Op Fl o Ar path
+.Op Fl -name Ar ref
+.Op Ar image
+.Op Ar output.tar
+.Xc
+Write an OCI archive suitable for
+.Ql legion image load .
+.Fl -name
+overrides the reference recorded in the archive.
+.It Nm check Op Ar target
+Check a directory's
+.Pa Containerfile ,
+a local image reference, or by default the current directory's
+.Pa Containerfile
+and built image against Legion's runtime:
+the image user, an executable entrypoint, the stop signal and the
+platform.
+.It Xo
+.Nm pull
+.Op Fl -linux
+.Op Fl -authfile Ar path
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Ar reference
+.Xc
+Pull an image into the local store.
+.Fl -linux
+accepts a Linux image when the registry offers no FreeBSD one.
+.It Nm load Oo Fl -name Ar ref Oc Ar archive.tar
+Load an OCI archive into the local store.
+.It Xo
+.Nm login
+.Op Fl -authfile Ar path
+.Fl u Ar username
+.Fl p Ar password
+.Ar registry
+.Xc
+Save credentials for
+.Ar registry
+to
+.Pa ~/.docker/config.json
+or
+.Ar path .
+.It Nm images
+List local images.
+.It Nm rmi Ar reference
+Remove a local image, along with any layers and blobs no other image uses.
+.It Nm ps Op Fl a
+List running containers, or all with
+.Fl a .
+.It Nm logs Oo Fl n Ar lines Oc Ar container
+Print a container's output, or its last
+.Ar lines .
+.It Nm exec Oo Fl it Oc Ar container Ar command ...
+Run a command in a running container.
+Needs root.
+.It Nm stop Oo Fl t Ar seconds Oc Ar container
+Stop a container, killing it after
+.Ar seconds .
+.It Nm rm Oo Fl f Oc Ar container ...
+Remove containers.
+A running container is refused unless
+.Fl f
+is given, which stops it first.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width JAILER_STATE_DIR
+.It Ev JAILER_STATE_DIR
+Default for
+.Fl -state-dir .
+.It Ev JAILER_ZFS_ROOT
+Default for
+.Fl -zfs-root .
+.It Ev JAILER_NO_ZFS
+Default for
+.Fl -no-zfs .
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /var/db/jailer
+Default state directory for root.
+.It Pa ~/.docker/config.json
+Registry credentials.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Nm run
+exits with the container's exit status.
+.Sh EXAMPLES
+Scaffold, build, test, and publish an image:
+.Bd -literal -offset indent
+jailer init
+jailer build --strict
+doas jailer run
+jailer push ghcr.io/me/app:1.0
+.Ed
+.Pp
+Produce an archive for an offline Legion node:
+.Bd -literal -offset indent
+jailer export app.tar
+legion image load app.tar --zfs-root zroot/legion
+.Ed
+.Sh SEE ALSO
+.Xr buildah 1 ,
+.Xr linux 4 ,
+.Xr nullfs 4 ,
+.Xr jail 8 ,
+.Xr jls 8 ,
+.Xr zfs 8

@@ -1,0 +1,56 @@
+[package]
+name = "jailer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Build, test, and publish FreeBSD jail OCI images for Legion"
+license = "BSD-2-Clause"
+repository = "https://github.com/grepjava/jailer"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+flate2 = "1.1"
+futures = "0.3"
+getrandom = "0.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "system-proxy",
+    "stream",
+    "json",
+] }
+ruzstd = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+thiserror = "2.0"
+tokio = { version = "1.44", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
