@@ -102,12 +102,17 @@ overwrites an existing
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
 .Op Fl -cache-max Ar size
+.Op Fl -cpus Ar n
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -label Ar key Ns = Ns Ar value
+.Op Fl m Ar size
 .Op Fl -param Ar key Ns = Ns Ar value
+.Op Fl -pids-limit Ar n
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -ssh Ar id Ns Op = Ns Ar socket
 .Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
 .Op Fl -target Ar stage
+.Op Fl -timestamp Ar seconds
 .Op Ar context
 .Xc
 Build an image from
@@ -288,6 +293,16 @@ and the other append-only and no-unlink flags, but not
 which ZFS sets on every write) and hard links; a layer holds every name
 of a hard-linked file it changes.
 .Pp
+.Fl -label
+sets a label on the image, over the Containerfile's
+.Cm LABEL .
+Files in layers carry a fixed time, and the image config none, so the
+same build gives the same image;
+.Fl -timestamp
+(or
+.Ev SOURCE_DATE_EPOCH )
+dates the config and this build's history, in seconds since 1970.
+.Pp
 .Cm RUN
 steps run in a jail with
 .Ql allow.chflags ,
@@ -300,6 +315,13 @@ parameter for them, e.g.
 .Fl -sysv
 gives them SysV IPC of their own
 .Pf ( Ql sysvshm=new ) .
+.Fl m ,
+.Fl -cpus
+and
+.Fl -pids-limit
+limit each step as
+.Nm run
+does a container.
 .Fl -backend Cm buildah
 delegates the build to
 .Xr buildah 1
@@ -317,8 +339,11 @@ and imports the result.
 .Op Fl w Ar dir
 .Op Fl -entrypoint Ar path
 .Op Fl -hostname Ar name
+.Op Fl m Ar size
+.Op Fl -cpus Ar n
 .Op Fl -name Ar name
 .Op Fl -param Ar key Ns = Ns Ar value
+.Op Fl -pids-limit Ar n
 .Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
 .Op Ar image Op Ar command ...
 .Xc
@@ -387,6 +412,32 @@ Set a
 .Xr jail 8
 parameter, over the security defaults, e.g.
 .Ql --param securelevel=-1 .
+.It Fl m , Fl -memory Ar size
+Kill a process of the container whose resident memory goes past
+.Ar size
+(e.g.
+.Ql 512m ) ,
+as a Legion node does.
+.It Fl -cpus Ar n
+Hold the container to
+.Ar n
+CPUs' time (e.g.
+.Ql 1.5 ) .
+.It Fl -pids-limit Ar n
+Allow the container at most
+.Ar n
+processes.
+.El
+.Pp
+The limits are
+.Xr rctl 8
+rules on the container's jail, which need
+.Ql kern.racct.enable=1
+in
+.Xr loader.conf 5 ;
+.Nm rm
+drops them.
+.Bl -tag -width Ds
 .It Fl -linux
 Run a Linux image through
 .Xr linux 4 ,

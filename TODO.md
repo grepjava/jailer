@@ -85,9 +85,13 @@ fail with a clear message.
   and earlier stages into a directory.
 - [ ] **Network for `run --vnet`**: an epair and bridge, and published
   ports; today a VNET container has only its loopback.
-- [ ] **Resource limits** (`rctl`, `cpuset`) for `run` and `build`.
-- [ ] **`build --label`, `--annotation`, `--timestamp`** (layers already
-  have fixed mtimes; the config's `created` does not).
+- [x] **Resource limits**: `-m`, `--cpus`, `--pids-limit` for `run` and
+  `build`, as rctl rules (memory per process, as on a Legion node).
+- [ ] **`--cpuset-cpus`**: best set by legion-jail when it makes the jail,
+  before anything runs in it.
+- [x] **`build --label` and `--timestamp`** (or `SOURCE_DATE_EPOCH`).
+- [ ] **`build --annotation`**: manifest annotations, which needs
+  `register_built_image` in legion-image to take them.
 - [ ] **zstd layers**, and a **registry-backed build cache**
   (`--cache-from`/`--cache-to`).
 

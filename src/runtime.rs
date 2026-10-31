@@ -13,6 +13,7 @@ pub use legion_jail::{
     DEVFS_RULESET, LINUX_MODULES,
 };
 pub use legion_runtime::{ContainerSpec, Mount};
+use legion_sys::{RctlRule, Resource, Sys};
 
 #[cfg(not(unix))]
 pub use elsewhere::{Config, JailRuntime, Step, StepMount, StepNetwork};
@@ -45,6 +46,99 @@ pub struct RunSpec {
     pub allow_mlock: bool,
     /// `msg`, `sem`, `shm`.
     pub sysv: Vec<String>,
+    pub limits: Limits,
+}
+
+/// Resource limits for a container or a build's `RUN` steps, held by
+/// rctl(8) rules on the jail. A rule may name a jail before it exists, so
+/// they are set before anything runs in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Limits {
+    /// Bytes of resident memory for each process: one going past it is
+    /// killed, as on a Legion node.
+    pub memory: Option<u64>,
+    /// CPUs' worth of time, as a percentage of one CPU.
+    pub pcpu: Option<u64>,
+    /// Processes at a time.
+    pub pids: Option<u64>,
+}
+
+impl Limits {
+    /// `--memory` (a size, e.g. `512m`), `--cpus` (e.g. `1.5`) and
+    /// `--pids-limit`.
+    pub fn parse(
+        memory: Option<&str>,
+        cpus: Option<&str>,
+        pids: Option<u64>,
+    ) -> Result<Self, Error> {
+        let memory = memory
+            .map(|m| {
+                crate::containerfile::parse_size(m)
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| {
+                        Error::Runtime(format!("--memory {m:?}: give a size such as 512m"))
+                    })
+            })
+            .transpose()?;
+        let pcpu = cpus
+            .map(|c| match c.parse::<f64>() {
+                Ok(n) if n > 0.0 && n.is_finite() => Ok(((n * 100.0).round() as u64).max(1)),
+                _ => Err(Error::Runtime(format!(
+                    "--cpus {c:?}: give a number of CPUs, such as 1.5"
+                ))),
+            })
+            .transpose()?;
+        if pids == Some(0) {
+            return Err(Error::Runtime("--pids-limit must be at least 1".to_owned()));
+        }
+        Ok(Limits { memory, pcpu, pids })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Limits::default()
+    }
+
+    /// The rules holding these limits on `jail`.
+    pub fn rules(&self, jail: &str) -> Vec<RctlRule> {
+        [
+            (Resource::MemoryUse, self.memory),
+            (Resource::Pcpu, self.pcpu),
+            (Resource::MaxProc, self.pids),
+        ]
+        .into_iter()
+        .filter_map(|(resource, amount)| {
+            amount.map(|amount| RctlRule {
+                jail: jail.to_owned(),
+                resource,
+                amount,
+            })
+        })
+        .collect()
+    }
+}
+
+/// Sets `limits` on `jail`, replacing any rules it had.
+pub fn limit(sys: &dyn Sys, jail: &str, limits: &Limits) -> Result<(), Error> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    if sys.sysctl_get("kern.racct.enable").ok().as_deref() != Some("1") {
+        return Err(Error::Runtime(
+            "resource limits need rctl: set kern.racct.enable=1 in /boot/loader.conf and reboot"
+                .to_owned(),
+        ));
+    }
+    unlimit(sys, jail);
+    for rule in limits.rules(jail) {
+        sys.rctl_add(&rule)
+            .map_err(|e| Error::Runtime(format!("setting the limit {rule}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Drops `jail`'s rules, if it has any.
+pub fn unlimit(sys: &dyn Sys, jail: &str) {
+    let _ = sys.rctl_remove_jail(jail);
 }
 
 /// The member `spec` asks for, its pod not yet named.
@@ -134,7 +228,7 @@ mod containers {
     use std::time::Duration;
 
     use legion_runtime::Runtime;
-    use legion_sys::{IfConfig, Ipv4Net, Sys};
+    use legion_sys::{IfConfig, Ipv4Net};
 
     use super::*;
 
@@ -171,14 +265,30 @@ mod containers {
                 .insert(ANNOTATION_PARENT.to_owned(), id.clone());
             member.labels.insert(LABEL_POD.to_owned(), id);
         }
-        match rt.create(&member).await {
+        let made = async {
+            let id = rt.create(&member).await?;
+            if let Err(e) = limit(sys, &jail_of(&id, pod.as_deref()), &spec.limits) {
+                let _ = rt.remove(&id).await;
+                return Err(e);
+            }
+            Ok(id)
+        };
+        match made.await {
             Ok(id) => Ok(id),
             Err(e) => {
                 if let Some(p) = pod {
                     let _ = rt.remove(&p).await;
                 }
-                Err(e.into())
+                Err(e)
             }
+        }
+    }
+
+    /// The jail Legion's runtime runs container `id` in.
+    fn jail_of(id: &str, pod: Option<&str>) -> String {
+        match pod {
+            Some(p) => format!("{p}.{id}"),
+            None => id.to_owned(),
         }
     }
 
@@ -200,10 +310,11 @@ mod containers {
         Ok(())
     }
 
-    /// Removes a container, then its pod.
-    pub async fn remove(rt: &JailRuntime, id: &str) -> Result<(), Error> {
+    /// Removes a container, then its pod, and the container's limits.
+    pub async fn remove(rt: &JailRuntime, sys: &dyn Sys, id: &str) -> Result<(), Error> {
         let pod = pod_of(rt, id).await?;
         rt.remove(id).await?;
+        unlimit(sys, &jail_of(id, pod.as_deref()));
         if let Some(p) = pod {
             match rt.remove(&p).await {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
@@ -356,6 +467,33 @@ mod tests {
             ..spec
         };
         assert!(member_spec(&spaced).is_err());
+    }
+
+    #[test]
+    fn limits_become_rctl_rules() {
+        let l = Limits::parse(Some("512m"), Some("1.5"), Some(64)).unwrap();
+        let rules: Vec<String> = l.rules("j").iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rules,
+            [
+                "jail:j:memoryuse:sigkill=536870912/process",
+                "jail:j:pcpu:deny=150",
+                "jail:j:maxproc:deny=64"
+            ]
+        );
+        assert!(Limits::parse(None, None, None).unwrap().is_empty());
+        assert_eq!(
+            Limits::parse(None, Some("0.001"), None).unwrap().pcpu,
+            Some(1)
+        );
+        for (m, c, p) in [
+            (Some("lots"), None, None),
+            (None, Some("0"), None),
+            (None, Some("nan"), None),
+            (None, None, Some(0)),
+        ] {
+            assert!(Limits::parse(m, c, p).is_err());
+        }
     }
 
     #[test]

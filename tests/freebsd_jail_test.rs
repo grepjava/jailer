@@ -297,6 +297,68 @@ CMD ["default-arg"]
     .concat());
     assert_eq!(vnet, "lo0\n1\n");
 
+    // Resource limits are rctl rules on the container's jail, set before it
+    // starts and dropped with it.
+    let forks =
+        "(for i in 1 2 3 4 5; do sleep 1 & done; wait) 2>/dev/null && echo free || echo limited";
+    if Command::new("sysctl")
+        .args(["-n", "kern.racct.enable"])
+        .output()
+        .map(|o| o.stdout == b"1\n")
+        .unwrap_or(false)
+    {
+        assert_eq!(
+            cmd(&[&["run", "--pids-limit", "3"][..], &shell, &[forks]].concat()),
+            "limited\n"
+        );
+        assert_eq!(cmd(&[&["run"][..], &shell, &[forks]].concat()), "free\n");
+        let id = cmd(&[
+            &["run", "-d", "--name", "lim", "-m", "64m", "--cpus", "0.5"][..],
+            &shell,
+            &["sleep 60"],
+        ]
+        .concat());
+        let rules = || String::from_utf8(Command::new("rctl").output().unwrap().stdout).unwrap();
+        let set = rules();
+        assert!(
+            set.contains(&format!(
+                "jail:{}:memoryuse:sigkill=67108864/process",
+                id.trim()
+            )) && set.contains(&format!("jail:{}:pcpu:deny=50", id.trim())),
+            "{set}"
+        );
+        cmd(&["rm", "-f", "lim"]);
+        assert!(
+            !rules().contains(id.trim()),
+            "the rules go with the container"
+        );
+
+        // And on a build's RUN steps.
+        let lim_dir = tmp.path().join("limited");
+        std::fs::create_dir_all(&lim_dir).unwrap();
+        std::fs::write(
+            lim_dir.join("Containerfile"),
+            format!("FROM localhost/hello-service:latest\nUSER root\nRUN ({forks}) > /forks\n"),
+        )
+        .unwrap();
+        cmd(&[
+            "build",
+            "--pids-limit",
+            "3",
+            "-t",
+            "limited:1",
+            lim_dir.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            cmd(&["run", "--entrypoint", "/bin/cat", "limited:1", "/forks"]),
+            "limited\n"
+        );
+        assert!(
+            !rules().contains("jailer_build_"),
+            "no step's rules are left"
+        );
+    }
+
     // COPY --from an image; file flags and hard links kept in layers;
     // jail parameters and SysV IPC for RUN steps.
     let flags_dir = tmp.path().join("flags");

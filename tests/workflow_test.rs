@@ -283,6 +283,9 @@ CMD ["--serve"]
             secrets: BTreeMap::new(),
             ssh: BTreeMap::new(),
             jail_params: Vec::new(),
+            labels: BTreeMap::new(),
+            timestamp: None,
+            limits: Default::default(),
         },
     )
     .await
@@ -438,6 +441,9 @@ async fn manifest_push_publishes_one_image_per_platform() {
             secrets: BTreeMap::new(),
             ssh: BTreeMap::new(),
             jail_params: Vec::new(),
+            labels: BTreeMap::new(),
+            timestamp: None,
+            limits: Default::default(),
         },
     )
     .await
@@ -588,6 +594,9 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         secrets: BTreeMap::new(),
         ssh: BTreeMap::new(),
         jail_params: Vec::new(),
+        labels: BTreeMap::new(),
+        timestamp: None,
+        limits: Default::default(),
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -681,6 +690,37 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     write_cf("FROM scratch\nCOPY --from=localhost/nowhere:1 /a /a\n".to_owned());
     assert!(build(&store, &runtime, &opts("nowhere:2")).await.is_err());
 
+    // `--label` goes over `LABEL`; `--timestamp` dates the config and this
+    // build's history, and an image built twice with it is the same image.
+    write_cf("FROM scratch\nLABEL a=file b=file\nCOPY onbuild.txt /o.txt\n".to_owned());
+    let stamped = |tag: &'static str| BuildOptions {
+        labels: BTreeMap::from([("b".to_owned(), "flag".to_owned())]),
+        timestamp: Some(1_700_000_000),
+        ..opts(tag)
+    };
+    let first = build(&store, &runtime, &stamped("stamped:1"))
+        .await
+        .unwrap()
+        .image;
+    let labels = &first.config.config.labels;
+    assert_eq!(
+        (labels["a"].as_str(), labels["b"].as_str()),
+        ("file", "flag")
+    );
+    assert_eq!(first.config.created, "2023-11-14T22:13:20Z");
+    assert!(
+        first
+            .config
+            .history
+            .iter()
+            .all(|h| h.created == "2023-11-14T22:13:20Z")
+    );
+    let again = build(&store, &runtime, &stamped("stamped:2"))
+        .await
+        .unwrap()
+        .image;
+    assert_eq!(again.id, first.id);
+
     // Failures name the problem.
     for (cf, msg) in [
         (
@@ -761,6 +801,9 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 secrets: BTreeMap::new(),
                 ssh: BTreeMap::new(),
                 jail_params: Vec::new(),
+                labels: BTreeMap::new(),
+                timestamp: None,
+                limits: Default::default(),
             },
         )
         .await

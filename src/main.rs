@@ -127,6 +127,18 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         sysv: Vec<String>,
 
+        #[command(flatten)]
+        limits: LimitArgs,
+
+        /// A label for the image (KEY=VALUE), over the Containerfile's
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// The image's creation time, in seconds since 1970 [default: none,
+        /// so that a build is reproducible]
+        #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
+        timestamp: Option<i64>,
+
         /// Registry credentials for pulling base images (USER[:PASSWORD])
         #[arg(long, value_name = "USER[:PASSWORD]")]
         creds: Option<String>,
@@ -201,6 +213,9 @@ pub enum Commands {
         /// Additional raw jail(8) parameters (KEY=VALUE)
         #[arg(long = "param", value_name = "KEY=VALUE")]
         params: Vec<String>,
+
+        #[command(flatten)]
+        limits: LimitArgs,
 
         /// Run a Linux image through FreeBSD's Linux ABI (`linux(4)`)
         #[arg(long)]
@@ -515,6 +530,32 @@ fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
     None
 }
 
+/// Resource limits, held by rctl(8).
+#[derive(clap::Args, Debug, Clone)]
+pub struct LimitArgs {
+    /// Memory limit for each process (e.g. 512m); one going past it is killed
+    #[arg(short = 'm', long, value_name = "SIZE")]
+    memory: Option<String>,
+
+    /// CPU time limit, in CPUs (e.g. 1.5)
+    #[arg(long, value_name = "N")]
+    cpus: Option<String>,
+
+    /// Limit on processes at a time
+    #[arg(long = "pids-limit", value_name = "N")]
+    pids_limit: Option<u64>,
+}
+
+impl LimitArgs {
+    fn parse(&self) -> Result<jailer::runtime::Limits> {
+        Ok(jailer::runtime::Limits::parse(
+            self.memory.as_deref(),
+            self.cpus.as_deref(),
+            self.pids_limit,
+        )?)
+    }
+}
+
 fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
     let sys: Arc<dyn Sys> = Arc::new(Shell::new());
     let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
@@ -627,6 +668,9 @@ async fn main() -> Result<()> {
             ssh,
             params,
             sysv,
+            limits,
+            labels,
+            timestamp,
             creds,
             authfile,
             context,
@@ -645,6 +689,13 @@ async fn main() -> Result<()> {
                     .split_once('=')
                     .with_context(|| format!("--build-arg {kv:?} must be KEY=VALUE"))?;
                 parsed_args.insert(k.to_owned(), v.to_owned());
+            }
+            let mut parsed_labels = BTreeMap::new();
+            for kv in labels {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--label {kv:?} must be KEY=VALUE"))?;
+                parsed_labels.insert(k.to_owned(), v.to_owned());
             }
             let resolved_creds =
                 resolve_credentials("docker.io", creds.as_deref(), authfile.as_deref())?;
@@ -671,6 +722,9 @@ async fn main() -> Result<()> {
                     secrets: parse_secrets(secrets)?,
                     ssh: parse_ssh(ssh)?,
                     jail_params: jailer::runtime::step_params(params, sysv)?,
+                    labels: parsed_labels,
+                    timestamp: *timestamp,
+                    limits: limits.parse()?,
                 },
             )
             .await?;
@@ -983,6 +1037,7 @@ async fn containers(cli: &Cli) -> Result<()> {
             allow_mlock,
             sysv,
             params,
+            limits,
             linux,
             args,
         } => {
@@ -1064,13 +1119,14 @@ async fn containers(cli: &Cli) -> Result<()> {
                 vnet: *vnet,
                 allow_mlock: *allow_mlock,
                 sysv: sysv.clone(),
+                limits: limits.parse()?,
             };
 
             let id = jailer::runtime::create(&runtime, &*sys, &spec).await?;
             if *detach {
                 if let Err(e) = runtime.start(&id).await {
                     if *rm {
-                        let _ = jailer::runtime::remove(&runtime, &id).await;
+                        let _ = jailer::runtime::remove(&runtime, &*sys, &id).await;
                     }
                     return Err(e.into());
                 }
@@ -1079,7 +1135,7 @@ async fn containers(cli: &Cli) -> Result<()> {
             }
             let code = runtime.run_attached(&id, *interactive, *tty).await;
             if auto_rm {
-                let _ = jailer::runtime::remove(&runtime, &id).await;
+                let _ = jailer::runtime::remove(&runtime, &*sys, &id).await;
             }
             let code = code?;
             if code != 0 {
@@ -1175,13 +1231,13 @@ async fn containers(cli: &Cli) -> Result<()> {
         }
 
         Commands::Rm { force, containers } => {
-            let (_, _, runtime) = open_context(cli, true)?;
+            let (sys, _, runtime) = open_context(cli, true)?;
             for c in containers {
                 let id = runtime.find(c)?;
                 if !force && runtime.inspect(&id).await?.state.running {
                     bail!("container {c:?} is running: stop it first or use `rm -f`");
                 }
-                jailer::runtime::remove(&runtime, &id).await?;
+                jailer::runtime::remove(&runtime, &*sys, &id).await?;
                 println!("{c}");
             }
             Ok(())
