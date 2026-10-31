@@ -290,6 +290,7 @@ RUN --mount=type=bind,source=data,target=/data,rw sh -c 'cat /data/a.txt > /boun
 RUN --mount=type=secret,id=tok sh -c 'v=$(cat /run/secrets/tok); echo ${#v} > /secretlen'
 RUN --mount=type=tmpfs,target=/scratch sh -c 'df -t tmpfs /scratch >/dev/null && echo yes > /tmpfs'
 RUN --network=none sh -c 'ifconfig -l > /ifs'
+RUN --mount=type=ssh sh -c 'test -S "$SSH_AUTH_SOCK" && echo "$SSH_AUTH_SOCK" > /ssh'
 RUN --mount=type=bind,target=/ctx ls /ctx/data > /ctxls
 RUN --mount=type=bind,from=docker.io/freebsd/freebsd-runtime:15.1,source=/bin,target=/img test -x /img/sh && echo yes > /fromimg
 RUN <<EOF
@@ -304,7 +305,7 @@ x-$((2+3))
 A
 y-$((2+3))
 B
-CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd sb two; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch /ctx /img; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
+CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd sb ssh two; do printf '%s=%s ' $f $(cat /$f); done; for d in /var/cache/thing /data /run/secrets /scratch /ctx /img /run/buildkit; do test -e $d && printf 'leaked=%s ' $d; done; echo"]
 "#,
     )
     .unwrap();
@@ -331,11 +332,36 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     }
     let _cleanup = Cleanup(tmp.path().to_path_buf());
 
+    // An SSH agent for `--mount=type=ssh`
+    let agent_sock = tmp.path().join("agent.sock");
+    struct Agent(std::process::Child);
+    impl Drop for Agent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _agent = Agent(
+        Command::new("ssh-agent")
+            .arg("-D")
+            .arg("-a")
+            .arg(&agent_sock)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    while !agent_sock.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let ssh_arg = format!("default={}", agent_sock.display());
+
     let build = [
         "build",
         "--no-cache",
         "--secret",
         "id=tok,src=tok.txt",
+        "--ssh",
+        &ssh_arg,
         "-t",
         "m:1",
         ".",
@@ -343,7 +369,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     jailer(&build);
     assert_eq!(
         jailer(&["run", "m:1"]),
-        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0 ctxls=a.txt fromimg=yes hd=heredoc-2 sb=shebang two=x-5 y-$((2+3))="
+        "count=1 bound=original secretlen=12 tmpfs=yes ifs=lo0 ctxls=a.txt fromimg=yes hd=heredoc-2 sb=shebang ssh=/run/buildkit/ssh_agent.0 two=x-5 y-$((2+3))="
     );
     // The cache mount keeps its contents; the rw bind left the context alone.
     jailer(&build);

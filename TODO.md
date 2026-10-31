@@ -44,7 +44,8 @@ fail with a clear message.
   discarded), **`type=tmpfs`**, and `RUN --network=none|host`.
 - [x] **`RUN --mount=type=bind,from=<image>`**, and `.containerignore`
   applied to context bind mounts.
-- [ ] **`RUN --mount=type=ssh`**, forwarding the SSH agent socket.
+- [x] **`RUN --mount=type=ssh`** and `build --ssh`: jailer relays the
+  agent through a socket of the step's own (nullfs cannot mount sockets).
 - [x] **Heredocs** in `RUN`, `COPY` and `ADD`, including `#!` scripts.
 - [x] **`ADD <url>`**, with `--checksum=sha256:...`. Git URLs are not
   supported.

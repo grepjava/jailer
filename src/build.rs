@@ -48,6 +48,8 @@ pub struct BuildOptions {
     pub cache_max: Option<u64>,
     /// Contents of the secrets `RUN --mount=type=secret` can mount, by id.
     pub secrets: BTreeMap<String, Vec<u8>>,
+    /// SSH agent sockets `RUN --mount=type=ssh` can reach, by id.
+    pub ssh: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +519,11 @@ async fn execute_instruction(
             }
             let mounts =
                 RunMounts::prepare(env, completed_stages, step_no, run_opts, sp.line).await?;
+            for e in &mounts.env {
+                let name = e.split('=').next().unwrap_or("");
+                run_env.retain(|x| x.split('=').next() != Some(name));
+                run_env.push(e.clone());
+            }
             let key = next_key(
                 &stage.cache_key,
                 &[
@@ -569,6 +576,10 @@ struct RunMounts {
     mounts: Vec<BuildMount>,
     key: String,
     temp: Vec<PathBuf>,
+    /// Variables the step gets, such as `SSH_AUTH_SOCK`.
+    env: Vec<String>,
+    /// Tasks relaying SSH agent connections, stopped on drop.
+    relays: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RunMounts {
@@ -595,6 +606,8 @@ impl RunMounts {
                 String::new()
             },
             temp: Vec::new(),
+            env: Vec::new(),
+            relays: Vec::new(),
         };
         for (i, m) in opts.mounts.iter().enumerate() {
             let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
@@ -732,6 +745,46 @@ impl RunMounts {
                         size: *size,
                     });
                 }
+                RunMount::Ssh {
+                    id,
+                    target,
+                    required,
+                    mode,
+                    uid,
+                    gid,
+                } => {
+                    let Some(agent) = env.opts.ssh.get(id) else {
+                        if *required {
+                            return Err(Error::Build(format!(
+                                "line {line}: SSH agent {id:?} is required: give `--ssh {id}`"
+                            )));
+                        }
+                        continue;
+                    };
+                    // nullfs mounts files and directories, not sockets: the
+                    // step gets a socket of its own in a directory mounted at
+                    // the target's, and jailer relays its connections.
+                    let (dir, name) = match target.rsplit_once('/') {
+                        Some((d, n)) if !n.is_empty() => (if d.is_empty() { "/" } else { d }, n),
+                        _ => {
+                            return Err(Error::Build(format!(
+                                "line {line}: ssh mount target {target:?}: give a socket path"
+                            )));
+                        }
+                    };
+                    std::fs::create_dir_all(&scratch)?;
+                    out.temp.push(scratch.clone());
+                    let sock = scratch.join(name);
+                    out.relays.push(relay_ssh_agent(&sock, agent, line)?);
+                    set_owner_mode(&sock, *uid, *gid, *mode)?;
+                    out.key.push_str(&format!("\0ssh {id} {target}"));
+                    out.env.push(format!("SSH_AUTH_SOCK={target}"));
+                    out.mounts.push(BuildMount::Nullfs {
+                        source: scratch,
+                        target: dir.to_owned(),
+                        read_only: false,
+                    });
+                }
             }
         }
         Ok(out)
@@ -740,10 +793,43 @@ impl RunMounts {
 
 impl Drop for RunMounts {
     fn drop(&mut self) {
+        for r in &self.relays {
+            r.abort();
+        }
         for p in &self.temp {
             let _ = layer::remove_tree(p);
         }
     }
+}
+
+/// Listens at `sock` and passes each connection on to the SSH agent at
+/// `agent`.
+#[cfg(unix)]
+fn relay_ssh_agent(
+    sock: &Path,
+    agent: &Path,
+    line: usize,
+) -> Result<tokio::task::JoinHandle<()>, Error> {
+    let listener = tokio::net::UnixListener::bind(sock)
+        .map_err(|e| Error::Build(format!("line {line}: ssh mount: {e}")))?;
+    let agent = agent.to_path_buf();
+    Ok(tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                if let Ok(mut up) = tokio::net::UnixStream::connect(&agent).await {
+                    let _ = tokio::io::copy_bidirectional(&mut conn, &mut up).await;
+                }
+            });
+        }
+    }))
+}
+
+#[cfg(not(unix))]
+fn relay_ssh_agent(_: &Path, _: &Path, line: usize) -> Result<tokio::task::JoinHandle<()>, Error> {
+    Err(Error::Build(format!(
+        "line {line}: ssh mounts need a FreeBSD host"
+    )))
 }
 
 /// Whether `ignore` leaves out anything below `dir`, a context directory.

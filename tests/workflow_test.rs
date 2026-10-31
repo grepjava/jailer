@@ -281,6 +281,7 @@ CMD ["--serve"]
             squash: false,
             cache_max: None,
             secrets: BTreeMap::new(),
+            ssh: BTreeMap::new(),
         },
     )
     .await
@@ -431,6 +432,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
             squash: false,
             cache_max: None,
             secrets: BTreeMap::new(),
+            ssh: BTreeMap::new(),
         },
     )
     .await
@@ -577,6 +579,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         squash: false,
         cache_max: None,
         secrets: BTreeMap::new(),
+        ssh: BTreeMap::new(),
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -732,6 +735,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 squash: false,
                 cache_max: None,
                 secrets: BTreeMap::new(),
+                ssh: BTreeMap::new(),
             },
         )
         .await

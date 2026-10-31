@@ -104,6 +104,7 @@ overwrites an existing
 .Op Fl -cache-max Ar size
 .Op Fl -creds Ar user Ns Op : Ns Ar password
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
+.Op Fl -ssh Ar id Ns Op = Ns Ar socket
 .Op Fl -target Ar stage
 .Op Ar context
 .Xc
@@ -175,6 +176,36 @@ mode 0400 unless
 .Cm mode
 says otherwise.
 A missing secret is skipped, or fails the build with
+.Cm required .
+.It Fl -mount Ns = Ns Cm type=ssh
+The SSH agent given by
+.Fl -ssh Ar id Ns Op = Ns Ar socket
+.Po
+.Cm id
+defaults to
+.Cm default ,
+and
+.Ar socket
+to
+.Ev SSH_AUTH_SOCK ,
+which
+.Xr sudo 8
+does not pass on
+.Pc ,
+as a socket at
+.Cm target
+(default
+.Pa /run/buildkit/ssh_agent.0 ) ,
+named by
+.Ev SSH_AUTH_SOCK
+in the step.
+The target's directory is replaced for the step.
+The socket has mode 0600 and belongs to root unless
+.Cm mode , uid
+and
+.Cm gid
+say otherwise.
+A missing agent is skipped, or fails the build with
 .Cm required .
 .It Fl -mount Ns = Ns Cm type=tmpfs , Ns Cm target Ns = Ns Ar path
 An empty memory file system, of at most

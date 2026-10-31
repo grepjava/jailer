@@ -552,7 +552,6 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-/// `realm="...",service="...",scope="..."`.
 /// The error for a 401 or 403, which Docker Hub also gives for a
 /// repository that does not exist.
 fn denied(r: &Reference, creds: Option<&Credentials>) -> Error {
@@ -562,6 +561,7 @@ fn denied(r: &Reference, creds: Option<&Credentials>) -> Error {
     })
 }
 
+/// `realm="...",service="...",scope="..."`.
 fn parse_challenge(s: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut rest = s.trim();

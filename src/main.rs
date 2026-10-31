@@ -118,6 +118,10 @@ pub enum Commands {
         #[arg(long = "secret", value_name = "id=ID,src=FILE")]
         secrets: Vec<String>,
 
+        /// An SSH agent for `RUN --mount=type=ssh`: ID (from $SSH_AUTH_SOCK) or ID=SOCKET
+        #[arg(long = "ssh", value_name = "ID[=SOCKET]")]
+        ssh: Vec<String>,
+
         /// Registry credentials for pulling base images (USER[:PASSWORD])
         #[arg(long, value_name = "USER[:PASSWORD]")]
         creds: Option<String>,
@@ -393,6 +397,40 @@ fn parse_secrets(specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
     Ok(out)
 }
 
+/// Reads `--ssh ID` (the agent at $SSH_AUTH_SOCK) and `--ssh ID=SOCKET`.
+fn parse_ssh(specs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut out = BTreeMap::new();
+    for spec in specs {
+        let (id, path) = match spec.split_once('=') {
+            Some((id, path)) => (id, PathBuf::from(path)),
+            None => (
+                spec.as_str(),
+                std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from).with_context(|| {
+                    format!(
+                        "--ssh {spec}: $SSH_AUTH_SOCK is not set (sudo drops it: give --ssh {spec}=\"$SSH_AUTH_SOCK\")"
+                    )
+                })?,
+            ),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let meta = std::fs::metadata(&path)
+                .with_context(|| format!("--ssh {id}: {}", path.display()))?;
+            if !meta.file_type().is_socket() {
+                bail!(
+                    "--ssh {id}: {} is not an agent socket (key files are not supported)",
+                    path.display()
+                );
+            }
+        }
+        if out.insert(id.to_owned(), path).is_some() {
+            bail!("--ssh {id} given twice");
+        }
+    }
+    Ok(out)
+}
+
 /// Jails can only be created or entered by root; fail before pulling anything.
 fn require_root(what: &str) -> Result<()> {
     #[cfg(unix)]
@@ -580,6 +618,7 @@ async fn main() -> Result<()> {
             squash,
             cache_max,
             secrets,
+            ssh,
             creds,
             authfile,
             context,
@@ -622,6 +661,7 @@ async fn main() -> Result<()> {
                         })?),
                     },
                     secrets: parse_secrets(secrets)?,
+                    ssh: parse_ssh(ssh)?,
                 },
             )
             .await?;

@@ -107,6 +107,15 @@ pub enum RunMount {
         target: String,
         size: Option<u64>,
     },
+    /// An SSH agent from `build --ssh`, as a socket at `target`.
+    Ssh {
+        id: String,
+        target: String,
+        required: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
 }
 
 impl RunMount {
@@ -115,7 +124,8 @@ impl RunMount {
             RunMount::Cache { target, .. }
             | RunMount::Bind { target, .. }
             | RunMount::Secret { target, .. }
-            | RunMount::Tmpfs { target, .. } => target,
+            | RunMount::Tmpfs { target, .. }
+            | RunMount::Ssh { target, .. } => target,
         }
     }
 }
@@ -681,6 +691,7 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
         "bind" => &["type", "target", "source", "from", "rw", "ro"],
         "secret" => &["type", "target", "id", "required", "mode", "uid", "gid"],
         "tmpfs" => &["type", "target", "size"],
+        "ssh" => &["type", "target", "id", "required", "mode", "uid", "gid"],
         other => return Err(bad(format!("type={other} is not supported"))),
     };
     if let Some(k) = kv.keys().find(|k| !allowed.contains(k)) {
@@ -730,6 +741,16 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
                 gid: num(&kv, "gid", 10, 0)?,
             }
         }
+        "ssh" => RunMount::Ssh {
+            id: kv.get("id").copied().unwrap_or("default").to_owned(),
+            target: target
+                .clone()
+                .unwrap_or_else(|| "/run/buildkit/ssh_agent.0".to_owned()),
+            required: flag(&kv, "required")?,
+            mode: num(&kv, "mode", 8, 0o600)?,
+            uid: num(&kv, "uid", 10, 0)?,
+            gid: num(&kv, "gid", 10, 0)?,
+        },
         _ => RunMount::Tmpfs {
             target: need_target()?,
             size: kv
@@ -1213,7 +1234,7 @@ CMD ["--serve"]
 
         for bad in [
             "--mount=type=cache echo",
-            "--mount=type=ssh,target=/x echo",
+            "--mount=type=nfs,target=/x echo",
             "--mount=type=tmpfs,target=/x,from=a echo",
             "--mount=type=cache,target=/x,ro=maybe echo",
             "--network=bridge echo",
@@ -1370,6 +1391,37 @@ COPY a\\b `
         }
         assert!(parse_trigger("ONBUILD RUN x", 1).is_err());
         assert_eq!(parse_trigger("COPY . /src", 3).unwrap().raw, "COPY . /src");
+    }
+
+    #[test]
+    fn ssh_mounts() {
+        let mount = |spec: &str| parse_mount(spec, 1);
+        assert_eq!(
+            mount("type=ssh").unwrap(),
+            RunMount::Ssh {
+                id: "default".into(),
+                target: "/run/buildkit/ssh_agent.0".into(),
+                required: false,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+            }
+        );
+        let RunMount::Ssh {
+            id,
+            target,
+            required,
+            uid,
+            ..
+        } = mount("type=ssh,id=gh,target=/tmp/a.sock,required,uid=65534").unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(
+            (id.as_str(), target.as_str(), required, uid),
+            ("gh", "/tmp/a.sock", true, 65534)
+        );
+        assert!(mount("type=ssh,source=x").is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@ jailer export app.tar       # Produce an offline OCI archive
 
 Legion pulls OCI images, stores their layers on ZFS, and runs containers as jails, intentionally leaving image building out of the cluster daemon. `jailer` fills the local development and CI workflow while matching Legion's exact runtime semantics:
 
-- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from`, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret and tmpfs mounts, `RUN --network=none`, here-documents, `COPY --exclude/--parents`, `ADD <url> --checksum`, `ONBUILD`, `.containerignore`, and a build cache), OCI layer differ (with `.wh.` whiteouts and FreeBSD file flags), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
+- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from`, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret, ssh and tmpfs mounts, `RUN --network=none`, here-documents, `COPY --exclude/--parents`, `ADD <url> --checksum`, `ONBUILD`, `.containerignore`, and a build cache), OCI layer differ (with `.wh.` whiteouts and FreeBSD file flags), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
 - **Local testing aligned with Legion's runtime:** `jailer run` executes images using the same jail setup as `legion-jail`:
   - ZFS snapshot/clone layers (`<dataset>/<chain>@layer`) with an automatic plain-directory fallback when ZFS is unavailable.
   - `/etc/passwd` and `/etc/group` user & supplementary group resolution inside the jail.
