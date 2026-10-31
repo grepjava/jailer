@@ -18,7 +18,7 @@ use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
 use crate::registry::{Credentials, sha256};
 use crate::runtime::{JailRuntime, Step, StepMount, StepNetwork, target};
-use crate::store::{CachedLayer, CachedStep, Image, Pin, Store, chain_ids, hex_of};
+use crate::store::{CachedLayer, CachedStep, Image, Pin, StorageMode, Store, chain_ids, hex_of};
 use crate::{Error, Reference, users};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -70,6 +70,9 @@ pub struct BuildResult {
 struct BuiltStage {
     name: Option<String>,
     root: PathBuf,
+    /// With a ZFS store, the dataset mounted on `root`, which later stages
+    /// built on this one are cloned from.
+    dataset: Option<String>,
     config: ImageConfig,
     layers: Vec<String>,
     descriptors: Vec<Descriptor>,
@@ -172,7 +175,34 @@ pub async fn build(
         tmp_dir: build_tmp.path(),
     };
     let mut completed_stages: Vec<BuiltStage> = Vec::new();
-    let mut cleanup_guard = StageCleanup(Vec::new());
+    // With a ZFS store, stages are clones rather than copies: of the base
+    // image's top layer, or of the stage they are built on. They are kept
+    // beside the store's datasets, out of reach of its prune.
+    let stage_datasets = match store.mode() {
+        StorageMode::Zfs(images) => images.rsplit_once('/').map(|(root, _)| {
+            let tmp = build_tmp.path().file_name().unwrap_or_default();
+            (
+                format!("{root}/build"),
+                format!(
+                    "{root}/build/{}-{}",
+                    std::process::id(),
+                    tmp.to_string_lossy()
+                ),
+            )
+        }),
+        StorageMode::Directory => None,
+    };
+    let mut cleanup_guard = StageCleanup {
+        sys: store.sys().clone(),
+        stages: Vec::new(),
+        parent: None,
+    };
+    if let Some((build, mine)) = &stage_datasets {
+        let sys = store.sys();
+        sys.zfs_create(build, &[("mountpoint", "none")])?;
+        sys.zfs_create(mine, &[("mountpoint", "none")])?;
+        cleanup_guard.parent = Some(mine.clone());
+    }
 
     for stage_def in &cf.stages {
         let mut vars = global_vars.clone();
@@ -189,12 +219,22 @@ pub async fn build(
         }
         let stage_root = build_tmp.path().join(format!("stage-{}", stage_def.index));
         std::fs::create_dir_all(&stage_root)?;
-        cleanup_guard.0.push(stage_root.clone());
+        let dataset = stage_datasets
+            .as_ref()
+            .map(|(_, mine)| format!("{mine}/stage-{}", stage_def.index));
+        cleanup_guard
+            .stages
+            .push((stage_root.clone(), dataset.clone()));
+        let mountpoint = stage_root.to_string_lossy().into_owned();
 
         let mut built = if base_ref.eq_ignore_ascii_case("scratch") {
+            if let Some(ds) = &dataset {
+                store.sys().zfs_create(ds, &[("mountpoint", &mountpoint)])?;
+            }
             BuiltStage {
                 name: stage_def.name.clone(),
                 root: stage_root,
+                dataset,
                 config: ImageConfig {
                     architecture: oci::arch().to_owned(),
                     os: "freebsd".to_owned(),
@@ -207,10 +247,22 @@ pub async fn build(
                 tree: None,
             }
         } else if let Some(prev) = find_stage(&completed_stages, &base_ref) {
-            layer::copy_tree(&prev.root, &stage_root)?;
+            match (&prev.dataset, &dataset) {
+                (Some(from), Some(ds)) => {
+                    // A stage is done with once built on: the snapshot
+                    // holds it as it ended.
+                    let snapshot = format!("{from}@stage-{}", stage_def.index);
+                    store.sys().zfs_snapshot(&snapshot)?;
+                    store
+                        .sys()
+                        .zfs_clone(&snapshot, ds, &[("mountpoint", &mountpoint)])?;
+                }
+                _ => layer::copy_tree(&prev.root, &stage_root)?,
+            }
             BuiltStage {
                 name: stage_def.name.clone(),
                 root: stage_root,
+                dataset,
                 config: prev.config.clone(),
                 layers: prev.layers.clone(),
                 descriptors: prev.descriptors.clone(),
@@ -232,7 +284,7 @@ pub async fn build(
                     })?
                 }
             };
-            store.prepare_rootfs(&base_img, &stage_root, None)?;
+            store.prepare_rootfs(&base_img, &stage_root, dataset.as_deref())?;
             let mut cfg = base_img.config.clone();
             if cfg.os.is_empty() {
                 cfg.os = "freebsd".to_owned();
@@ -243,6 +295,7 @@ pub async fn build(
             BuiltStage {
                 name: stage_def.name.clone(),
                 root: stage_root,
+                dataset,
                 config: cfg,
                 layers: base_img.layers.clone(),
                 descriptors: base_img.layer_descriptors.clone(),
@@ -364,12 +417,27 @@ pub async fn build(
     Ok(BuildResult { image, report })
 }
 
-struct StageCleanup(Vec<PathBuf>);
+/// Removes a build's stages, and with a ZFS store their datasets: the
+/// last first, as each may be a clone of one before it.
+struct StageCleanup {
+    sys: Arc<dyn crate::sys::Sys>,
+    stages: Vec<(PathBuf, Option<String>)>,
+    /// The datasets' parent, this build's own.
+    parent: Option<String>,
+}
 
 impl Drop for StageCleanup {
     fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = layer::remove_tree(p);
+        for (root, dataset) in self.stages.iter().rev() {
+            if let Some(ds) = dataset
+                && self.sys.zfs_list(ds).is_ok_and(|l| !l.is_empty())
+            {
+                let _ = self.sys.zfs_destroy(ds, true);
+            }
+            let _ = layer::remove_tree(root);
+        }
+        if let Some(ds) = &self.parent {
+            let _ = self.sys.zfs_destroy(ds, true);
         }
     }
 }

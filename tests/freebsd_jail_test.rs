@@ -559,6 +559,40 @@ COPY --from=$SRC /flagged /bin/sh /bin/sh2 /copied/
         "no pods or members are left"
     );
 
+    // Stages are ZFS clones: of the base image, or of the stage before.
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1 AS base
+RUN echo one > /one && chflags schg /one
+FROM base AS next
+RUN echo two > /two
+FROM next
+RUN cat /one /two > /both
+",
+    )
+    .unwrap();
+    cmd(&["build", "-t", "staged:1", flags_dir.to_str().unwrap()]);
+    assert_eq!(
+        cmd(&["run", "--entrypoint", "/bin/cat", "staged:1", "/both"]),
+        "one\ntwo\n"
+    );
+    let left = Command::new("zfs")
+        .args([
+            "list",
+            "-H",
+            "-o",
+            "name",
+            "-r",
+            &format!("{zfs_root}/build"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&left.stdout).trim(),
+        format!("{zfs_root}/build"),
+        "a build's stage datasets go with it"
+    );
+
     // 4. Run `jailer export app.tar`
     let archive = tmp.path().join("app.tar");
     let export_out = Command::new(bin)

@@ -81,8 +81,9 @@ fail with a clear message.
 
 ## 5. Later
 
-- [ ] **ZFS clones for build stages**, instead of copying the base image
-  and earlier stages into a directory.
+- [x] **ZFS clones for build stages**: with a ZFS store, a stage is a
+  clone of its base image's top layer, or of a snapshot of the stage it is
+  built on, kept under `<zfs-root>/build` and destroyed with the build.
 - [x] **Network for `run --vnet`**: an epair on jailer's own bridge
   (`jailer0`, 10.88.0.0/16), NAT out and `-p` published ports through pf
   anchors under `jailer/`; `--network none` for loopback only.
