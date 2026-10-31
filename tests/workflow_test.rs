@@ -303,6 +303,7 @@ CMD ["--serve"]
     let archive_path = tmp.path().join("demo.tar");
     store
         .export("demo:1.0", &archive_path, Some("localhost/demo:1.0"))
+        .await
         .unwrap();
     assert!(archive_path.exists());
     // Docker's manifest names files the archive holds.

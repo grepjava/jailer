@@ -819,7 +819,7 @@ async fn main() -> Result<()> {
                 (None, [img, out]) => (img.clone(), PathBuf::from(out)),
                 _ => bail!("usage: jailer export [IMAGE] <OUTPUT.tar>"),
             };
-            let img = store.export(&image_ref, &out_path, name.as_deref())?;
+            let img = store.export(&image_ref, &out_path, name.as_deref()).await?;
             let shown = name
                 .as_deref()
                 .or_else(|| img.references.first().map(String::as_str))
