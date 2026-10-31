@@ -59,6 +59,8 @@ pub struct BuildOptions {
     pub timestamp: Option<i64>,
     /// Limits on each `RUN` step's jail.
     pub limits: crate::runtime::Limits,
+    /// How new layers are compressed.
+    pub compression: layer::Compression,
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +245,7 @@ pub async fn build(
                 layers: Vec::new(),
                 descriptors: Vec::new(),
                 shell: Vec::new(),
-                cache_key: next_key("", &["scratch"]),
+                cache_key: root_key(opts, &["scratch"]),
                 tree: None,
             }
         } else if let Some(prev) = find_stage(&completed_stages, &base_ref) {
@@ -300,7 +302,7 @@ pub async fn build(
                 layers: base_img.layers.clone(),
                 descriptors: base_img.layer_descriptors.clone(),
                 shell: Vec::new(),
-                cache_key: next_key("", &["from", &base_img.id]),
+                cache_key: root_key(opts, &["from", &base_img.id]),
                 tree: None,
             }
         };
@@ -367,13 +369,15 @@ pub async fn build(
     if final_layers.is_empty() {
         let tar_out = build_tmp.path().join("scratch.tar");
         let gz_out = build_tmp.path().join("scratch.tar.gz");
-        let art = layer::pack_directory_layer(&final_stage.root, &tar_out, &gz_out)?;
+        let art =
+            layer::pack_directory_layer(&final_stage.root, &tar_out, &gz_out, opts.compression)?;
         final_config.rootfs.diff_ids.push(art.diff_id.clone());
         let chains = chain_ids(&final_config.rootfs.diff_ids);
         let chain_hex = hex_of(chains.last().unwrap())?.to_owned();
-        let desc = store
+        let mut desc = store
             .commit_built_layer(&pin, None, &chain_hex, &tar_out, &gz_out, &art)
             .await?;
+        desc.media_type = opts.compression.media_type().to_owned();
         final_layers.push(chain_hex);
         final_descriptors.push(desc);
     }
@@ -643,7 +647,7 @@ async fn execute_instruction(
             )?;
             drop(from_image);
             drop(extras);
-            commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw).await?;
+            commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
             stage.cache_key = copy_key(stage, &sp.raw);
         }
         Instruction::Run(form, run_opts) => {
@@ -733,9 +737,7 @@ async fn execute_instruction(
                         )));
                     }
                     drop(mounts);
-                    let layer =
-                        commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)
-                            .await?;
+                    let layer = commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
                     crate::store::record_step(store, &key, &CachedStep { layer })?;
                 }
             }
@@ -1045,17 +1047,23 @@ fn set_owner_mode(_: &Path, _: u32, _: u32, _: u32) -> Result<(), Error> {
 }
 
 async fn commit_step_diff(
-    store: &Arc<Store>,
-    pin: &Pin,
+    env: BuildEnv<'_>,
     stage: &mut BuiltStage,
     before: &TreeState,
-    tmp_dir: &Path,
     step_no: usize,
     created_by: &str,
 ) -> Result<Option<CachedLayer>, Error> {
+    let BuildEnv {
+        store,
+        pin,
+        tmp_dir,
+        ..
+    } = env;
+    let compression = env.opts.compression;
     let tar_out = tmp_dir.join(format!("step-{}-{step_no}.tar", stage.layers.len()));
     let gz_out = tmp_dir.join(format!("step-{}-{step_no}.tar.gz", stage.layers.len()));
-    let (diff, after) = layer::create_diff_layer(before, &stage.root, &tar_out, &gz_out)?;
+    let (diff, after) =
+        layer::create_diff_layer(before, &stage.root, &tar_out, &gz_out, compression)?;
     stage.tree = Some(after);
     match diff {
         Some(art) => {
@@ -1063,7 +1071,7 @@ async fn commit_step_diff(
             stage.config.rootfs.diff_ids.push(art.diff_id.clone());
             let chains = chain_ids(&stage.config.rootfs.diff_ids);
             let chain_hex = hex_of(chains.last().unwrap())?.to_owned();
-            let desc = store
+            let mut desc = store
                 .commit_built_layer(
                     pin,
                     parent_hex.as_deref(),
@@ -1073,6 +1081,7 @@ async fn commit_step_diff(
                     &art,
                 )
                 .await?;
+            desc.media_type = compression.media_type().to_owned();
             let _ = std::fs::remove_file(&tar_out);
             let _ = std::fs::remove_file(&gz_out);
             stage.layers.push(chain_hex.clone());
@@ -1088,6 +1097,16 @@ async fn commit_step_diff(
             record_history(&mut stage.config, created_by, true);
             Ok(None)
         }
+    }
+}
+
+/// A stage's first cache key. zstd layers are told apart from gzip ones,
+/// whose keys stay as they were before there was a choice.
+fn root_key(opts: &BuildOptions, parts: &[&str]) -> String {
+    let key = next_key("", parts);
+    match opts.compression {
+        layer::Compression::Gzip => key,
+        layer::Compression::Zstd => next_key(&key, &["zstd"]),
     }
 }
 

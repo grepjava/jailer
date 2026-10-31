@@ -98,8 +98,8 @@ fail with a clear message.
 - [x] **`build --label` and `--timestamp`** (or `SOURCE_DATE_EPOCH`).
 - [ ] **`build --annotation`**: manifest annotations, which needs
   `register_built_image` in legion-image to take them.
-- [ ] **zstd layers**, and a **registry-backed build cache**
-  (`--cache-from`/`--cache-to`).
+- [x] **zstd layers**: `build --compression zstd`.
+- [ ] **A registry-backed build cache** (`--cache-from`/`--cache-to`).
 
 ## Not planned
 

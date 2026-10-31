@@ -571,7 +571,15 @@ RUN cat /one /two > /both
 ",
     )
     .unwrap();
-    cmd(&["build", "-t", "staged:1", flags_dir.to_str().unwrap()]);
+    // In zstd layers, which a real jail's root is made from as well.
+    cmd(&[
+        "build",
+        "--compression",
+        "zstd",
+        "-t",
+        "staged:1",
+        flags_dir.to_str().unwrap(),
+    ]);
     assert_eq!(
         cmd(&["run", "--entrypoint", "/bin/cat", "staged:1", "/both"]),
         "one\ntwo\n"

@@ -286,6 +286,7 @@ CMD ["--serve"]
             labels: BTreeMap::new(),
             timestamp: None,
             limits: Default::default(),
+            compression: Default::default(),
         },
     )
     .await
@@ -445,6 +446,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
             labels: BTreeMap::new(),
             timestamp: None,
             limits: Default::default(),
+            compression: Default::default(),
         },
     )
     .await
@@ -598,6 +600,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         labels: BTreeMap::new(),
         timestamp: None,
         limits: Default::default(),
+        compression: Default::default(),
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -722,6 +725,38 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         .image;
     assert_eq!(again.id, first.id);
 
+    // zstd layers: their own media type and blobs, the same files, and no
+    // gzip layer from the cache.
+    let zstd = build(
+        &store,
+        &runtime,
+        &BuildOptions {
+            compression: jailer::layer::Compression::Zstd,
+            ..opts("zstd:1")
+        },
+    )
+    .await
+    .unwrap()
+    .image;
+    assert!(!zstd.layer_descriptors.is_empty());
+    for d in &zstd.layer_descriptors {
+        assert_eq!(d.media_type, "application/vnd.oci.image.layer.v1.tar+zstd");
+        let blob = std::fs::read(store.blob_path(&d.digest).unwrap()).unwrap();
+        assert_eq!(blob[..4], [0x28, 0xb5, 0x2f, 0xfd], "a zstd frame");
+    }
+    let gzipped = build(&store, &runtime, &opts("gzip:1"))
+        .await
+        .unwrap()
+        .image;
+    assert_eq!(files(&zstd), files(&gzipped));
+    assert_eq!(zstd.config.rootfs.diff_ids, gzipped.config.rootfs.diff_ids);
+    assert!(
+        gzipped
+            .layer_descriptors
+            .iter()
+            .all(|d| d.media_type.ends_with("tar+gzip"))
+    );
+
     // Failures name the problem.
     for (cf, msg) in [
         (
@@ -805,6 +840,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 labels: BTreeMap::new(),
                 timestamp: None,
                 limits: Default::default(),
+                compression: Default::default(),
             },
         )
         .await

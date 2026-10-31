@@ -102,6 +102,7 @@ overwrites an existing
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
 .Op Fl -cache-max Ar size
+.Op Fl -compression Cm gzip | zstd
 .Op Fl -cpus Ar n
 .Op Fl -creds Ar user Ns Op : Ns Ar password
 .Op Fl -label Ar key Ns = Ns Ar value
@@ -292,6 +293,14 @@ and the other append-only and no-unlink flags, but not
 .Cm uarch ,
 which ZFS sets on every write) and hard links; a layer holds every name
 of a hard-linked file it changes.
+.Pp
+New layers are gzip-compressed, or with
+.Fl -compression Cm zstd
+zstd-compressed, which pulls and unpacks faster; Docker 23 and later,
+Podman and Legion read both.
+A cached layer is reused only by builds compressing as it was.
+With a ZFS store, each stage is a clone of its base image or of the
+stage it is built on, rather than a copy.
 .Pp
 .Fl -label
 sets a label on the image, over the Containerfile's

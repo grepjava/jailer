@@ -10,6 +10,7 @@ use jailer::build::{BuildBackend, BuildOptions};
 use jailer::check::{CheckReport, Severity, check_containerfile, check_image};
 use jailer::containerfile::Containerfile;
 use jailer::init::{InitOptions, Template, detect_app_name};
+use jailer::layer::Compression;
 use jailer::registry::Client;
 use jailer::runtime::{Config, JailRuntime};
 use jailer::store::Store;
@@ -138,6 +139,10 @@ pub enum Commands {
         /// so that a build is reproducible]
         #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
         timestamp: Option<i64>,
+
+        /// How new layers are compressed
+        #[arg(long, alias = "compression-format", value_enum, default_value_t = Compression::Gzip)]
+        compression: Compression,
 
         /// Registry credentials for pulling base images (USER[:PASSWORD])
         #[arg(long, value_name = "USER[:PASSWORD]")]
@@ -689,6 +694,7 @@ async fn main() -> Result<()> {
             limits,
             labels,
             timestamp,
+            compression,
             creds,
             authfile,
             context,
@@ -743,6 +749,7 @@ async fn main() -> Result<()> {
                     labels: parsed_labels,
                     timestamp: *timestamp,
                     limits: limits.parse()?,
+                    compression: *compression,
                 },
             )
             .await?;

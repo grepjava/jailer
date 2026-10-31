@@ -13,6 +13,64 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
+/// How a built layer's blob is compressed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Compression {
+    #[default]
+    Gzip,
+    Zstd,
+}
+
+pub const OCI_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+
+impl Compression {
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Compression::Gzip => legion_image::oci::OCI_LAYER_GZIP,
+            Compression::Zstd => OCI_LAYER_ZSTD,
+        }
+    }
+
+    /// Compresses the tar `tar` into `out`, returning both digests.
+    pub fn compress(self, tar: &Path, out: &Path) -> Result<LayerArtifact, Error> {
+        if self == Compression::Gzip {
+            return Ok(compress(tar, out)?);
+        }
+        let mut input = std::io::BufReader::new(std::fs::File::open(tar)?);
+        let mut enc = zstd::stream::Encoder::new(
+            std::io::BufWriter::new(std::fs::File::create(out)?),
+            zstd::DEFAULT_COMPRESSION_LEVEL,
+        )?;
+        let mut diff = Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = std::io::Read::read(&mut input, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            diff.update(&buf[..n]);
+            enc.write_all(&buf[..n])?;
+        }
+        enc.finish()?.flush()?;
+        let mut blob = Sha256::new();
+        let mut size = 0u64;
+        let mut input = std::fs::File::open(out)?;
+        loop {
+            let n = std::io::Read::read(&mut input, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            blob.update(&buf[..n]);
+            size += n as u64;
+        }
+        Ok(LayerArtifact {
+            diff_id: format!("sha256:{:x}", diff.finalize()),
+            blob_digest: format!("sha256:{:x}", blob.finalize()),
+            blob_size: size,
+        })
+    }
+}
+
 pub use legion_image::layer::{
     LayerArtifact, Whiteout, apply, apply_whiteouts, compress, copy_tree, decompress, extract,
     remove_tree, whiteouts,
@@ -348,6 +406,7 @@ pub fn create_diff_layer(
     after_root: &Path,
     tar_out: &Path,
     gz_out: &Path,
+    compression: Compression,
 ) -> Result<(Option<LayerArtifact>, TreeState), Error> {
     let after = TreeState::capture_from(after_root, Some(before))?;
     let mut deleted: Vec<String> = Vec::new();
@@ -442,7 +501,7 @@ pub fn create_diff_layer(
         builder.finish()?;
     }
 
-    let art = compress(tar_out, gz_out)?;
+    let art = compression.compress(tar_out, gz_out)?;
     Ok((Some(art), after))
 }
 
@@ -452,6 +511,7 @@ pub fn pack_directory_layer(
     root: &Path,
     tar_out: &Path,
     gz_out: &Path,
+    compression: Compression,
 ) -> Result<LayerArtifact, Error> {
     let state = TreeState::capture(root)?;
     {
@@ -463,7 +523,7 @@ pub fn pack_directory_layer(
         }
         builder.finish()?;
     }
-    Ok(compress(tar_out, gz_out)?)
+    compression.compress(tar_out, gz_out)
 }
 
 fn append_path_to_tar<W: Write>(
@@ -542,7 +602,7 @@ mod tests {
 
         let tar_out = t.path().join("layer.tar");
         let gz_out = t.path().join("layer.tar.gz");
-        let art = create_diff_layer(&before, &root, &tar_out, &gz_out)
+        let art = create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip)
             .unwrap()
             .0
             .expect("changes present");
@@ -631,7 +691,7 @@ mod tests {
         let tar_out = t.path().join("l.tar");
         let gz_out = t.path().join("l.tar.gz");
 
-        pack_directory_layer(&root, &tar_out, &gz_out).unwrap();
+        pack_directory_layer(&root, &tar_out, &gz_out, Compression::Gzip).unwrap();
         let all = entries(&tar_out);
         let chfn = all.iter().find(|e| e.0 == "bin/chfn").unwrap();
         let chpass = all.iter().position(|e| e.0 == "bin/chpass").unwrap();
@@ -646,7 +706,8 @@ mod tests {
         // A third name brings the others along.
         let before = TreeState::capture(&root).unwrap();
         std::fs::hard_link(root.join("bin/chpass"), root.join("bin/chsh")).unwrap();
-        let (_, after) = create_diff_layer(&before, &root, &tar_out, &gz_out).unwrap();
+        let (_, after) =
+            create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip).unwrap();
         let names: Vec<_> = entries(&tar_out)
             .into_iter()
             .filter(|e| e.0.starts_with("bin/c"))
@@ -700,7 +761,7 @@ mod tests {
         chflags("nodump");
         let tar_out = t.path().join("l.tar");
         let gz_out = t.path().join("l.tar.gz");
-        let made = create_diff_layer(&before, &root, &tar_out, &gz_out);
+        let made = create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip);
         chflags("0");
         assert!(made.unwrap().0.is_some());
         let f = entries(&tar_out).into_iter().find(|e| e.0 == "f").unwrap();
