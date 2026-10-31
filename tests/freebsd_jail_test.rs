@@ -229,8 +229,8 @@ CMD ["default-arg"]
     // Containers as Legion runs them: detached, then ps, exec, logs, stop
     // and rm; Legion's security defaults, with --param over them; --vnet
     // as a pod with a member.
-    let cmd = |args: &[&str]| {
-        let out = Command::new(bin)
+    let try_cmd = |args: &[&str]| {
+        Command::new(bin)
             .args([
                 "--state-dir",
                 state_dir.to_str().unwrap(),
@@ -239,7 +239,10 @@ CMD ["default-arg"]
             ])
             .args(args)
             .output()
-            .unwrap();
+            .unwrap()
+    };
+    let cmd = |args: &[&str]| {
+        let out = try_cmd(args);
         assert!(
             out.status.success(),
             "jailer {args:?}:\n{}{}",
@@ -290,12 +293,143 @@ CMD ["default-arg"]
     assert_eq!(over, "-1\n");
 
     let vnet = cmd(&[
-        &["run", "--vnet"][..],
+        &["run", "--network", "none"][..],
         &shell,
         &["/sbin/ifconfig -l; /sbin/ifconfig lo0 inet | grep -c 'inet 127.0.0.1'"],
     ]
     .concat());
     assert_eq!(vnet, "lo0\n1\n");
+
+    // --vnet puts the pod on jailer's bridge; -p publishes its ports. Both
+    // need pf.conf to call jailer's anchors.
+    let host = |args: &[&str]| {
+        let out = Command::new(args[0]).args(&args[1..]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    if host(&["pfctl", "-sn"]).contains("\"jailer/*\"") {
+        // A listener: the host's nc and the libraries it needs.
+        let nc_dir = tmp.path().join("nc");
+        std::fs::create_dir_all(nc_dir.join("lib")).unwrap();
+        std::fs::copy("/usr/bin/nc", nc_dir.join("nc")).unwrap();
+        for lib in ["libipsec.so.4", "libsbuf.so.6", "libstats.so.0"] {
+            std::fs::copy(Path::new("/lib").join(lib), nc_dir.join("lib").join(lib)).unwrap();
+        }
+        std::fs::write(
+            nc_dir.join("Containerfile"),
+            "FROM localhost/hello-service:latest\nCOPY nc /usr/bin/nc\nCOPY lib/ /lib/\n",
+        )
+        .unwrap();
+        cmd(&["build", "-t", "nc:1", nc_dir.to_str().unwrap()]);
+        cmd(&[
+            "run",
+            "-d",
+            "--name",
+            "web",
+            "-p",
+            "18080:8080",
+            "--entrypoint",
+            "/bin/sh",
+            "nc:1",
+            "-c",
+            "echo hello | /usr/bin/nc -N -l 8080",
+        ]);
+        let ps = cmd(&["ps"]);
+        assert!(
+            ps.contains("10.88.0.") && ps.contains("18080:8080/tcp"),
+            "{ps}"
+        );
+        let ip = ps
+            .split_whitespace()
+            .find(|w| w.starts_with("10.88.0."))
+            .unwrap()
+            .to_owned();
+        // From outside: the host's own connections to its addresses go
+        // through lo0, where pf cannot send them on. A client jail on an
+        // epair of its own stands in for another machine.
+        struct Client(String);
+        impl Drop for Client {
+            fn drop(&mut self) {
+                let _ = Command::new("jail")
+                    .args(["-r", "jailer_test_client"])
+                    .status();
+                let _ = Command::new("ifconfig").args([&self.0, "destroy"]).status();
+            }
+        }
+        let a = host(&["ifconfig", "epair", "create"]).trim().to_owned();
+        let _client = Client(a.clone());
+        let b = format!("{}b", a.trim_end_matches('a'));
+        host(&["ifconfig", &a, "inet", "10.99.0.1/30", "up"]);
+        host(&[
+            "jail",
+            "-c",
+            "name=jailer_test_client",
+            "path=/",
+            "vnet",
+            "persist",
+            &format!("vnet.interface={b}"),
+        ]);
+        let inside = |args: &[&str]| host(&[&["jexec", "jailer_test_client"][..], args].concat());
+        inside(&["ifconfig", &b, "inet", "10.99.0.2/30", "up"]);
+        inside(&["route", "add", "default", "10.99.0.1"]);
+        let mut got = String::new();
+        for _ in 0..20 {
+            got = inside(&["nc", "-w", "2", "10.99.0.1", "18080"]);
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert_eq!(got, "hello\n", "published port 18080, from outside");
+        // And a pod reaches out, through the bridge and the host.
+        let mut listener = Command::new("jexec")
+            .args(["jailer_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            cmd(&[
+                "run",
+                "--vnet",
+                "--entrypoint",
+                "/usr/bin/nc",
+                "nc:1",
+                "-w",
+                "5",
+                "10.99.0.2",
+                "9999",
+            ]),
+            "hi\n"
+        );
+        listener.wait().unwrap();
+        // Until legion-jail forces the unmount: a jail that served TCP
+        // dies only once its TIME_WAIT sockets expire (up to 60 s), and
+        // holds its root busy until then.
+        let mut removed = false;
+        for _ in 0..45 {
+            if try_cmd(&["rm", "-f", "web"]).status.success() {
+                removed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        assert!(removed, "rm -f web");
+        assert!(
+            !host(&["ifconfig", "-l"]).contains(" jp"),
+            "epairs are gone"
+        );
+        assert!(!Path::new("/var/run/jailer/net").join(&ip).exists());
+        for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+            let rules = host(&["pfctl", "-a", anchor, "-sn"]);
+            assert!(!rules.contains("18080"), "{anchor}: {rules}");
+        }
+    } else {
+        let out = try_cmd(&[&["run", "--vnet"][..], &shell, &["true"]].concat());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("rdr-anchor \"jailer/*\""),
+            "{err}"
+        );
+    }
 
     // Resource limits are rctl rules on the container's jail, set before it
     // starts and dropped with it.

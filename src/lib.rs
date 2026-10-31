@@ -10,6 +10,7 @@ pub mod check;
 pub mod containerfile;
 pub mod init;
 pub mod layer;
+pub mod net;
 pub mod runtime;
 pub mod store;
 

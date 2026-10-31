@@ -83,8 +83,13 @@ fail with a clear message.
 
 - [ ] **ZFS clones for build stages**, instead of copying the base image
   and earlier stages into a directory.
-- [ ] **Network for `run --vnet`**: an epair and bridge, and published
-  ports; today a VNET container has only its loopback.
+- [x] **Network for `run --vnet`**: an epair on jailer's own bridge
+  (`jailer0`, 10.88.0.0/16), NAT out and `-p` published ports through pf
+  anchors under `jailer/`; `--network none` for loopback only.
+- [ ] **Legion fixes asked for**: `remove` of a container that served TCP
+  fails until its dying jail lets go of the root (up to 60 s); manifest
+  annotations; a cpuset annotation; `PodNetwork` with a bridge name of
+  one's own (jailer's `net.rs` is a near-copy of it).
 - [x] **Resource limits**: `-m`, `--cpus`, `--pids-limit` for `run` and
   `build`, as rctl rules (memory per process, as on a Legion node).
 - [ ] **`--cpuset-cpus`**: best set by legion-jail when it makes the jail,

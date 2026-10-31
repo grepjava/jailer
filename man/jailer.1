@@ -342,6 +342,8 @@ and imports the result.
 .Op Fl m Ar size
 .Op Fl -cpus Ar n
 .Op Fl -name Ar name
+.Op Fl -network Cm host | bridge | none
+.Op Fl p Oo Ar ip : Oc Ns Ar port : Ns Ar port Ns Op / Ns Cm tcp | udp
 .Op Fl -param Ar key Ns = Ns Ar value
 .Op Fl -pids-limit Ar n
 .Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
@@ -396,10 +398,40 @@ Run it as a node runs a pod: a VNET jail running nothing, named
 with
 .Li lo0
 up on 127.0.0.1, and the container a jail inside it.
+The pod gets an
+.Xr epair 4
+on jailer's bridge,
+.Li jailer0
+(10.88.0.1/16), an address from 10.88.0.0/16 and a default route through
+the bridge; pf translates its traffic out of the host's default
+interface.
 .Nm stop
 and
 .Nm rm
-take the pod along.
+take the pod along, and free its address.
+Same as
+.Fl -network Cm bridge .
+.It Fl -network Cm host | bridge | none
+.Cm host
+(the default): the host's network, in a jail of its own.
+.Cm bridge :
+as
+.Fl -vnet .
+.Cm none :
+a pod with only its loopback.
+.It Fl p , Fl -publish Oo Ar ip : Oc Ns Ar host : Ns Ar container Ns Op / Ns Cm tcp | udp
+Publish the container's port
+.Ar container
+on the host's port
+.Ar host ,
+on every address or only
+.Ar ip ;
+implies
+.Fl -vnet .
+Other machines reach it; the host itself reaches the container at its
+own address, which
+.Nm ps
+shows.
 .It Fl -allow-mlock
 Allow
 .Xr mlock 2 .
@@ -437,6 +469,24 @@ in
 .Xr loader.conf 5 ;
 .Nm rm
 drops them.
+.Pp
+.Fl -vnet
+and
+.Fl p
+need
+.Xr pf 4 ,
+with
+.Xr pf.conf 5
+calling jailer's anchors, the first two before any filter rule:
+.Bd -literal -offset indent
+nat-anchor "jailer/*"
+rdr-anchor "jailer/*"
+anchor "jailer/*"
+.Ed
+.Pp
+Each address taken is a file in
+.Pa /var/run/jailer/net ,
+so containers of different state directories never share one.
 .Bl -tag -width Ds
 .It Fl -linux
 Run a Linux image through

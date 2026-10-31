@@ -2,7 +2,7 @@
 //! node does, and runs a build's `RUN` steps. What is jailer's own is how
 //! `jailer run` asks for one: a standalone container (a jail of its own on
 //! the host's network), or with `--vnet` a pod jail and a member in it, as
-//! a cluster runs a pod. Containers get Legion's security defaults, with
+//! a cluster runs a pod, the pod on jailer's bridge ([`crate::net`]). Containers get Legion's security defaults, with
 //! `--param` over them.
 
 use std::collections::BTreeMap;
@@ -26,6 +26,22 @@ use crate::Error;
 pub const LABEL_POD: &str = "jailer.pod";
 /// `pod` on a pod jailer made; `jailer ps` leaves them out.
 pub const LABEL_ROLE: &str = "jailer.role";
+/// On a pod on the bridge: its address.
+pub const LABEL_IP: &str = "jailer.ip";
+/// On a pod on the bridge: the ports it publishes, comma-separated.
+pub const LABEL_PORTS: &str = "jailer.ports";
+
+/// The network a container is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Network {
+    /// The host's, in a jail of its own.
+    #[default]
+    Host,
+    /// A pod's VNET, on jailer's bridge.
+    Bridge,
+    /// A pod's VNET with only its loopback.
+    None,
+}
 
 /// What `jailer run` asks for.
 #[derive(Debug, Clone, Default)]
@@ -42,7 +58,9 @@ pub struct RunSpec {
     pub mounts: Vec<Mount>,
     /// jail(8) parameters, over Legion's security defaults.
     pub params: Vec<(String, String)>,
-    pub vnet: bool,
+    pub network: Network,
+    /// Published, with [`Network::Bridge`].
+    pub ports: Vec<crate::net::Port>,
     pub allow_mlock: bool,
     /// `msg`, `sem`, `shm`.
     pub sysv: Vec<String>,
@@ -231,14 +249,36 @@ mod containers {
     use legion_sys::{IfConfig, Ipv4Net};
 
     use super::*;
+    use crate::net::{self, Leases};
 
     /// Creates the container `spec` asks for (and with `--vnet` starts its
-    /// pod) and returns its id.
-    pub async fn create(rt: &JailRuntime, sys: &dyn Sys, spec: &RunSpec) -> Result<String, Error> {
+    /// pod, on the bridge) and returns its id.
+    pub async fn create(
+        rt: &JailRuntime,
+        sys: &dyn Sys,
+        leases: &Leases,
+        spec: &RunSpec,
+    ) -> Result<String, Error> {
         let mut member = member_spec(spec)?;
         let mut pod = None;
-        if spec.vnet {
-            let id = rt.create(&pod_spec(spec)).await?;
+        if spec.network != Network::Host {
+            let mut pod_spec = pod_spec(spec);
+            // Held until the address is recorded as the pod's.
+            let mut lease = None;
+            if spec.network == Network::Bridge {
+                net::ensure(sys)?;
+                let held = leases.lock()?;
+                let ip = held.allocate(sys, &spec.ports)?;
+                pod_spec.labels.insert(LABEL_IP.to_owned(), ip.to_string());
+                if !spec.ports.is_empty() {
+                    let ports: Vec<String> = spec.ports.iter().map(ToString::to_string).collect();
+                    pod_spec
+                        .labels
+                        .insert(LABEL_PORTS.to_owned(), ports.join(","));
+                }
+                lease = Some((held, ip));
+            }
+            let id = rt.create(&pod_spec).await?;
             pod = Some(id.clone());
             let started = async {
                 rt.start(&id).await?;
@@ -254,12 +294,21 @@ mod containers {
                         ..Default::default()
                     },
                 )?;
+                if let Some((held, ip)) = &lease {
+                    held.record(*ip, &id, &spec.ports)?;
+                    net::attach(sys, &id, *ip, &spec.ports)?;
+                }
                 Ok::<_, Error>(())
             };
             if let Err(e) = started.await {
                 let _ = rt.remove(&id).await;
+                if let Some((held, ip)) = lease {
+                    drop(held);
+                    let _ = leases.release(ip, &id);
+                }
                 return Err(e);
             }
+            drop(lease);
             member
                 .annotations
                 .insert(ANNOTATION_PARENT.to_owned(), id.clone());
@@ -297,8 +346,28 @@ mod containers {
         Ok(rt.inspect(id).await?.config.labels.get(LABEL_POD).cloned())
     }
 
+    /// Takes a stopped pod off the bridge and frees its address: a stopped
+    /// pod does not start again.
+    async fn unplug(rt: &JailRuntime, sys: &dyn Sys, leases: &Leases, pod: &str) {
+        let Ok(status) = rt.inspect(pod).await else {
+            return;
+        };
+        if let Some(ip) = status.config.labels.get(LABEL_IP) {
+            net::detach(sys, pod);
+            if let Ok(ip) = ip.parse() {
+                let _ = leases.release(ip, pod);
+            }
+        }
+    }
+
     /// Stops a container, then its pod.
-    pub async fn stop(rt: &JailRuntime, id: &str, timeout: Duration) -> Result<(), Error> {
+    pub async fn stop(
+        rt: &JailRuntime,
+        sys: &dyn Sys,
+        leases: &Leases,
+        id: &str,
+        timeout: Duration,
+    ) -> Result<(), Error> {
         let pod = pod_of(rt, id).await?;
         rt.stop(id, timeout).await?;
         if let Some(p) = pod {
@@ -306,16 +375,23 @@ mod containers {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
                 _ => {}
             }
+            unplug(rt, sys, leases, &p).await;
         }
         Ok(())
     }
 
     /// Removes a container, then its pod, and the container's limits.
-    pub async fn remove(rt: &JailRuntime, sys: &dyn Sys, id: &str) -> Result<(), Error> {
+    pub async fn remove(
+        rt: &JailRuntime,
+        sys: &dyn Sys,
+        leases: &Leases,
+        id: &str,
+    ) -> Result<(), Error> {
         let pod = pod_of(rt, id).await?;
         rt.remove(id).await?;
         unlimit(sys, &jail_of(id, pod.as_deref()));
         if let Some(p) = pod {
+            unplug(rt, sys, leases, &p).await;
             match rt.remove(&p).await {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
                 _ => {}

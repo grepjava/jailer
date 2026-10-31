@@ -198,9 +198,20 @@ pub enum Commands {
         #[arg(long, value_name = "BIN")]
         entrypoint: Option<String>,
 
-        /// Create a VNET jail with an isolated network stack
+        /// Run in a pod with a network stack of its own, on jailer's bridge
+        /// (`--network bridge`)
         #[arg(long)]
         vnet: bool,
+
+        /// The network: the host's, jailer's bridge (as `--vnet`), or none
+        /// (a pod with only its loopback)
+        #[arg(long, value_enum, default_value_t = NetworkArg::Host)]
+        network: NetworkArg,
+
+        /// Publish a port on the host: [IP:]HOST:CONTAINER[/tcp|udp]
+        /// (implies `--vnet`)
+        #[arg(short = 'p', long = "publish", value_name = "[IP:]HOST:CONTAINER")]
+        publish: Vec<String>,
 
         /// Allow mlock(2) inside the jail (`org.freebsd.jail.allow.mlock=true`)
         #[arg(long)]
@@ -528,6 +539,13 @@ fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
     }
     let _ = sys;
     None
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkArg {
+    Host,
+    Bridge,
+    None,
 }
 
 /// Resource limits, held by rctl(8).
@@ -1015,7 +1033,9 @@ async fn main() -> Result<()> {
 #[cfg(unix)]
 async fn containers(cli: &Cli) -> Result<()> {
     use futures::StreamExt;
-    use jailer::runtime::{LABEL_ROLE, LINUX_MODULES, Mount, RunSpec};
+    use jailer::runtime::{
+        LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, LINUX_MODULES, Mount, Network, RunSpec,
+    };
     use std::time::Duration;
 
     use legion_runtime::{Output, Runtime};
@@ -1034,6 +1054,8 @@ async fn containers(cli: &Cli) -> Result<()> {
             hostname,
             entrypoint,
             vnet,
+            network,
+            publish,
             allow_mlock,
             sysv,
             params,
@@ -1096,6 +1118,21 @@ async fn containers(cli: &Cli) -> Result<()> {
                 extra_params.push((k.to_owned(), v.to_owned()));
             }
 
+            let ports = publish
+                .iter()
+                .map(|p| p.parse())
+                .collect::<Result<Vec<jailer::net::Port>, _>>()?;
+            let network = match network {
+                NetworkArg::Host if *vnet || !ports.is_empty() => Network::Bridge,
+                NetworkArg::Host => Network::Host,
+                NetworkArg::Bridge => Network::Bridge,
+                NetworkArg::None if *vnet || !ports.is_empty() => {
+                    bail!("--network none has no ports to publish and is not --vnet's bridge")
+                }
+                NetworkArg::None => Network::None,
+            };
+            let leases = jailer::net::Leases::new(jailer::net::LEASES);
+
             // When running in foreground without `-d`, default to removing the
             // ephemeral test container afterwards unless `--name` was given to keep it.
             let auto_rm = *rm || (!*detach && name.is_none());
@@ -1116,17 +1153,18 @@ async fn containers(cli: &Cli) -> Result<()> {
                 hostname: hostname.clone(),
                 mounts,
                 params: extra_params,
-                vnet: *vnet,
+                network,
+                ports,
                 allow_mlock: *allow_mlock,
                 sysv: sysv.clone(),
                 limits: limits.parse()?,
             };
 
-            let id = jailer::runtime::create(&runtime, &*sys, &spec).await?;
+            let id = jailer::runtime::create(&runtime, &*sys, &leases, &spec).await?;
             if *detach {
                 if let Err(e) = runtime.start(&id).await {
                     if *rm {
-                        let _ = jailer::runtime::remove(&runtime, &*sys, &id).await;
+                        let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
                     }
                     return Err(e.into());
                 }
@@ -1135,7 +1173,7 @@ async fn containers(cli: &Cli) -> Result<()> {
             }
             let code = runtime.run_attached(&id, *interactive, *tty).await;
             if auto_rm {
-                let _ = jailer::runtime::remove(&runtime, &*sys, &id).await;
+                let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
             }
             let code = code?;
             if code != 0 {
@@ -1146,8 +1184,19 @@ async fn containers(cli: &Cli) -> Result<()> {
 
         Commands::Ps { all } => {
             let (_, _, runtime) = open_context(cli, true)?;
+            let all_of = runtime.list(&[]).await?;
+            // A member's address and ports are its pod's.
+            let network = |c: &legion_runtime::ContainerSummary| {
+                let pod = c.labels.get(LABEL_POD)?;
+                let labels = &all_of.iter().find(|p| &p.id == pod)?.labels;
+                let mut net = labels.get(LABEL_IP)?.clone();
+                if let Some(ports) = labels.get(LABEL_PORTS) {
+                    net = format!("{net} {}", ports.replace(',', " "));
+                }
+                Some(net)
+            };
             let mut list = Vec::new();
-            for c in runtime.list(&[]).await? {
+            for c in &all_of {
                 if c.labels.get(LABEL_ROLE).is_some_and(|r| r == "pod")
                     || (!*all && c.state != "running")
                 {
@@ -1161,29 +1210,36 @@ async fn containers(cli: &Cli) -> Result<()> {
                     "exited" => format!("exited ({})", c.exit_code),
                     other => other.to_owned(),
                 };
-                list.push((c, status));
+                list.push((c, status, network(c).unwrap_or_default()));
             }
             let width = |f: fn(&legion_runtime::ContainerSummary) -> &str, head: &str| {
                 list.iter()
-                    .map(|(c, _)| f(c).len())
+                    .map(|(c, ..)| f(c).len())
                     .chain([head.len()])
                     .max()
                     .unwrap_or(0)
             };
             let wn = width(|c| c.name(), "NAME");
             let wi = width(|c| &c.image, "IMAGE");
+            let ws = list
+                .iter()
+                .map(|(_, s, _)| s.len())
+                .chain(["STATUS".len()])
+                .max()
+                .unwrap_or(0);
             println!(
-                "{:<14} {:<wn$}  {:<wi$}  STATUS",
-                "CONTAINER ID", "NAME", "IMAGE"
+                "{:<14} {:<wn$}  {:<wi$}  {:<ws$}  NETWORK",
+                "CONTAINER ID", "NAME", "IMAGE", "STATUS"
             );
-            for (c, status) in &list {
+            for (c, status, net) in &list {
                 let short_id: String = c.id.chars().take(12).collect();
-                println!(
-                    "{:<14} {:<wn$}  {:<wi$}  {status}",
+                let line = format!(
+                    "{:<14} {:<wn$}  {:<wi$}  {status:<ws$}  {net}",
                     short_id,
                     c.name(),
                     c.image
                 );
+                println!("{}", line.trim_end());
             }
             Ok(())
         }
@@ -1222,22 +1278,24 @@ async fn containers(cli: &Cli) -> Result<()> {
         }
 
         Commands::Stop { time, container } => {
-            let (_, _, runtime) = open_context(cli, true)?;
+            let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = jailer::net::Leases::new(jailer::net::LEASES);
             let id = runtime.find(container)?;
             let wait = Duration::from_secs(time.unwrap_or(10));
-            jailer::runtime::stop(&runtime, &id, wait).await?;
+            jailer::runtime::stop(&runtime, &*sys, &leases, &id, wait).await?;
             println!("{container}");
             Ok(())
         }
 
         Commands::Rm { force, containers } => {
             let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = jailer::net::Leases::new(jailer::net::LEASES);
             for c in containers {
                 let id = runtime.find(c)?;
                 if !force && runtime.inspect(&id).await?.state.running {
                     bail!("container {c:?} is running: stop it first or use `rm -f`");
                 }
-                jailer::runtime::remove(&runtime, &*sys, &id).await?;
+                jailer::runtime::remove(&runtime, &*sys, &leases, &id).await?;
                 println!("{c}");
             }
             Ok(())
