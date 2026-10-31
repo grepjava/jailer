@@ -1,6 +1,6 @@
 PORTNAME=	jailer
 DISTVERSIONPREFIX=	v
-DISTVERSION=	0.1.0
+DISTVERSION=	0.4.0
 CATEGORIES=	sysutils
 
 MAINTAINER=	grepjava@gmail.com
@@ -9,6 +9,8 @@ WWW=		https://github.com/grepjava/jailer
 
 LICENSE=	BSD2CLAUSE
 LICENSE_FILE=	${WRKSRC}/LICENSE
+
+LIB_DEPENDS=	libzstd.so:archivers/zstd
 
 USES=		cargo
 USE_GITHUB=	yes

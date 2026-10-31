@@ -20,12 +20,13 @@ jailer export app.tar       # Produce an offline OCI archive
 
 Legion pulls OCI images, stores their layers on ZFS, and runs containers as jails, intentionally leaving image building out of the cluster daemon. `jailer` fills the local development and CI workflow while matching Legion's exact runtime semantics:
 
-- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from` a stage or an image, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret, ssh and tmpfs mounts, `RUN --network=none`, here-documents, `COPY --exclude/--parents`, `ADD <url> --checksum`, `ONBUILD`, `.containerignore`, jail parameters and SysV IPC for `RUN` steps (`--param`, `--sysv`), and a build cache), OCI layer differ (with `.wh.` whiteouts, FreeBSD file flags and hard links), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
+- **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from` a stage or an image, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret, ssh and tmpfs mounts, `RUN --network=none`, here-documents, `COPY --exclude/--parents`, `ADD <url> --checksum`, `ONBUILD`, `.containerignore`, jail parameters, SysV IPC and resource limits for `RUN` steps (`--param`, `--sysv`, `-m`, `--cpus`, `--pids-limit`, `--cpuset-cpus`), `--label`, `--annotation` and reproducible `--timestamp`, gzip or zstd layers, ZFS clones for stages, and a build cache kept locally or in a registry with `--cache-to`/`--cache-from`), OCI layer differ (with `.wh.` whiteouts, FreeBSD file flags and hard links), and OCI Distribution API client (`pull` and `push`, with cosign-compatible signing: `push --sign-key`, `sign`, `verify`). Can also delegate builds to `buildah` (`--backend buildah`).
 - **Local testing with Legion's runtime:** `jailer run` runs images with Legion's own `legion-jail`, as a node does:
   - ZFS snapshot/clone layers (`<dataset>/<chain>@layer`) with an automatic plain-directory fallback when ZFS is unavailable.
   - `/etc/passwd` and `/etc/group` user & supplementary group resolution inside the jail.
   - `devfs` ruleset 4 mounted at `/dev`, Legion's security defaults (`enforce_statfs=2`, `securelevel=2`, no raw sockets or file flags; `--param` overrides them), and symlink-safe `nullfs` volume mounts (`-v`).
-  - Optional VNET pods (`--vnet`), `allow.mlock` (`--allow-mlock`), SysV IPC (`--sysv`), and FreeBSD Linux ABI support (`--linux` mounting `linprocfs`, `linsysfs`, `fdescfs`, and `/dev/shm`).
+  - VNET pods on jailer's own bridge (`--vnet`), with NAT out and published ports (`-p 8080:80`) through pf anchors under `jailer/`, or loopback only (`--network none`).
+  - Resource limits as rctl rules (`-m`, `--cpus`, `--pids-limit`) and CPU sets (`--cpuset-cpus`), `allow.mlock` (`--allow-mlock`), SysV IPC (`--sysv`), and FreeBSD Linux ABI support (`--linux` mounting `linprocfs`, `linsysfs`, `fdescfs`, and `/dev/shm`).
 - **Build-time Legion compatibility checks (`jailer check`):** Catches image configuration issues at build time instead of deploy time:
   - Verifies `USER` against the image's `/etc/passwd` and `/etc/group`.
   - Verifies `ENTRYPOINT` / `CMD` exist and are executable inside the image rootfs along `PATH`.
@@ -45,6 +46,8 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
 | `jailer check [image-or-dir]` | Validate a `Containerfile` and/or built image against Legion's runtime |
 | `jailer manifest push <registry/repo:tag> <source>...` | Publish one name for several architectures (an OCI image index) |
 | `jailer manifest inspect <reference>` | Show the manifest or index a registry holds |
+| `jailer sign --key k.key <ref>` / `jailer verify --key k.pub <ref>` | Sign an image in a registry as cosign does, or check its signature |
+| `jailer key generate [prefix]` | Make a P-256 key pair for signing |
 | `jailer pull <reference>` | Pull an image from an OCI registry into the local store |
 | `jailer load <archive.tar>` | Load an OCI archive into the local store |
 | `jailer images` / `jailer rmi <ref>` | List or remove local images |
@@ -57,10 +60,10 @@ Release tarballs for FreeBSD 15 (amd64 so far) are on the
 [releases page](https://github.com/grepjava/jailer/releases):
 
 ```sh
-fetch https://github.com/grepjava/jailer/releases/download/v0.3.0/jailer-0.3.0-freebsd15-amd64.tar.gz
-tar xzf jailer-0.3.0-freebsd15-amd64.tar.gz
-install -s jailer-0.3.0-freebsd15-amd64/bin/jailer /usr/local/bin/
-install -m 444 jailer-0.3.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
+fetch https://github.com/grepjava/jailer/releases/download/v0.4.0/jailer-0.4.0-freebsd15-amd64.tar.gz
+tar xzf jailer-0.4.0-freebsd15-amd64.tar.gz
+install -s jailer-0.4.0-freebsd15-amd64/bin/jailer /usr/local/bin/
+install -m 444 jailer-0.4.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
 ```
 
 Or build the port in `ports/sysutils/jailer` from a ports tree:
@@ -85,8 +88,8 @@ Tag the version, then build a tarball per architecture on FreeBSD hosts and
 attach them to the GitHub release (`-n` builds into `dist/` only):
 
 ```sh
-git tag v0.3.0 && git push origin v0.3.0
-scripts/release.sh v0.3.0 user@amd64-host user@arm64-host
+git tag v0.4.0 && git push origin v0.4.0
+scripts/release.sh v0.4.0 user@amd64-host user@arm64-host
 ```
 
 After a dependency change, `scripts/port-crates.sh` regenerates the port's
