@@ -282,6 +282,7 @@ CMD ["--serve"]
             cache_max: None,
             secrets: BTreeMap::new(),
             ssh: BTreeMap::new(),
+            jail_params: Vec::new(),
         },
     )
     .await
@@ -436,6 +437,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
             cache_max: None,
             secrets: BTreeMap::new(),
             ssh: BTreeMap::new(),
+            jail_params: Vec::new(),
         },
     )
     .await
@@ -585,6 +587,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         cache_max: None,
         secrets: BTreeMap::new(),
         ssh: BTreeMap::new(),
+        jail_params: Vec::new(),
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -662,6 +665,21 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert_eq!(squashed.layers.len(), 1);
     assert_eq!(squashed.config.rootfs.diff_ids.len(), 1);
     assert_eq!(files(&squashed), got);
+
+    // `COPY --from` an image, not a stage.
+    write_cf(
+        "FROM scratch AS tools\nFROM scratch\nCOPY --from=base:1 /etc/raw.txt /docs/ /copied/\nCOPY --from=tools / /empty/\n"
+            .to_owned(),
+    );
+    let copied = build(&store, &runtime, &opts("copied:1"))
+        .await
+        .unwrap()
+        .image;
+    let got = files(&copied);
+    assert_eq!(got["copied/raw.txt"], "$NAME\n");
+    assert_eq!(got["copied/guide.txt"], "docs/guide.txt");
+    write_cf("FROM scratch\nCOPY --from=localhost/nowhere:1 /a /a\n".to_owned());
+    assert!(build(&store, &runtime, &opts("nowhere:2")).await.is_err());
 
     // Failures name the problem.
     for (cf, msg) in [
@@ -742,6 +760,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 cache_max: None,
                 secrets: BTreeMap::new(),
                 ssh: BTreeMap::new(),
+                jail_params: Vec::new(),
             },
         )
         .await

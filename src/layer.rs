@@ -4,7 +4,7 @@
 //! and copying and removing trees with their file flags, is
 //! `legion_image::layer`'s, re-exported here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path};
@@ -30,6 +30,44 @@ pub struct EntryMeta {
     pub gid: u64,
     pub size: u64,
     pub digest_or_link: String,
+    /// FreeBSD file flags that matter in an image ([`FLAGS`]).
+    pub flags: u32,
+}
+
+/// File flags kept in layers, by chflags(1)'s names: what bsdtar
+/// `--fflags` restores. Others (`uarch`, which ZFS sets on writes) are
+/// left out.
+const FLAGS: [(u32, &str); 7] = [
+    (0x0000_0001, "nodump"),
+    (0x0000_0002, "uchg"),
+    (0x0000_0004, "uappnd"),
+    (0x0000_0010, "uunlnk"),
+    (0x0002_0000, "schg"),
+    (0x0004_0000, "sappnd"),
+    (0x0010_0000, "sunlnk"),
+];
+
+/// `flags` as bsdtar's `SCHILY.fflags` names them.
+fn flags_text(flags: u32) -> String {
+    FLAGS
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(target_os = "freebsd")]
+fn file_flags(meta: &std::fs::Metadata) -> u32 {
+    use std::os::freebsd::fs::MetadataExt;
+    FLAGS
+        .iter()
+        .fold(0, |kept, (bit, _)| kept | (meta.st_flags() & bit))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn file_flags(_: &std::fs::Metadata) -> u32 {
+    0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +82,48 @@ pub struct TreeState {
     pub entries: BTreeMap<String, EntryMeta>,
     /// Each file's stat fingerprint when it was hashed.
     stamps: BTreeMap<String, Stamp>,
+    /// Hard-linked files: each name of one, and the first of its names,
+    /// which layers hold as the file (the others link to it).
+    links: BTreeMap<String, String>,
+}
+
+impl TreeState {
+    /// Where `rel` links to, if it is a second name of a file.
+    fn link_of(&self, rel: &str) -> Option<&str> {
+        self.links
+            .get(rel)
+            .map(String::as_str)
+            .filter(|first| *first != rel)
+    }
+
+    /// `paths` with every other name of the files among them, so that a
+    /// layer holds each hard-linked file with all its names: a link to a
+    /// file a lower layer has would need that file's flags to allow it.
+    fn with_link_groups(&self, paths: Vec<String>) -> BTreeSet<String> {
+        let firsts: BTreeSet<&String> = paths.iter().filter_map(|p| self.links.get(p)).collect();
+        let mut all: BTreeSet<String> = paths.iter().cloned().collect();
+        all.extend(
+            self.links
+                .iter()
+                .filter(|(_, first)| firsts.contains(first))
+                .map(|(p, _)| p.clone()),
+        );
+        all
+    }
+}
+
+/// Names of hard-linked files by device and inode.
+type Inodes = HashMap<(u64, u64), Vec<String>>;
+
+#[cfg(unix)]
+fn inode(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    (meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn inode(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// What changes whenever a file's contents could have: a write updates
@@ -91,8 +171,15 @@ impl TreeState {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64)
             - 1;
+        let mut inodes = Inodes::new();
         if root.exists() {
-            walk_capture(root, root, prev, racy_after, &mut state)?;
+            walk_capture(root, root, prev, racy_after, &mut state, &mut inodes)?;
+        }
+        for names in inodes.into_values().filter(|n| n.len() > 1) {
+            let first = names.iter().min().expect("names").clone();
+            state
+                .links
+                .extend(names.into_iter().map(|n| (n, first.clone())));
         }
         Ok(state)
     }
@@ -104,6 +191,7 @@ fn walk_capture(
     prev: Option<&TreeState>,
     racy_after: i64,
     out: &mut TreeState,
+    inodes: &mut Inodes,
 ) -> Result<(), Error> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(|e| e.file_name());
@@ -119,6 +207,7 @@ fn walk_capture(
         }
         let meta = std::fs::symlink_metadata(&full)?;
         let (mode, uid, gid) = meta_owner_mode(&meta);
+        let flags = file_flags(&meta);
         if meta.file_type().is_symlink() {
             let link = std::fs::read_link(&full)?
                 .to_string_lossy()
@@ -132,6 +221,7 @@ fn walk_capture(
                     gid,
                     size: 0,
                     digest_or_link: link,
+                    flags,
                 },
             );
         } else if meta.is_dir() {
@@ -144,9 +234,10 @@ fn walk_capture(
                     gid,
                     size: 0,
                     digest_or_link: String::new(),
+                    flags,
                 },
             );
-            walk_capture(root, &full, prev, racy_after, out)?;
+            walk_capture(root, &full, prev, racy_after, out, inodes)?;
         } else if meta.is_file() {
             let stamp = Stamp::of(&meta);
             let reused = prev.and_then(|p| {
@@ -163,6 +254,9 @@ fn walk_capture(
             if let Some(stamp) = stamp.filter(|s| s.ctime.0 < racy_after) {
                 out.stamps.insert(rel_str.clone(), stamp);
             }
+            if let Some(key) = inode(&meta) {
+                inodes.entry(key).or_default().push(rel_str.clone());
+            }
             out.entries.insert(
                 rel_str,
                 EntryMeta {
@@ -172,6 +266,7 @@ fn walk_capture(
                     gid,
                     size: meta.len(),
                     digest_or_link: digest,
+                    flags,
                 },
             );
         }
@@ -257,6 +352,7 @@ pub fn create_diff_layer(
             changed.push(path.clone());
         }
     }
+    let changed = after.with_link_groups(changed);
 
     if deleted.is_empty() && changed.is_empty() {
         return Ok((None, after));
@@ -288,7 +384,7 @@ pub fn create_diff_layer(
             if let Some(meta) = after.entries.get(dir_rel)
                 && meta.kind == EntryKind::Dir
             {
-                append_path_to_tar(&mut builder, after_root, dir_rel, meta)?;
+                append_path_to_tar(&mut builder, after_root, dir_rel, meta, None)?;
             }
         }
 
@@ -315,7 +411,13 @@ pub fn create_diff_layer(
 
         for ch_rel in &changed {
             let meta = &after.entries[ch_rel];
-            append_path_to_tar(&mut builder, after_root, ch_rel, meta)?;
+            append_path_to_tar(
+                &mut builder,
+                after_root,
+                ch_rel,
+                meta,
+                after.link_of(ch_rel),
+            )?;
         }
 
         builder.finish()?;
@@ -338,7 +440,7 @@ pub fn pack_directory_layer(
         let mut builder = tar::Builder::new(tar_file);
         builder.follow_symlinks(false);
         for (rel, meta) in &state.entries {
-            append_path_to_tar(&mut builder, root, rel, meta)?;
+            append_path_to_tar(&mut builder, root, rel, meta, state.link_of(rel))?;
         }
         builder.finish()?;
     }
@@ -350,9 +452,23 @@ fn append_path_to_tar<W: Write>(
     root: &Path,
     rel: &str,
     meta: &EntryMeta,
+    link_to: Option<&str>,
 ) -> Result<(), Error> {
     let full = root.join(rel);
     let mut header = tar::Header::new_gnu();
+    if let Some(first) = link_to {
+        // Written after `first`: entries go in path order, and it is the
+        // least of the file's names.
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        builder.append_link(&mut header, rel, first)?;
+        return Ok(());
+    }
+    if meta.flags != 0 {
+        let text = flags_text(meta.flags);
+        builder.append_pax_extensions([("SCHILY.fflags", text.as_bytes())])?;
+    }
     header.set_mode(meta.mode);
     header.set_uid(meta.uid);
     header.set_gid(meta.gid);
@@ -453,5 +569,122 @@ mod tests {
         // The rewritten file is racy now; the untouched one keeps its stamp.
         assert!(!second.stamps.contains_key("f"));
         assert!(second.stamps.contains_key("g"));
+    }
+
+    /// Each entry of the layer `tar`: its path, type, link target and
+    /// `SCHILY.fflags`.
+    #[cfg(unix)]
+    fn entries(tar: &Path) -> Vec<(String, tar::EntryType, String, String)> {
+        let mut archive = tar::Archive::new(File::open(tar).unwrap());
+        let mut out = Vec::new();
+        for e in archive.entries().unwrap() {
+            let mut e = e.unwrap();
+            let flags = e
+                .pax_extensions()
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|x| x.unwrap())
+                .find(|x| x.key() == Ok("SCHILY.fflags"))
+                .map(|x| x.value().unwrap().to_owned())
+                .unwrap_or_default();
+            let link = e
+                .link_name()
+                .unwrap()
+                .map(|l| l.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let path = e.path().unwrap().to_string_lossy().into_owned();
+            out.push((path, e.header().entry_type(), link, flags));
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_go_into_layers_with_all_their_names() {
+        use tar::EntryType::{Link, Regular};
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/chpass"), "chpass").unwrap();
+        std::fs::hard_link(root.join("bin/chpass"), root.join("bin/chfn")).unwrap();
+        std::fs::write(root.join("bin/other"), "other").unwrap();
+        let tar_out = t.path().join("l.tar");
+        let gz_out = t.path().join("l.tar.gz");
+
+        pack_directory_layer(&root, &tar_out, &gz_out).unwrap();
+        let all = entries(&tar_out);
+        let chfn = all.iter().find(|e| e.0 == "bin/chfn").unwrap();
+        let chpass = all.iter().position(|e| e.0 == "bin/chpass").unwrap();
+        assert_eq!(
+            (chfn.1, chfn.2.as_str()),
+            (Regular, ""),
+            "the least name is the file"
+        );
+        assert_eq!(all[chpass].1, Link);
+        assert_eq!(all[chpass].2, "bin/chfn");
+
+        // A third name brings the others along.
+        let before = TreeState::capture(&root).unwrap();
+        std::fs::hard_link(root.join("bin/chpass"), root.join("bin/chsh")).unwrap();
+        let (_, after) = create_diff_layer(&before, &root, &tar_out, &gz_out).unwrap();
+        let names: Vec<_> = entries(&tar_out)
+            .into_iter()
+            .filter(|e| e.0.starts_with("bin/c"))
+            .map(|e| (e.0, e.1, e.2))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("bin/chfn".to_owned(), Regular, String::new()),
+                ("bin/chpass".to_owned(), Link, "bin/chfn".to_owned()),
+                ("bin/chsh".to_owned(), Link, "bin/chfn".to_owned()),
+            ]
+        );
+        assert!(after.link_of("bin/other").is_none());
+
+        // Applied, they are one file again.
+        let target = t.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        apply(&tar_out, &target).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let ino = |p: &str| std::fs::metadata(target.join(p)).unwrap().ino();
+        assert_eq!(ino("bin/chfn"), ino("bin/chsh"));
+        assert_eq!(ino("bin/chfn"), ino("bin/chpass"));
+    }
+
+    #[test]
+    fn flags_are_named_as_bsdtar_names_them() {
+        assert_eq!(flags_text(0x0002_0000), "schg");
+        assert_eq!(flags_text(0x0000_0001 | 0x0000_0002), "nodump,uchg");
+        assert_eq!(flags_text(0), "");
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn file_flags_go_into_layers() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), "f").unwrap();
+        let before = TreeState::capture(&root).unwrap();
+        let chflags = |flags: &str| {
+            let ok = std::process::Command::new("chflags")
+                .args([flags, root.join("f").to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        // A change of flags alone is a change. (On ZFS a user may set only
+        // nodump; ZFS sets uarch itself, which layers leave out.)
+        chflags("nodump");
+        let tar_out = t.path().join("l.tar");
+        let gz_out = t.path().join("l.tar.gz");
+        let made = create_diff_layer(&before, &root, &tar_out, &gz_out);
+        chflags("0");
+        assert!(made.unwrap().0.is_some());
+        let f = entries(&tar_out).into_iter().find(|e| e.0 == "f").unwrap();
+        assert_eq!(f.3, "nodump");
     }
 }

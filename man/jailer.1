@@ -103,8 +103,10 @@ overwrites an existing
 .Op Fl -build-arg Ar key Ns = Ns Ar value
 .Op Fl -cache-max Ar size
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -param Ar key Ns = Ns Ar value
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -ssh Ar id Ns Op = Ns Ar socket
+.Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
 .Op Fl -target Ar stage
 .Op Ar context
 .Xc
@@ -230,6 +232,9 @@ gives them to the shell, and
 writes them to a file
 .Ar name .
 .It
+.Cm COPY Fl -from Ns = Ns Ar image ,
+naming an image rather than a stage; it is pulled if missing.
+.It
 .Cm COPY Fl -exclude Ns = Ns Ar pattern ,
 .Fl -parents ,
 which keeps each source's path below the destination
@@ -269,6 +274,27 @@ fails the build when the compatibility check reports an error.
 stops at the named stage.
 .Fl -squash
 flattens the image, its base included, into one layer.
+Layers keep file flags
+.Pf ( Cm schg ,
+.Cm uchg ,
+.Cm nodump
+and the other append-only and no-unlink flags, but not
+.Cm uarch ,
+which ZFS sets on every write) and hard links; a layer holds every name
+of a hard-linked file it changes.
+.Pp
+.Cm RUN
+steps run in a jail with
+.Ql allow.chflags ,
+no securelevel and devfs ruleset 4.
+.Fl -param
+sets another
+.Xr jail 8
+parameter for them, e.g.
+.Ql --param allow.raw_sockets ;
+.Fl -sysv
+gives them SysV IPC of their own
+.Pf ( Ql sysvshm=new ) .
 .Fl -backend Cm buildah
 delegates the build to
 .Xr buildah 1

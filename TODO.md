@@ -59,6 +59,12 @@ fail with a clear message.
 - [x] **Wildcards anywhere in a source path**, and `[...]` classes.
 - [x] **Parser directives**: `# escape=`; `# syntax=` is ignored with a
   warning.
+- [x] **`COPY --from=<image>`**, not only a stage.
+- [x] **File flags and hard links in built layers**: `schg` and the like
+  as bsdtar's `SCHILY.fflags`, and each hard-linked file with all its
+  names.
+- [x] **`build --param` and `--sysv`**: jail parameters and SysV IPC for
+  `RUN` steps.
 
 ## 4. Nice to have
 
@@ -72,6 +78,18 @@ fail with a clear message.
   client are Legion's `legion-image`, and containers and `RUN` steps
   Legion's `legion-jail` (v0.1.1): `jailer run` gets Legion's security
   defaults, and `--vnet` runs a pod as a node does.
+
+## 5. Later
+
+- [ ] **ZFS clones for build stages**, instead of copying the base image
+  and earlier stages into a directory.
+- [ ] **Network for `run --vnet`**: an epair and bridge, and published
+  ports; today a VNET container has only its loopback.
+- [ ] **Resource limits** (`rctl`, `cpuset`) for `run` and `build`.
+- [ ] **`build --label`, `--annotation`, `--timestamp`** (layers already
+  have fixed mtimes; the config's `created` does not).
+- [ ] **zstd layers**, and a **registry-backed build cache**
+  (`--cache-from`/`--cache-to`).
 
 ## Not planned
 

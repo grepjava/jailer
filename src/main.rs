@@ -119,6 +119,14 @@ pub enum Commands {
         #[arg(long = "ssh", value_name = "ID[=SOCKET]")]
         ssh: Vec<String>,
 
+        /// A jail(8) parameter for `RUN` steps (KEY=VALUE)
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+
+        /// Give `RUN` steps SysV IPC of their own (`msg`, `sem`, `shm`)
+        #[arg(long, value_delimiter = ',')]
+        sysv: Vec<String>,
+
         /// Registry credentials for pulling base images (USER[:PASSWORD])
         #[arg(long, value_name = "USER[:PASSWORD]")]
         creds: Option<String>,
@@ -617,6 +625,8 @@ async fn main() -> Result<()> {
             cache_max,
             secrets,
             ssh,
+            params,
+            sysv,
             creds,
             authfile,
             context,
@@ -660,6 +670,7 @@ async fn main() -> Result<()> {
                     },
                     secrets: parse_secrets(secrets)?,
                     ssh: parse_ssh(ssh)?,
+                    jail_params: jailer::runtime::step_params(params, sysv)?,
                 },
             )
             .await?;

@@ -50,6 +50,8 @@ pub struct BuildOptions {
     pub secrets: BTreeMap<String, Vec<u8>>,
     /// SSH agent sockets `RUN --mount=type=ssh` can reach, by id.
     pub ssh: BTreeMap<String, PathBuf>,
+    /// More jail(8) parameters for `RUN` steps, over the steps' own.
+    pub jail_params: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +366,41 @@ struct BuildEnv<'a> {
     tmp_dir: &'a Path,
 }
 
+/// Extracts the image `name` (pulled if missing, pinned for the build) at
+/// `at`, for `COPY --from` or `RUN --mount=type=bind,from=` naming an image
+/// rather than a stage.
+async fn extract_image(
+    env: BuildEnv<'_>,
+    name: &str,
+    at: &Path,
+    line: usize,
+) -> Result<Image, Error> {
+    let (store, pin) = (env.store, env.pin);
+    let image = match store.pin_image(pin, name).await? {
+        Some(img) => img,
+        None => {
+            println!("Pulling {name}...");
+            store.pull(name, env.opts.creds.as_ref(), "root").await?;
+            store.pin_image(pin, name).await?.ok_or_else(|| {
+                Error::Build(format!(
+                    "line {line}: image {name} was removed during the build"
+                ))
+            })?
+        }
+    };
+    store.prepare_rootfs(&image, at, None)?;
+    Ok(image)
+}
+
+/// A tree removed (file flags and all) when dropped.
+struct TempTree(PathBuf);
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = layer::remove_tree(&self.0);
+    }
+}
+
 fn find_stage<'a>(stages: &'a [BuiltStage], name_or_idx: &str) -> Option<&'a BuiltStage> {
     if let Ok(idx) = name_or_idx.parse::<usize>() {
         return stages.get(idx);
@@ -490,11 +527,20 @@ async fn execute_instruction(
         Instruction::Copy(spec) | Instruction::Add(spec) => {
             let is_add = matches!(sp.instruction, Instruction::Add(_));
             let extras = CopyExtras::prepare(spec, vars, tmp_dir, is_add, sp.line).await?;
+            let from_image = match &spec.from {
+                Some(name) if find_stage(completed_stages, name).is_none() => {
+                    let tree = TempTree(tmp_dir.join(format!("from-{step_no}")));
+                    extract_image(env, name, &tree.0, sp.line).await?;
+                    Some(tree)
+                }
+                _ => None,
+            };
             let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
             apply_copy(
                 context_dir,
                 ignore,
                 completed_stages,
+                from_image.as_ref().map(|t| t.0.as_path()),
                 stage,
                 vars,
                 spec,
@@ -502,6 +548,7 @@ async fn execute_instruction(
                 &extras.files,
                 sp.line,
             )?;
+            drop(from_image);
             drop(extras);
             commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw).await?;
             stage.cache_key = copy_key(stage, &sp.raw);
@@ -534,7 +581,16 @@ async fn execute_instruction(
                     &serde_json::to_string(&run_env)?,
                     &stage.config.config.user,
                     &stage.config.config.working_dir,
-                    &mounts.key,
+                    &if opts.jail_params.is_empty() {
+                        // As before there were any, so that keys stay.
+                        mounts.key.clone()
+                    } else {
+                        format!(
+                            "{} params={}",
+                            mounts.key,
+                            serde_json::to_string(&opts.jail_params)?
+                        )
+                    },
                 ],
             );
             let cached = if no_cache {
@@ -568,7 +624,7 @@ async fn execute_instruction(
                             } else {
                                 StepNetwork::Host
                             },
-                            params: &[],
+                            params: &opts.jail_params,
                         })
                         .await?;
                     if code != 0 {
@@ -612,7 +668,6 @@ impl RunMounts {
     ) -> Result<Self, Error> {
         let BuildEnv {
             store,
-            pin,
             ignore,
             tmp_dir,
             ..
@@ -663,21 +718,9 @@ impl RunMounts {
                         Some(name) => match find_stage(completed_stages, name) {
                             Some(st) => (st.root.clone(), st.cache_key.clone()),
                             None => {
-                                let image = match store.pin_image(pin, name).await? {
-                                    Some(img) => img,
-                                    None => {
-                                        println!("Pulling {name} for --mount from={name}...");
-                                        store.pull(name, env.opts.creds.as_ref(), "root").await?;
-                                        store.pin_image(pin, name).await?.ok_or_else(|| {
-                                            Error::Build(format!(
-                                                "line {line}: image {name} was removed during the build"
-                                            ))
-                                        })?
-                                    }
-                                };
                                 let image_root = scratch.with_extension("image");
                                 out.temp.push(image_root.clone());
-                                store.prepare_rootfs(&image, &image_root, None)?;
+                                let image = extract_image(env, name, &image_root, line).await?;
                                 (image_root, format!("image {}", image.id))
                             }
                         },
@@ -1113,6 +1156,8 @@ fn apply_copy(
     context_dir: &Path,
     ignore: &IgnoreMatcher,
     completed_stages: &[BuiltStage],
+    // The image `--from` names, extracted, when it names no stage.
+    from_image: Option<&Path>,
     stage: &mut BuiltStage,
     vars: &BTreeMap<String, String>,
     spec: &CopySpec,
@@ -1120,8 +1165,9 @@ fn apply_copy(
     extras: &[PathBuf],
     line_no: usize,
 ) -> Result<(), Error> {
-    let (src_root, use_ignore) = match &spec.from {
-        Some(from_stage) => {
+    let (src_root, use_ignore) = match (&spec.from, from_image) {
+        (Some(_), Some(root)) => (root, false),
+        (Some(from_stage), None) => {
             let st = find_stage(completed_stages, from_stage).ok_or_else(|| {
                 Error::Build(format!(
                     "line {line_no}: `COPY --from={from_stage}`: stage not found"
@@ -1129,7 +1175,7 @@ fn apply_copy(
             })?;
             (st.root.as_path(), false)
         }
-        None => (context_dir, true),
+        (None, _) => (context_dir, true),
     };
     let exclude = IgnoreMatcher::parse(
         &spec

@@ -68,16 +68,7 @@ pub fn member_spec(spec: &RunSpec) -> Result<ContainerSpec, Error> {
         annotations.insert(ANNOTATION_MLOCK.to_owned(), "true".to_owned());
     }
     for s in &spec.sysv {
-        let wanted = match s.trim() {
-            "msg" | "sysvmsg" => "sysvmsg",
-            "sem" | "sysvsem" => "sysvsem",
-            "shm" | "sysvshm" => "sysvshm",
-            other => {
-                return Err(Error::Runtime(format!(
-                    "unknown --sysv option {other:?} (expected msg, sem, or shm)"
-                )));
-            }
-        };
+        let wanted = sysv_param(s)?;
         let (annotation, _) = ANNOTATION_SYSV
             .iter()
             .find(|(_, param)| *param == wanted)
@@ -97,6 +88,32 @@ pub fn member_spec(spec: &RunSpec) -> Result<ContainerSpec, Error> {
         mounts: spec.mounts.clone(),
         ..Default::default()
     })
+}
+
+/// The jail parameter `--sysv` names: `sysvmsg` for `msg`.
+pub fn sysv_param(kind: &str) -> Result<&'static str, Error> {
+    match kind.trim() {
+        "msg" | "sysvmsg" => Ok("sysvmsg"),
+        "sem" | "sysvsem" => Ok("sysvsem"),
+        "shm" | "sysvshm" => Ok("sysvshm"),
+        other => Err(Error::Runtime(format!(
+            "unknown --sysv option {other:?} (expected msg, sem, or shm)"
+        ))),
+    }
+}
+
+/// `build --param` (`KEY=VALUE`) and `--sysv`: jail parameters for `RUN`
+/// steps, each kind of SysV IPC a step's own.
+pub fn step_params(params: &[String], sysv: &[String]) -> Result<Vec<(String, String)>, Error> {
+    let mut out = Vec::new();
+    for s in sysv {
+        out.push((sysv_param(s)?.to_owned(), "new".to_owned()));
+    }
+    for kv in params {
+        let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+        out.push((k.to_owned(), v.to_owned()));
+    }
+    Ok(out)
 }
 
 /// The pod a `--vnet` member runs in: a VNET jail running nothing.
@@ -339,5 +356,22 @@ mod tests {
             ..spec
         };
         assert!(member_spec(&spaced).is_err());
+    }
+
+    #[test]
+    fn steps_get_sysv_of_their_own_and_params() {
+        let got = step_params(
+            &["securelevel=1".to_owned(), "allow.raw_sockets".to_owned()],
+            &["shm".to_owned(), "sysvmsg".to_owned()],
+        )
+        .unwrap();
+        let want = [
+            ("sysvshm", "new"),
+            ("sysvmsg", "new"),
+            ("securelevel", "1"),
+            ("allow.raw_sockets", ""),
+        ];
+        assert_eq!(got, want.map(|(k, v)| (k.to_owned(), v.to_owned())));
+        assert!(step_params(&[], &["pipe".to_owned()]).is_err());
     }
 }

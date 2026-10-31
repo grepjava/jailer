@@ -296,6 +296,44 @@ CMD ["default-arg"]
     ]
     .concat());
     assert_eq!(vnet, "lo0\n1\n");
+
+    // COPY --from an image; file flags and hard links kept in layers;
+    // jail parameters and SysV IPC for RUN steps.
+    let flags_dir = tmp.path().join("flags");
+    std::fs::create_dir_all(&flags_dir).unwrap();
+    std::fs::write(
+        flags_dir.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+COPY --from=localhost/hello-service:latest /app/stamp.txt /stamp-copy.txt
+RUN echo x > /flagged && chflags schg /flagged && ln /bin/sh /bin/sh2 && /sbin/sysctl -n kern.securelevel > /securelevel
+",
+    )
+    .unwrap();
+    cmd(&[
+        "build",
+        "--param",
+        "securelevel=1",
+        "--sysv",
+        "shm",
+        "-t",
+        "flags:1",
+        flags_dir.to_str().unwrap(),
+    ]);
+    // The image has no stat(1).
+    let seen = cmd(&[
+        "run",
+        "--entrypoint",
+        "/bin/sh",
+        "flags:1",
+        "-c",
+        "ls -lo /flagged; ls -i /bin/sh; ls -i /bin/sh2; cat /securelevel /stamp-copy.txt",
+    ]);
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines.len(), 5, "{seen}");
+    assert!(lines[0].contains(" schg"), "{seen}");
+    let inode = |l: &str| l.split_whitespace().next().unwrap().to_owned();
+    assert_eq!(inode(lines[1]), inode(lines[2]), "{seen}");
+    assert_eq!(lines[3..], ["1", "built-inside-jail"]);
     assert_eq!(
         cmd(&["ps", "-a"]).lines().count(),
         1,
