@@ -47,10 +47,44 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
 | `jailer prune [--cache]` | Free layers nothing uses; `--cache` also clears the build cache |
 | `jailer ps` / `jailer logs` / `jailer exec` / `jailer stop` / `jailer rm` | Manage detached test containers |
 
+## Installing
+
+Release tarballs for FreeBSD 15 on amd64 and aarch64 are on the
+[releases page](https://github.com/grepjava/jailer/releases):
+
+```sh
+fetch https://github.com/grepjava/jailer/releases/download/v0.1.0/jailer-0.1.0-freebsd15-amd64.tar.gz
+tar xzf jailer-0.1.0-freebsd15-amd64.tar.gz
+install -s jailer-0.1.0-freebsd15-amd64/bin/jailer /usr/local/bin/
+install -m 444 jailer-0.1.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
+```
+
+Or build the port in `ports/sysutils/jailer` from a ports tree:
+
+```sh
+cp -R ports/sysutils/jailer /usr/ports/sysutils/
+make -C /usr/ports/sysutils/jailer install clean
+```
+
+Or from source, with Rust 1.85 or later: `cargo install --locked --path .`
+
 ## Building on FreeBSD
 
 ```sh
 scripts/freebsd-build.sh user@freebsd-host
 scripts/freebsd-build.sh user@freebsd-host test
 ```
+
+## Releasing
+
+Tag the version, then build a tarball per architecture on FreeBSD hosts and
+attach them to the GitHub release (`-n` builds into `dist/` only):
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+scripts/release.sh v0.1.0 user@amd64-host user@arm64-host
+```
+
+After a dependency change, `scripts/port-crates.sh` regenerates the port's
+crate list; `make makesum` in the port updates its `distinfo`.
 

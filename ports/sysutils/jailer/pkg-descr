@@ -1,0 +1,4 @@
+jailer builds OCI images of FreeBSD jails from a Containerfile, runs them
+locally in jails, checks them for Legion compatibility, and pushes them to
+OCI registries. It stores layers in ZFS or plain directories and needs no
+other container tools.
