@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.jpg" alt="jailer — FreeBSD OCI image builder and local jail runner" width="100%">
+</p>
+
 # jailer
 
 `jailer` is a standalone FreeBSD OCI image builder, local jail test runner, compatibility checker, and registry publisher designed for [Legion](https://github.com/grepjava/legion) — and usable on any FreeBSD host without it.
@@ -53,10 +57,10 @@ Release tarballs for FreeBSD 15 (amd64 so far) are on the
 [releases page](https://github.com/grepjava/jailer/releases):
 
 ```sh
-fetch https://github.com/grepjava/jailer/releases/download/v0.1.0/jailer-0.1.0-freebsd15-amd64.tar.gz
-tar xzf jailer-0.1.0-freebsd15-amd64.tar.gz
-install -s jailer-0.1.0-freebsd15-amd64/bin/jailer /usr/local/bin/
-install -m 444 jailer-0.1.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
+fetch https://github.com/grepjava/jailer/releases/download/v0.2.0/jailer-0.2.0-freebsd15-amd64.tar.gz
+tar xzf jailer-0.2.0-freebsd15-amd64.tar.gz
+install -s jailer-0.2.0-freebsd15-amd64/bin/jailer /usr/local/bin/
+install -m 444 jailer-0.2.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
 ```
 
 Or build the port in `ports/sysutils/jailer` from a ports tree:
@@ -81,8 +85,8 @@ Tag the version, then build a tarball per architecture on FreeBSD hosts and
 attach them to the GitHub release (`-n` builds into `dist/` only):
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
-scripts/release.sh v0.1.0 user@amd64-host user@arm64-host
+git tag v0.2.0 && git push origin v0.2.0
+scripts/release.sh v0.2.0 user@amd64-host user@arm64-host
 ```
 
 After a dependency change, `scripts/port-crates.sh` regenerates the port's

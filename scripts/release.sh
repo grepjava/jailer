@@ -33,6 +33,7 @@ for host in "$@"; do
 	echo "building $dir on $host" >&2
 	git archive --prefix="$dir/" "$tag" | ssh "$host" "set -e
 		export PATH=\$HOME/.cargo/bin:\$PATH
+		${CARGO_BUILD_JOBS:+export CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS}
 		command -v rustup >/dev/null && ! rustup default >/dev/null 2>&1 &&
 		    export RUSTUP_TOOLCHAIN=\$(rustup toolchain list | head -1 | cut -d' ' -f1)
 		w=\$(mktemp -d)
