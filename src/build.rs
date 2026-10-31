@@ -61,6 +61,10 @@ pub struct BuildOptions {
     pub limits: crate::runtime::Limits,
     /// How new layers are compressed.
     pub compression: layer::Compression,
+    /// The CPUs `RUN` steps may run on, as `cpuset -l` takes them.
+    pub cpuset: Option<String>,
+    /// Annotations for the image's manifest.
+    pub annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,12 +409,13 @@ pub async fn build(
 
     let target_ref = Reference::parse_local_tag(&opts.tag)?;
     let image = store
-        .register_built_image(
+        .register_built_image_with(
             &pin,
             &target_ref,
             final_config,
             final_layers,
             final_descriptors,
+            opts.annotations.clone(),
         )
         .await?;
     drop(pin);
@@ -724,6 +729,7 @@ async fn execute_instruction(
                                 StepNetwork::Host
                             },
                             params: &opts.jail_params,
+                            cpuset: opts.cpuset.as_deref(),
                         })
                         .await;
                     if !opts.limits.is_empty() {

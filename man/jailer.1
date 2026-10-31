@@ -98,12 +98,14 @@ overwrites an existing
 .Op Fl -strict
 .Op Fl f Ar file
 .Op Fl t Ar name Ns Op : Ns Ar tag
+.Op Fl -annotation Ar key Ns = Ns Ar value
 .Op Fl -authfile Ar path
 .Op Fl -backend Cm native | buildah
 .Op Fl -build-arg Ar key Ns = Ns Ar value
 .Op Fl -cache-max Ar size
 .Op Fl -compression Cm gzip | zstd
 .Op Fl -cpus Ar n
+.Op Fl -cpuset-cpus Ar list
 .Op Fl -creds Ar user Ns Op : Ns Ar password
 .Op Fl -label Ar key Ns = Ns Ar value
 .Op Fl m Ar size
@@ -304,7 +306,13 @@ stage it is built on, rather than a copy.
 .Pp
 .Fl -label
 sets a label on the image, over the Containerfile's
-.Cm LABEL .
+.Cm LABEL ;
+.Fl -annotation
+an annotation on its manifest, which
+.Nm push
+and
+.Nm export
+keep.
 Files in layers carry a fixed time, and the image config none, so the
 same build gives the same image;
 .Fl -timestamp
@@ -325,7 +333,8 @@ parameter for them, e.g.
 gives them SysV IPC of their own
 .Pf ( Ql sysvshm=new ) .
 .Fl m ,
-.Fl -cpus
+.Fl -cpus ,
+.Fl -cpuset-cpus
 and
 .Fl -pids-limit
 limit each step as
@@ -350,6 +359,7 @@ and imports the result.
 .Op Fl -hostname Ar name
 .Op Fl m Ar size
 .Op Fl -cpus Ar n
+.Op Fl -cpuset-cpus Ar list
 .Op Fl -name Ar name
 .Op Fl -network Cm host | bridge | none
 .Op Fl p Oo Ar ip : Oc Ns Ar port : Ns Ar port Ns Op / Ns Cm tcp | udp
@@ -468,6 +478,14 @@ CPUs' time (e.g.
 Allow the container at most
 .Ar n
 processes.
+.It Fl -cpuset-cpus Ar list
+Run the container on the CPUs in
+.Ar list ,
+as
+.Xr cpuset 1
+lists them (e.g.
+.Ql 0-3,6 ) ,
+set on its jail before anything runs in it.
 .El
 .Pp
 The limits are

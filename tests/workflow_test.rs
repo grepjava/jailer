@@ -287,6 +287,8 @@ CMD ["--serve"]
             timestamp: None,
             limits: Default::default(),
             compression: Default::default(),
+            cpuset: None,
+            annotations: BTreeMap::new(),
         },
     )
     .await
@@ -447,6 +449,8 @@ async fn manifest_push_publishes_one_image_per_platform() {
             timestamp: None,
             limits: Default::default(),
             compression: Default::default(),
+            cpuset: None,
+            annotations: BTreeMap::new(),
         },
     )
     .await
@@ -601,6 +605,8 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         timestamp: None,
         limits: Default::default(),
         compression: Default::default(),
+        cpuset: None,
+        annotations: BTreeMap::new(),
     };
     let files = |image: &jailer::store::Image| {
         let root = tmp.path().join(format!("root-{}", &image.id[7..19]));
@@ -700,6 +706,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let stamped = |tag: &'static str| BuildOptions {
         labels: BTreeMap::from([("b".to_owned(), "flag".to_owned())]),
         timestamp: Some(1_700_000_000),
+        annotations: BTreeMap::from([("org.example.note".to_owned(), "hi".to_owned())]),
         ..opts(tag)
     };
     let first = build(&store, &runtime, &stamped("stamped:1"))
@@ -712,6 +719,12 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         ("file", "flag")
     );
     assert_eq!(first.config.created, "2023-11-14T22:13:20Z");
+    // --annotation goes in the manifest.
+    let manifest = std::fs::read_to_string(store.blob_path(&first.digest).unwrap()).unwrap();
+    assert!(
+        manifest.contains("\"org.example.note\": \"hi\""),
+        "{manifest}"
+    );
     assert!(
         first
             .config
@@ -841,6 +854,8 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 timestamp: None,
                 limits: Default::default(),
                 compression: Default::default(),
+                cpuset: None,
+                annotations: BTreeMap::new(),
             },
         )
         .await

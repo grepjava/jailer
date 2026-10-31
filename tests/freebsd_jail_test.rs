@@ -300,6 +300,31 @@ CMD ["default-arg"]
     .concat());
     assert_eq!(vnet, "lo0\n1\n");
 
+    // --cpuset-cpus holds a container, and a build's RUN steps, to its CPUs.
+    assert_eq!(
+        cmd(&[&["run", "--cpuset-cpus", "0"][..], &shell, &["/bin/nproc"]].concat()),
+        "1\n"
+    );
+    let cpus_dir = tmp.path().join("cpus");
+    std::fs::create_dir_all(&cpus_dir).unwrap();
+    std::fs::write(
+        cpus_dir.join("Containerfile"),
+        "FROM localhost/hello-service:latest\nUSER root\nRUN /bin/nproc > /cpus\n",
+    )
+    .unwrap();
+    cmd(&[
+        "build",
+        "--cpuset-cpus",
+        "0-1",
+        "-t",
+        "cpus:1",
+        cpus_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        cmd(&["run", "--entrypoint", "/bin/cat", "cpus:1", "/cpus"]),
+        "2\n"
+    );
+
     // --vnet puts the pod on jailer's bridge; -p publishes its ports. Both
     // need pf.conf to call jailer's anchors.
     let host = |args: &[&str]| {
@@ -401,18 +426,8 @@ CMD ["default-arg"]
             "hi\n"
         );
         listener.wait().unwrap();
-        // Until legion-jail forces the unmount: a jail that served TCP
-        // dies only once its TIME_WAIT sockets expire (up to 60 s), and
-        // holds its root busy until then.
-        let mut removed = false;
-        for _ in 0..45 {
-            if try_cmd(&["rm", "-f", "web"]).status.success() {
-                removed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-        assert!(removed, "rm -f web");
+        // Right after serving TCP: the jail may be dying still.
+        cmd(&["rm", "-f", "web"]);
         assert!(
             !host(&["ifconfig", "-l"]).contains(" jp"),
             "epairs are gone"

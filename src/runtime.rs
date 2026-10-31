@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 pub use legion_jail::{
-    ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV, ANNOTATION_VNET,
-    DEVFS_RULESET, LINUX_MODULES,
+    ANNOTATION_CPUSET, ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV,
+    ANNOTATION_VNET, DEVFS_RULESET, LINUX_MODULES,
 };
 pub use legion_runtime::{ContainerSpec, Mount};
 use legion_sys::{RctlRule, Resource, Sys};
@@ -65,6 +65,8 @@ pub struct RunSpec {
     /// `msg`, `sem`, `shm`.
     pub sysv: Vec<String>,
     pub limits: Limits,
+    /// The CPUs it may run on, as `cpuset -l` takes them.
+    pub cpuset: Option<String>,
 }
 
 /// Resource limits for a container or a build's `RUN` steps, held by
@@ -178,6 +180,9 @@ pub fn member_spec(spec: &RunSpec) -> Result<ContainerSpec, Error> {
     let mut annotations = BTreeMap::from([(ANNOTATION_JAIL.to_owned(), jail)]);
     if spec.allow_mlock {
         annotations.insert(ANNOTATION_MLOCK.to_owned(), "true".to_owned());
+    }
+    if let Some(cpus) = &spec.cpuset {
+        annotations.insert(ANNOTATION_CPUSET.to_owned(), cpus.clone());
     }
     for s in &spec.sysv {
         let wanted = sysv_param(s)?;
@@ -434,6 +439,7 @@ mod elsewhere {
         pub mounts: &'a [StepMount],
         pub network: StepNetwork,
         pub params: &'a [(String, String)],
+        pub cpuset: Option<&'a str>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

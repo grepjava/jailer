@@ -87,17 +87,15 @@ fail with a clear message.
 - [x] **Network for `run --vnet`**: an epair on jailer's own bridge
   (`jailer0`, 10.88.0.0/16), NAT out and `-p` published ports through pf
   anchors under `jailer/`; `--network none` for loopback only.
-- [ ] **Legion fixes asked for**: `remove` of a container that served TCP
-  fails until its dying jail lets go of the root (up to 60 s); manifest
-  annotations; a cpuset annotation; `PodNetwork` with a bridge name of
-  one's own (jailer's `net.rs` is a near-copy of it).
+- [ ] **Use Legion's `PodNetwork`** for `jailer0` instead of `net.rs`'s
+  near-copy, once its IPv6 twin addresses can be turned off or given
+  another prefix: today they would put `legion0`'s address on `jailer0`.
 - [x] **Resource limits**: `-m`, `--cpus`, `--pids-limit` for `run` and
   `build`, as rctl rules (memory per process, as on a Legion node).
-- [ ] **`--cpuset-cpus`**: best set by legion-jail when it makes the jail,
-  before anything runs in it.
+- [x] **`--cpuset-cpus`** for `run` and `build`, set by legion-jail on
+  the jail before anything runs in it (Legion v0.1.3).
 - [x] **`build --label` and `--timestamp`** (or `SOURCE_DATE_EPOCH`).
-- [ ] **`build --annotation`**: manifest annotations, which needs
-  `register_built_image` in legion-image to take them.
+- [x] **`build --annotation`**: manifest annotations (Legion v0.1.3).
 - [x] **zstd layers**: `build --compression zstd`.
 - [ ] **A registry-backed build cache** (`--cache-from`/`--cache-to`).
 

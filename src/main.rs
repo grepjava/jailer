@@ -140,6 +140,10 @@ pub enum Commands {
         #[arg(long, env = "SOURCE_DATE_EPOCH", value_name = "SECONDS")]
         timestamp: Option<i64>,
 
+        /// An annotation for the image's manifest (KEY=VALUE)
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+
         /// How new layers are compressed
         #[arg(long, alias = "compression-format", value_enum, default_value_t = Compression::Gzip)]
         compression: Compression,
@@ -567,6 +571,10 @@ pub struct LimitArgs {
     /// Limit on processes at a time
     #[arg(long = "pids-limit", value_name = "N")]
     pids_limit: Option<u64>,
+
+    /// CPUs to run on, as cpuset(1) lists them (e.g. 0-3,6)
+    #[arg(long = "cpuset-cpus", value_name = "LIST")]
+    cpuset_cpus: Option<String>,
 }
 
 impl LimitArgs {
@@ -695,6 +703,7 @@ async fn main() -> Result<()> {
             labels,
             timestamp,
             compression,
+            annotations,
             creds,
             authfile,
             context,
@@ -713,6 +722,13 @@ async fn main() -> Result<()> {
                     .split_once('=')
                     .with_context(|| format!("--build-arg {kv:?} must be KEY=VALUE"))?;
                 parsed_args.insert(k.to_owned(), v.to_owned());
+            }
+            let mut parsed_annotations = BTreeMap::new();
+            for kv in annotations {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--annotation {kv:?} must be KEY=VALUE"))?;
+                parsed_annotations.insert(k.to_owned(), v.to_owned());
             }
             let mut parsed_labels = BTreeMap::new();
             for kv in labels {
@@ -750,6 +766,8 @@ async fn main() -> Result<()> {
                     timestamp: *timestamp,
                     limits: limits.parse()?,
                     compression: *compression,
+                    cpuset: limits.cpuset_cpus.clone(),
+                    annotations: parsed_annotations,
                 },
             )
             .await?;
@@ -1165,6 +1183,7 @@ async fn containers(cli: &Cli) -> Result<()> {
                 allow_mlock: *allow_mlock,
                 sysv: sysv.clone(),
                 limits: limits.parse()?,
+                cpuset: limits.cpuset_cpus.clone(),
             };
 
             let id = jailer::runtime::create(&runtime, &*sys, &leases, &spec).await?;
