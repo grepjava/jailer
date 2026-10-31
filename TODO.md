@@ -89,7 +89,8 @@ fail with a clear message.
   per config digest, so a gzip and a zstd build of one Containerfile
   (same diff_ids, so same config) become one image: the later build's
   layers replace the earlier's under both tags, and the record's manifest
-  digest stays the first build's. Needs a change in `legion-image`.
+  digest stays the first build's. Fixed in Legion's main (an image is its
+  config and manifest digests together); move to the next Legion tag.
 
 ## 5. Later
 
