@@ -776,7 +776,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "legion-api",
  "legion-image",
+ "legion-jail",
+ "legion-runtime",
  "legion-sys",
  "libc",
  "reqwest 0.12.28",
@@ -858,9 +861,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "legion-api"
+version = "0.1.1"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.1#227166099695949853e735c4aaa7e00f0a40f827"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_yaml_ng",
+ "thiserror",
+]
+
+[[package]]
 name = "legion-image"
-version = "0.1.0"
-source = "git+https://github.com/grepjava/legion?branch=image-share#294d9e0741f084b93151991ae0cf3741b94d7726"
+version = "0.1.1"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.1#227166099695949853e735c4aaa7e00f0a40f827"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -881,9 +897,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-jail"
+version = "0.1.1"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.1#227166099695949853e735c4aaa7e00f0a40f827"
+dependencies = [
+ "bytes",
+ "futures",
+ "getrandom 0.3.4",
+ "legion-image",
+ "legion-runtime",
+ "legion-sys",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "legion-runtime"
+version = "0.1.1"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.1#227166099695949853e735c4aaa7e00f0a40f827"
+dependencies = [
+ "bytes",
+ "futures",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "legion-sys"
-version = "0.1.0"
-source = "git+https://github.com/grepjava/legion?branch=image-share#294d9e0741f084b93151991ae0cf3741b94d7726"
+version = "0.1.1"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.1#227166099695949853e735c4aaa7e00f0a40f827"
 dependencies = [
  "libc",
  "serde",
@@ -1446,6 +1491,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1455,6 +1511,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -1866,6 +1935,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

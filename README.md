@@ -17,11 +17,11 @@ jailer export app.tar       # Produce an offline OCI archive
 Legion pulls OCI images, stores their layers on ZFS, and runs containers as jails, intentionally leaving image building out of the cluster daemon. `jailer` fills the local development and CI workflow while matching Legion's exact runtime semantics:
 
 - **Zero external container dependencies:** Includes a native `Containerfile` parser (multi-stage builds, `COPY --from`, `--chown`, `--chmod`, `RUN --mount` cache, bind, secret, ssh and tmpfs mounts, `RUN --network=none`, here-documents, `COPY --exclude/--parents`, `ADD <url> --checksum`, `ONBUILD`, `.containerignore`, and a build cache), OCI layer differ (with `.wh.` whiteouts and FreeBSD file flags), and OCI Distribution API client (`pull` and `push`). Can also delegate builds to `buildah` (`--backend buildah`).
-- **Local testing aligned with Legion's runtime:** `jailer run` executes images using the same jail setup as `legion-jail`:
+- **Local testing with Legion's runtime:** `jailer run` runs images with Legion's own `legion-jail`, as a node does:
   - ZFS snapshot/clone layers (`<dataset>/<chain>@layer`) with an automatic plain-directory fallback when ZFS is unavailable.
   - `/etc/passwd` and `/etc/group` user & supplementary group resolution inside the jail.
-  - `devfs` ruleset 4 mounted at `/dev`, `enforce_statfs=2`, and symlink-safe `nullfs` volume mounts (`-v`).
-  - Optional VNET jails (`--vnet`), `allow.mlock` (`--allow-mlock`), SysV IPC (`--sysv`), and FreeBSD Linux ABI support (`--linux` mounting `linprocfs`, `linsysfs`, `fdescfs`, and `/dev/shm`).
+  - `devfs` ruleset 4 mounted at `/dev`, Legion's security defaults (`enforce_statfs=2`, `securelevel=2`, no raw sockets or file flags; `--param` overrides them), and symlink-safe `nullfs` volume mounts (`-v`).
+  - Optional VNET pods (`--vnet`), `allow.mlock` (`--allow-mlock`), SysV IPC (`--sysv`), and FreeBSD Linux ABI support (`--linux` mounting `linprocfs`, `linsysfs`, `fdescfs`, and `/dev/shm`).
 - **Build-time Legion compatibility checks (`jailer check`):** Catches image configuration issues at build time instead of deploy time:
   - Verifies `USER` against the image's `/etc/passwd` and `/etc/group`.
   - Verifies `ENTRYPOINT` / `CMD` exist and are executable inside the image rootfs along `PATH`.

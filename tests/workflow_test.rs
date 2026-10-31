@@ -15,7 +15,7 @@ use jailer::Reference;
 use jailer::build::{BuildBackend, BuildOptions, build};
 use jailer::init::{InitOptions, Template, scaffold};
 use jailer::registry::{Client, Credentials, sha256};
-use jailer::runtime::{JailRuntime, RuntimeConfig};
+use jailer::runtime::{Config, JailRuntime};
 use jailer::sys::FakeSys;
 
 #[derive(Default)]
@@ -255,10 +255,11 @@ CMD ["--serve"]
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
-        RuntimeConfig {
+        Config {
             state_dir: tmp.path().join("containers1"),
             dataset: None,
             shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
         },
     )
     .unwrap();
@@ -405,10 +406,11 @@ async fn manifest_push_publishes_one_image_per_platform() {
         let runtime = JailRuntime::new(
             sys,
             store.clone(),
-            RuntimeConfig {
+            Config {
                 state_dir: tmp.path().join(format!("{dir}-containers")),
                 dataset: None,
                 shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+                prune_images: false,
             },
         )
         .unwrap();
@@ -561,10 +563,11 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
-        RuntimeConfig {
+        Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
             shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
         },
     )
     .unwrap();
@@ -707,10 +710,11 @@ async fn cache_trim_drops_least_recently_used_layers() {
     let runtime = JailRuntime::new(
         sys,
         store.clone(),
-        RuntimeConfig {
+        Config {
             state_dir: tmp.path().join("containers"),
             dataset: None,
             shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
         },
     )
     .unwrap();

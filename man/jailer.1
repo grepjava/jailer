@@ -293,12 +293,18 @@ and imports the result.
 .Xc
 Run
 .Ar image
-in a jail set up as Legion's runtime does: devfs ruleset 4,
-.Ql enforce_statfs=2 ,
-and the image's user resolved against its own
+with Legion's own jail runtime, as a node runs a container: a jail of
+its own on the host's network, devfs ruleset 4, and the image's user
+resolved against its own
 .Pa /etc/passwd
 and
 .Pa /etc/group .
+It has Legion's security defaults:
+.Ql enforce_statfs=2 ,
+.Ql securelevel=2 ,
+.Ql allow.raw_sockets=false
+and
+.Ql allow.chflags=false .
 Without
 .Ar image ,
 the current directory's built image is run; an image missing from the
@@ -329,16 +335,27 @@ Working directory inside the container.
 .It Fl -rm
 Remove the container when it exits.
 .It Fl -vnet
-Give the jail its own network stack.
+Run it as a node runs a pod: a VNET jail running nothing, named
+.Ar name Ns Li -pod ,
+with
+.Li lo0
+up on 127.0.0.1, and the container a jail inside it.
+.Nm stop
+and
+.Nm rm
+take the pod along.
 .It Fl -allow-mlock
 Allow
 .Xr mlock 2 .
 .It Fl -sysv
-Enable the listed SysV IPC namespaces.
+Give the jail the host's SysV IPC of the listed kinds, as Legion's
+.Ql sysvipc
+does.
 .It Fl -param
-Pass a raw
+Set a
 .Xr jail 8
-parameter.
+parameter, over the security defaults, e.g.
+.Ql --param securelevel=-1 .
 .It Fl -linux
 Run a Linux image through
 .Xr linux 4 ,

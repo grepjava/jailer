@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -11,10 +10,8 @@ use jailer::build::{BuildBackend, BuildOptions};
 use jailer::check::{CheckReport, Severity, check_containerfile, check_image};
 use jailer::containerfile::Containerfile;
 use jailer::init::{InitOptions, Template, detect_app_name};
-use jailer::log::Output;
 use jailer::registry::Client;
-use jailer::runtime::{JailRuntime, RunSpec, RuntimeConfig};
-use jailer::state::Mount;
+use jailer::runtime::{Config, JailRuntime};
 use jailer::store::Store;
 use jailer::sys::{Shell, Sys};
 use jailer::{Reference, shim};
@@ -432,13 +429,11 @@ fn parse_ssh(specs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
 }
 
 /// Jails can only be created or entered by root; fail before pulling anything.
+#[cfg(unix)]
 fn require_root(what: &str) -> Result<()> {
-    #[cfg(unix)]
     if unsafe { libc::geteuid() } != 0 {
         bail!("`jailer {what}` needs root to create jails; run it with sudo or doas");
     }
-    #[cfg(not(unix))]
-    let _ = what;
     Ok(())
 }
 
@@ -533,10 +528,12 @@ fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, Jai
     let runtime = JailRuntime::new(
         sys.clone(),
         store.clone(),
-        RuntimeConfig {
+        Config {
             state_dir: state_dir.join("containers"),
             dataset: jails_zfs,
             shim: vec![exe.into_os_string(), OsString::from("jail-shim")],
+            // The store is the builds' too, and its cache's.
+            prune_images: false,
         },
     )?;
     Ok((sys, store, runtime))
@@ -676,109 +673,6 @@ async fn main() -> Result<()> {
                 .unwrap_or("");
             println!("Built {} ({})", name, res.image.id);
             Ok(())
-        }
-
-        Commands::Run {
-            rm,
-            detach,
-            interactive,
-            tty,
-            name,
-            env,
-            volumes,
-            user,
-            workdir,
-            hostname,
-            entrypoint,
-            vnet,
-            allow_mlock,
-            sysv,
-            params,
-            linux,
-            args,
-        } => {
-            require_root("run")?;
-            let (_, store, runtime) = open_context(&cli, *linux)?;
-            let (image_ref, cmd_args) = match args.split_first() {
-                Some((img, rest)) => (img.clone(), rest.to_vec()),
-                None => (default_local_image_for_cwd(), Vec::new()),
-            };
-
-            // Pull automatically if the image is not in the local store and not a localhost ref.
-            if store.find(&image_ref)?.is_none() {
-                let r = Reference::parse(&image_ref)?;
-                if !r.is_local() {
-                    let creds = resolve_credentials(&r.registry, None, None)?;
-                    println!("Pulling {r}...");
-                    store.pull(&image_ref, creds.as_ref(), "root").await?;
-                }
-            }
-
-            let mut env_map = BTreeMap::new();
-            for kv in env {
-                let (k, v) = kv
-                    .split_once('=')
-                    .with_context(|| format!("-e {kv:?} must be KEY=VALUE"))?;
-                env_map.insert(k.to_owned(), v.to_owned());
-            }
-
-            let mut mounts = Vec::new();
-            for vol in volumes {
-                let parts: Vec<&str> = vol.split(':').collect();
-                let (src, dst, ro) = match parts.as_slice() {
-                    [s, d] => (*s, *d, false),
-                    [s, d, opt] => (*s, *d, *opt == "ro"),
-                    _ => bail!("invalid volume mount {vol:?} (expected SRC:DEST[:ro])"),
-                };
-                mounts.push(Mount {
-                    source: src.to_owned(),
-                    destination: dst.to_owned(),
-                    read_only: ro,
-                });
-            }
-
-            let mut extra_params = Vec::new();
-            for kv in params {
-                let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
-                extra_params.push((k.to_owned(), v.to_owned()));
-            }
-
-            // When running in foreground without `-d`, default to removing the
-            // ephemeral test container afterwards unless `--name` was given to keep it.
-            let auto_rm = *rm || (!*detach && name.is_none());
-
-            let spec = RunSpec {
-                name: name.clone(),
-                image: image_ref,
-                entrypoint: entrypoint.iter().cloned().collect(),
-                command: cmd_args,
-                env: env_map,
-                user: user.clone(),
-                work_dir: workdir.clone(),
-                hostname: hostname.clone(),
-                mounts,
-                params: extra_params,
-                stop_timeout: None,
-                vnet: *vnet,
-                allow_mlock: *allow_mlock,
-                sysv: sysv.clone(),
-                linux: *linux,
-                rm: auto_rm,
-                detach: *detach,
-                interactive: *interactive,
-                tty: *tty,
-            };
-
-            let (id, code) = runtime.run(&spec).await?;
-            if *detach {
-                println!("{id}");
-                Ok(())
-            } else {
-                if code != 0 {
-                    std::process::exit(code);
-                }
-                Ok(())
-            }
         }
 
         Commands::Push {
@@ -1042,40 +936,198 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Commands::Run { .. }
+        | Commands::Ps { .. }
+        | Commands::Logs { .. }
+        | Commands::Exec { .. }
+        | Commands::Stop { .. }
+        | Commands::Rm { .. } => containers(&cli).await,
+    }
+}
+
+/// `run`, `ps`, `logs`, `exec`, `stop` and `rm`: containers, which need
+/// jails.
+#[cfg(unix)]
+async fn containers(cli: &Cli) -> Result<()> {
+    use futures::StreamExt;
+    use jailer::runtime::{LABEL_ROLE, LINUX_MODULES, Mount, RunSpec};
+    use std::time::Duration;
+
+    use legion_runtime::{Output, Runtime};
+
+    match &cli.command {
+        Commands::Run {
+            rm,
+            detach,
+            interactive,
+            tty,
+            name,
+            env,
+            volumes,
+            user,
+            workdir,
+            hostname,
+            entrypoint,
+            vnet,
+            allow_mlock,
+            sysv,
+            params,
+            linux,
+            args,
+        } => {
+            require_root("run")?;
+            let (sys, store, runtime) = open_context(cli, *linux)?;
+            let (image_ref, cmd_args) = match args.split_first() {
+                Some((img, rest)) => (img.clone(), rest.to_vec()),
+                None => (default_local_image_for_cwd(), Vec::new()),
+            };
+
+            // Pull automatically if the image is not in the local store and not a localhost ref.
+            if store.find(&image_ref)?.is_none() {
+                let r = Reference::parse(&image_ref)?;
+                if !r.is_local() {
+                    let creds = resolve_credentials(&r.registry, None, None)?;
+                    println!("Pulling {r}...");
+                    store.pull(&image_ref, creds.as_ref(), "root").await?;
+                }
+            }
+            let image = store
+                .find(&image_ref)?
+                .with_context(|| format!("{image_ref}: image not known"))?;
+            if image.config.os == "linux" {
+                if !*linux {
+                    bail!(
+                        "{image_ref} is a Linux image; pass --linux to run it through FreeBSD's Linux ABI"
+                    );
+                }
+                for m in LINUX_MODULES {
+                    let _ = sys.kld_load(m);
+                }
+            }
+
+            let mut env_map = BTreeMap::new();
+            for kv in env {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("-e {kv:?} must be KEY=VALUE"))?;
+                env_map.insert(k.to_owned(), v.to_owned());
+            }
+
+            let mut mounts = Vec::new();
+            for vol in volumes {
+                let parts: Vec<&str> = vol.split(':').collect();
+                let (src, dst, ro) = match parts.as_slice() {
+                    [s, d] => (*s, *d, false),
+                    [s, d, opt] => (*s, *d, *opt == "ro"),
+                    _ => bail!("invalid volume mount {vol:?} (expected SRC:DEST[:ro])"),
+                };
+                mounts.push(Mount::nullfs(src, dst, ro));
+            }
+
+            let mut extra_params = Vec::new();
+            for kv in params {
+                let (k, v) = kv.split_once('=').unwrap_or((kv.as_str(), ""));
+                extra_params.push((k.to_owned(), v.to_owned()));
+            }
+
+            // When running in foreground without `-d`, default to removing the
+            // ephemeral test container afterwards unless `--name` was given to keep it.
+            let auto_rm = *rm || (!*detach && name.is_none());
+            let name = name.clone().unwrap_or_else(|| {
+                let mut b = [0u8; 6];
+                getrandom::fill(&mut b).expect("random bytes");
+                b.iter()
+                    .fold("jailer-".to_owned(), |n, x| n + &format!("{x:02x}"))
+            });
+            let spec = RunSpec {
+                name,
+                image: image.references[0].clone(),
+                entrypoint: entrypoint.iter().cloned().collect(),
+                command: cmd_args,
+                env: env_map,
+                user: user.clone(),
+                work_dir: workdir.clone(),
+                hostname: hostname.clone(),
+                mounts,
+                params: extra_params,
+                vnet: *vnet,
+                allow_mlock: *allow_mlock,
+                sysv: sysv.clone(),
+            };
+
+            let id = jailer::runtime::create(&runtime, &*sys, &spec).await?;
+            if *detach {
+                if let Err(e) = runtime.start(&id).await {
+                    if *rm {
+                        let _ = jailer::runtime::remove(&runtime, &id).await;
+                    }
+                    return Err(e.into());
+                }
+                println!("{id}");
+                return Ok(());
+            }
+            let code = runtime.run_attached(&id, *interactive, *tty).await;
+            if auto_rm {
+                let _ = jailer::runtime::remove(&runtime, &id).await;
+            }
+            let code = code?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+
         Commands::Ps { all } => {
-            let (_, _, runtime) = open_context(&cli, true)?;
-            let list = runtime.list(*all)?;
-            let width = |f: fn(&jailer::runtime::ContainerSummary) -> &str, head: &str| {
+            let (_, _, runtime) = open_context(cli, true)?;
+            let mut list = Vec::new();
+            for c in runtime.list(&[]).await? {
+                if c.labels.get(LABEL_ROLE).is_some_and(|r| r == "pod")
+                    || (!*all && c.state != "running")
+                {
+                    continue;
+                }
+                let status = match c.state.as_str() {
+                    "running" => {
+                        let jid = runtime.inspect(&c.id).await?.state.jid;
+                        format!("running (jid {jid}, pid {})", c.pid)
+                    }
+                    "exited" => format!("exited ({})", c.exit_code),
+                    other => other.to_owned(),
+                };
+                list.push((c, status));
+            }
+            let width = |f: fn(&legion_runtime::ContainerSummary) -> &str, head: &str| {
                 list.iter()
-                    .map(|c| f(c).len())
+                    .map(|(c, _)| f(c).len())
                     .chain([head.len()])
                     .max()
                     .unwrap_or(0)
             };
-            let wn = width(|c| &c.name, "NAME");
+            let wn = width(|c| c.name(), "NAME");
             let wi = width(|c| &c.image, "IMAGE");
             println!(
                 "{:<14} {:<wn$}  {:<wi$}  STATUS",
                 "CONTAINER ID", "NAME", "IMAGE"
             );
-            for c in list {
+            for (c, status) in &list {
                 let short_id: String = c.id.chars().take(12).collect();
-                let st = match &c.status {
-                    jailer::runtime::Status::Created => "created".to_owned(),
-                    jailer::runtime::Status::Running(r) => {
-                        format!("running (jid {}, pid {})", r.jid, r.pid)
-                    }
-                    jailer::runtime::Status::Exited(e) => format!("exited ({})", e.code),
-                };
-                println!("{:<14} {:<wn$}  {:<wi$}  {st}", short_id, c.name, c.image);
+                println!(
+                    "{:<14} {:<wn$}  {:<wi$}  {status}",
+                    short_id,
+                    c.name(),
+                    c.image
+                );
             }
             Ok(())
         }
 
         Commands::Logs { tail, container } => {
-            let (_, _, runtime) = open_context(&cli, true)?;
+            let (_, _, runtime) = open_context(cli, true)?;
             use std::io::Write;
-            for chunk in runtime.logs(container, *tail)? {
+            let id = runtime.find(container)?;
+            let mut chunks = runtime.logs(&id, false, *tail).await?;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk?;
                 match chunk.stream {
                     Output::Stdout => std::io::stdout().write_all(&chunk.data)?,
                     Output::Stderr => std::io::stderr().write_all(&chunk.data)?,
@@ -1091,8 +1143,11 @@ async fn main() -> Result<()> {
             command,
         } => {
             require_root("exec")?;
-            let (_, _, runtime) = open_context(&cli, true)?;
-            let code = runtime.exec(container, command, *interactive, *tty).await?;
+            let (_, _, runtime) = open_context(cli, true)?;
+            let id = runtime.find(container)?;
+            let code = runtime
+                .exec_inherit(&id, command, *interactive, *tty)
+                .await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1100,27 +1155,32 @@ async fn main() -> Result<()> {
         }
 
         Commands::Stop { time, container } => {
-            let (_, _, runtime) = open_context(&cli, true)?;
-            runtime
-                .stop(container, time.map(Duration::from_secs))
-                .await?;
+            let (_, _, runtime) = open_context(cli, true)?;
+            let id = runtime.find(container)?;
+            let wait = Duration::from_secs(time.unwrap_or(10));
+            jailer::runtime::stop(&runtime, &id, wait).await?;
             println!("{container}");
             Ok(())
         }
 
         Commands::Rm { force, containers } => {
-            let (_, _, runtime) = open_context(&cli, true)?;
+            let (_, _, runtime) = open_context(cli, true)?;
             for c in containers {
-                if !force {
-                    let rec = runtime.record(c)?;
-                    if matches!(runtime.status(&rec)?, jailer::runtime::Status::Running(_)) {
-                        bail!("container {c:?} is running: stop it first or use `rm -f`");
-                    }
+                let id = runtime.find(c)?;
+                if !force && runtime.inspect(&id).await?.state.running {
+                    bail!("container {c:?} is running: stop it first or use `rm -f`");
                 }
-                runtime.remove(c).await?;
+                jailer::runtime::remove(&runtime, &id).await?;
                 println!("{c}");
             }
             Ok(())
         }
+
+        _ => unreachable!("not a container command"),
     }
+}
+
+#[cfg(not(unix))]
+async fn containers(_: &Cli) -> Result<()> {
+    bail!("containers run in jails, which need FreeBSD")
 }

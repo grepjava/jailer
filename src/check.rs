@@ -7,8 +7,10 @@ use std::path::Path;
 
 use crate::containerfile::{Containerfile, Instruction};
 use crate::oci::ImageConfig;
-use crate::shim::DEFAULT_PATH;
 use crate::{state, users};
+
+/// The `PATH` a container's process gets when its image sets none.
+const DEFAULT_PATH: &str = "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {

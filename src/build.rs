@@ -17,7 +17,7 @@ use crate::containerfile::{
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
 use crate::registry::{Credentials, sha256};
-use crate::runtime::{BuildMount, JailRuntime, target};
+use crate::runtime::{JailRuntime, Step, StepMount, StepNetwork, target};
 use crate::store::{CachedLayer, CachedStep, Image, Pin, Store, chain_ids, hex_of};
 use crate::{Error, Reference, users};
 
@@ -549,17 +549,34 @@ async fn execute_instruction(
                 }
                 _ => {
                     let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
-                    runtime
-                        .run_build_step(
-                            &stage.root,
-                            &argv,
-                            &run_env,
-                            &stage.config.config.user,
-                            &stage.config.config.working_dir,
-                            &mounts.mounts,
-                            run_opts.no_network,
-                        )
+                    let mut id = [0u8; 6];
+                    getrandom::fill(&mut id).expect("random bytes");
+                    let name: String = std::iter::once("jailer_build_".to_owned())
+                        .chain(id.iter().map(|b| format!("{b:02x}")))
+                        .collect();
+                    let code = runtime
+                        .run_step(&Step {
+                            name: &name,
+                            root: &stage.root,
+                            argv: &argv,
+                            env: &run_env,
+                            user: &stage.config.config.user,
+                            work_dir: &stage.config.config.working_dir,
+                            mounts: &mounts.mounts,
+                            network: if run_opts.no_network {
+                                StepNetwork::None
+                            } else {
+                                StepNetwork::Host
+                            },
+                            params: &[],
+                        })
                         .await?;
+                    if code != 0 {
+                        return Err(Error::Build(format!(
+                            "RUN command {:?} exited with status {code}",
+                            argv.join(" ")
+                        )));
+                    }
                     drop(mounts);
                     let layer =
                         commit_step_diff(store, pin, stage, &before, tmp_dir, step_no, &sp.raw)
@@ -576,7 +593,7 @@ async fn execute_instruction(
 /// A `RUN` step's mounts, resolved to host paths, and what about them
 /// belongs in the step's cache key. Temporary copies are removed on drop.
 struct RunMounts {
-    mounts: Vec<BuildMount>,
+    mounts: Vec<StepMount>,
     key: String,
     temp: Vec<PathBuf>,
     /// Variables the step gets, such as `SSH_AUTH_SOCK`.
@@ -629,7 +646,7 @@ impl RunMounts {
                         set_owner_mode(&dir, *uid, *gid, *mode)?;
                     }
                     out.key.push_str(&format!("\0cache {id} {target}"));
-                    out.mounts.push(BuildMount::Nullfs {
+                    out.mounts.push(StepMount::Nullfs {
                         source: dir,
                         target: target.clone(),
                         read_only: *read_only,
@@ -709,7 +726,7 @@ impl RunMounts {
                     };
                     out.key
                         .push_str(&format!("\0bind {source} {target} {rw} {contents}"));
-                    out.mounts.push(BuildMount::Nullfs {
+                    out.mounts.push(StepMount::Nullfs {
                         source: src,
                         target: target.clone(),
                         read_only: !rw,
@@ -735,7 +752,7 @@ impl RunMounts {
                     out.temp.push(scratch.clone());
                     set_owner_mode(&scratch, *uid, *gid, *mode)?;
                     out.key.push_str(&format!("\0secret {id} {target}"));
-                    out.mounts.push(BuildMount::Nullfs {
+                    out.mounts.push(StepMount::Nullfs {
                         source: scratch,
                         target: target.clone(),
                         read_only: true,
@@ -743,7 +760,7 @@ impl RunMounts {
                 }
                 RunMount::Tmpfs { target, size } => {
                     out.key.push_str(&format!("\0tmpfs {target}"));
-                    out.mounts.push(BuildMount::Tmpfs {
+                    out.mounts.push(StepMount::Tmpfs {
                         target: target.clone(),
                         size: *size,
                     });
@@ -782,7 +799,7 @@ impl RunMounts {
                     set_owner_mode(&sock, *uid, *gid, *mode)?;
                     out.key.push_str(&format!("\0ssh {id} {target}"));
                     out.env.push(format!("SSH_AUTH_SOCK={target}"));
-                    out.mounts.push(BuildMount::Nullfs {
+                    out.mounts.push(StepMount::Nullfs {
                         source: scratch,
                         target: dir.to_owned(),
                         read_only: false,

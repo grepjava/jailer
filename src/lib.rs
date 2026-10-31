@@ -1,7 +1,8 @@
 //! `jailer`: a standalone FreeBSD OCI image builder, local jail test runner,
 //! compatibility checker, and registry publisher aligned with Legion's runtime.
 //! Images (references, the registry client, the store, layers) are Legion's
-//! own `legion-image`, and the system calls `legion-sys`.
+//! own `legion-image`, containers are `legion-jail`'s, and the system
+//! calls `legion-sys`.
 
 pub mod auth;
 pub mod build;
@@ -9,12 +10,10 @@ pub mod check;
 pub mod containerfile;
 pub mod init;
 pub mod layer;
-pub mod log;
 pub mod runtime;
-pub mod shim;
-pub mod state;
 pub mod store;
-pub mod users;
+
+pub use legion_jail::{log, shim, state, users};
 
 pub use legion_image::oci;
 pub use legion_image::{Client, Credentials, Reference, registry_of};
@@ -65,6 +64,17 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Sys(#[from] sys::Error),
+}
+
+impl From<legion_runtime::Error> for Error {
+    fn from(e: legion_runtime::Error) -> Self {
+        use legion_runtime::Error as E;
+        match e {
+            E::NotFound(s) => Error::NotFound(s),
+            E::Io(e) => Error::Io(e),
+            e => Error::Runtime(e.to_string()),
+        }
+    }
 }
 
 impl From<legion_image::Error> for Error {

@@ -16,7 +16,8 @@ people building images for Legion.
   builds, packages and installs (`make package`, portlint clean). Still to
   do: an aarch64 tarball (run the script on an arm64 host), and submitting
   the port to FreeBSD so that `pkg install jailer` works; then link it from
-  Legion's `docs/IMAGES.md`.
+  Legion's `docs/IMAGES.md`. Since jailer uses Legion's crates from git,
+  the port needs Legion's source as a second distfile (`GH_TUPLE`).
 
 ## 2. Build speed
 
@@ -67,6 +68,10 @@ fail with a clear message.
 - [ ] **Image signing** with sigstore/cosign signatures on `push`.
 - [x] **`build --squash`** flattens the image into one layer.
 - [x] **Man page note** on `schg` files in a `--no-zfs` state directory.
+- [x] **One runtime with Legion.** Images, the store and the registry
+  client are Legion's `legion-image`, and containers and `RUN` steps
+  Legion's `legion-jail` (v0.1.1): `jailer run` gets Legion's security
+  defaults, and `--vnet` runs a pod as a node does.
 
 ## Not planned
 

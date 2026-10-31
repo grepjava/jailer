@@ -226,6 +226,82 @@ CMD ["default-arg"]
         "built-inside-jail"
     );
 
+    // Containers as Legion runs them: detached, then ps, exec, logs, stop
+    // and rm; Legion's security defaults, with --param over them; --vnet
+    // as a pod with a member.
+    let cmd = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args([
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--zfs-root",
+                &zfs_root,
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let shell = [
+        "--entrypoint",
+        "/bin/sh",
+        "localhost/hello-service:latest",
+        "-c",
+    ];
+    let id = cmd(&[
+        &["run", "-d", "--name", "bg"][..],
+        &shell,
+        &["echo up; sleep 60"],
+    ]
+    .concat());
+    let id = id.trim();
+    assert_eq!(id.len(), 64, "{id}");
+    let ps = cmd(&["ps"]);
+    assert!(ps.contains(" bg ") && ps.contains("running (jid "), "{ps}");
+    assert_eq!(
+        cmd(&[
+            "exec",
+            "bg",
+            "/sbin/sysctl",
+            "-n",
+            "kern.securelevel",
+            "security.jail.enforce_statfs"
+        ]),
+        "2\n2\n"
+    );
+    assert_eq!(cmd(&["logs", "bg"]), "up\n");
+    cmd(&["stop", "-t", "1", &id[..12]]);
+    assert!(cmd(&["ps", "-a"]).contains("exited"));
+    cmd(&["rm", "bg"]);
+    assert!(!cmd(&["ps", "-a"]).contains(" bg "));
+
+    let over = cmd(&[
+        &["run", "--param", "securelevel=-1"][..],
+        &shell,
+        &["/sbin/sysctl -n kern.securelevel"],
+    ]
+    .concat());
+    assert_eq!(over, "-1\n");
+
+    let vnet = cmd(&[
+        &["run", "--vnet"][..],
+        &shell,
+        &["/sbin/ifconfig -l; /sbin/ifconfig lo0 inet | grep -c 'inet 127.0.0.1'"],
+    ]
+    .concat());
+    assert_eq!(vnet, "lo0\n1\n");
+    assert_eq!(
+        cmd(&["ps", "-a"]).lines().count(),
+        1,
+        "no pods or members are left"
+    );
+
     // 4. Run `jailer export app.tar`
     let archive = tmp.path().join("app.tar");
     let export_out = Command::new(bin)
