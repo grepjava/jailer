@@ -13,6 +13,7 @@ pub mod init;
 pub mod layer;
 pub mod net;
 pub mod runtime;
+pub mod sign;
 pub mod store;
 
 pub use legion_jail::{log, shim, state, users};

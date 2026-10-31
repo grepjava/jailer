@@ -264,6 +264,10 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         authfile: Option<PathBuf>,
 
+        /// Sign the pushed manifest with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
+
         /// `<target-reference>` (pushes current project's image) or `<source-image> <target-reference>`
         #[arg(required = true, num_args = 1..=2)]
         refs: Vec<String>,
@@ -272,6 +276,46 @@ pub enum Commands {
     /// Publish or inspect multi-architecture image indexes
     #[command(subcommand)]
     Manifest(ManifestCommand),
+
+    /// Sign an image already in a registry, as cosign does with a key pair
+    Sign {
+        /// The private key (PEM), from `jailer key generate`
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Check that an image in a registry is signed by a key
+    Verify {
+        /// The public key (PEM)
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Make signing keys
+    #[command(subcommand)]
+    Key(KeyCommand),
 
     /// Produce an offline OCI archive (`app.tar`) for `legion image load`
     Export {
@@ -489,6 +533,15 @@ fn require_root(what: &str) -> Result<()> {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum KeyCommand {
+    /// Write a new key pair: PREFIX.key (private, mode 0600) and PREFIX.pub
+    Generate {
+        #[arg(default_value = "jailer")]
+        prefix: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ManifestCommand {
     /// Push an index naming one image per platform, e.g. an amd64 and an
     /// arm64 build of the same app
@@ -500,6 +553,10 @@ pub enum ManifestCommand {
         /// Path to Docker/Podman auth.json file
         #[arg(long, value_name = "PATH")]
         authfile: Option<PathBuf>,
+
+        /// Sign the pushed manifest with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
 
         /// Registry reference to push the index to (e.g. ghcr.io/me/app:1.0)
         target: String,
@@ -563,6 +620,23 @@ pub enum NetworkArg {
     Host,
     Bridge,
     None,
+}
+
+/// Signs `digest`, just pushed to `r`, with the key at `path`.
+async fn sign_pushed(
+    store: &Store,
+    path: &Path,
+    r: &Reference,
+    digest: &str,
+    creds: Option<&jailer::registry::Credentials>,
+) -> Result<()> {
+    let key = jailer::sign::signing_key(&jailer::sign::read_key(path)?)?;
+    jailer::sign::sign(store.client(), r, digest, &key, creds).await?;
+    println!(
+        "Signed {r} ({digest}) as {}",
+        jailer::sign::signature_ref(r, digest)
+    );
+    Ok(())
 }
 
 /// Resource limits, held by rctl(8).
@@ -809,6 +883,7 @@ async fn main() -> Result<()> {
         Commands::Push {
             creds,
             authfile,
+            sign_key,
             refs,
         } => {
             let (_, store, _) = open_context(&cli, true)?;
@@ -832,12 +907,16 @@ async fn main() -> Result<()> {
                 .push(&source_image, &target_ref, resolved_creds.as_ref())
                 .await?;
             println!("Pushed {} ({digest})", target_ref);
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+            }
             Ok(())
         }
 
         Commands::Manifest(ManifestCommand::Push {
             creds,
             authfile,
+            sign_key,
             target,
             sources,
         }) => {
@@ -849,6 +928,64 @@ async fn main() -> Result<()> {
                 .push_index(&target_ref, sources, resolved_creds.as_ref())
                 .await?;
             println!("Pushed {target_ref} ({digest})");
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+            }
+            Ok(())
+        }
+
+        Commands::Sign {
+            key,
+            creds,
+            authfile,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let (digest, _) = store
+                .client()
+                .document(&r, r.target(), creds.as_ref())
+                .await?;
+            sign_pushed(&store, key, &r, &digest, creds.as_ref()).await?;
+            Ok(())
+        }
+
+        Commands::Verify {
+            key,
+            creds,
+            authfile,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let key = jailer::sign::verifying_key(&jailer::sign::read_key(key)?)?;
+            let digest = jailer::sign::verify(store.client(), &r, &key, creds.as_ref()).await?;
+            println!("{r} ({digest}) is signed by the key");
+            Ok(())
+        }
+
+        Commands::Key(KeyCommand::Generate { prefix }) => {
+            let private = prefix.with_extension("key");
+            let public = prefix.with_extension("pub");
+            for p in [&private, &public] {
+                if p.exists() {
+                    bail!("{} exists already", p.display());
+                }
+            }
+            let (private_pem, public_pem) = jailer::sign::generate()?;
+            let mut file = std::fs::OpenOptions::new();
+            file.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+            std::io::Write::write_all(&mut file.open(&private)?, private_pem.as_bytes())?;
+            std::fs::write(&public, public_pem)?;
+            println!(
+                "Wrote {} (keep it secret) and {}",
+                private.display(),
+                public.display()
+            );
             Ok(())
         }
 

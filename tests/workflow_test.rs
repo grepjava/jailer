@@ -863,3 +863,121 @@ async fn registry_cache_carries_steps_to_another_store() {
     };
     assert!(Imported::read(other.client(), &[missing]).await.is_empty());
 }
+
+#[tokio::test]
+async fn pushed_images_are_signed_and_verified() {
+    use jailer::sign::{generate, sign, signature_ref, signing_key, verify, verifying_key};
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, registry) = start_mock_registry().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+    let sys = Arc::new(FakeSys::new());
+    let store = Arc::new(
+        jailer::store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap().plain_http(&host),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        Config {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("Containerfile"), "FROM scratch\nLABEL a=b\n").unwrap();
+    build(
+        &store,
+        &runtime,
+        &BuildOptions {
+            context_dir: ctx.clone(),
+            containerfile: None,
+            tag: "signed:1".to_owned(),
+            build_args: BTreeMap::new(),
+            target: None,
+            backend: BuildBackend::Native,
+            creds: None,
+            strict_lint: false,
+            no_cache: false,
+            squash: false,
+            cache_max: None,
+            secrets: BTreeMap::new(),
+            ssh: BTreeMap::new(),
+            jail_params: Vec::new(),
+            labels: BTreeMap::new(),
+            timestamp: None,
+            limits: Default::default(),
+            compression: Default::default(),
+            cpuset: None,
+            annotations: BTreeMap::new(),
+            cache_from: Vec::new(),
+            cache_to: None,
+        },
+    )
+    .await
+    .unwrap();
+    let client = store.client();
+    let target = Reference::parse(&format!("{host}/me/app:1")).unwrap();
+    let digest = store.push("signed:1", &target, None).await.unwrap();
+
+    // Unsigned, then signed by one key and not another.
+    let (private, public) = generate().unwrap();
+    let (other_private, other_public) = generate().unwrap();
+    let key = verifying_key(&public).unwrap();
+    let other = verifying_key(&other_public).unwrap();
+    let err = verify(client, &target, &key, None).await.unwrap_err();
+    assert!(err.to_string().contains("not signed"), "{err}");
+    sign(
+        client,
+        &target,
+        &digest,
+        &signing_key(&private).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(verify(client, &target, &key, None).await.unwrap(), digest);
+    let err = verify(client, &target, &other, None).await.unwrap_err();
+    assert!(
+        err.to_string().contains("no signature by this key"),
+        "{err}"
+    );
+
+    // A second signer adds to the signatures; signing again changes nothing.
+    sign(
+        client,
+        &target,
+        &digest,
+        &signing_key(&other_private).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    sign(
+        client,
+        &target,
+        &digest,
+        &signing_key(&private).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(verify(client, &target, &other, None).await.unwrap(), digest);
+    assert_eq!(verify(client, &target, &key, None).await.unwrap(), digest);
+    let sig_tag = signature_ref(&target, &digest).tag.unwrap();
+    let (_, sig) = registry.manifests.lock().unwrap()[&sig_tag].clone();
+    let sig: serde_json::Value = serde_json::from_slice(&sig).unwrap();
+    assert_eq!(sig["layers"].as_array().unwrap().len(), 2, "{sig}");
+    assert_eq!(
+        sig["layers"][0]["mediaType"],
+        "application/vnd.dev.cosign.simplesigning.v1+json"
+    );
+}

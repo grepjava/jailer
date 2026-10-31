@@ -71,7 +71,10 @@ fail with a clear message.
 - [x] **Clearer pull errors**: "not found, or access denied".
 - [x] **Podman interop.** `export` also writes Docker's `manifest.json`, as
   `docker save` does. Still to try with `podman load` and `docker load`.
-- [ ] **Image signing** with sigstore/cosign signatures on `push`.
+- [x] **Image signing**: `push --sign-key`, `sign`, `verify` and `key
+  generate`, signatures as cosign makes them with a key pair (no
+  transparency log, no keyless signing). Still to check against `cosign
+  verify` itself.
 - [x] **`build --squash`** flattens the image into one layer.
 - [x] **Man page note** on `schg` files in a `--no-zfs` state directory.
 - [x] **One runtime with Legion.** Images, the store and the registry
