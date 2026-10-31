@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/hero.jpg" alt="jailer — FreeBSD OCI image builder and local jail runner" width="100%">
-</p>
-
 # jailer
 
 `jailer` is a standalone FreeBSD OCI image builder, local jail test runner, compatibility checker, and registry publisher designed for [Legion](https://github.com/grepjava/legion) — and usable on any FreeBSD host without it.
