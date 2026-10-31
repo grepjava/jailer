@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use jailer::auth::{resolve_credentials, save_credentials};
+use jailer::auth::{check_credentials, resolve_credentials, save_credentials};
 use jailer::build::{BuildBackend, BuildOptions};
 use jailer::check::{CheckReport, Severity, check_containerfile, check_image};
 use jailer::containerfile::Containerfile;
@@ -1187,14 +1187,16 @@ async fn run() -> Result<()> {
                     password_from_stdin(&buf)?
                 }
             };
-            let path = save_credentials(
-                registry,
-                &jailer::Credentials {
-                    username: username.clone(),
-                    password,
-                },
-                authfile.as_deref(),
-            )?;
+            let creds = jailer::Credentials {
+                username: username.clone(),
+                password,
+            };
+            let plain = cli
+                .plain_http
+                .iter()
+                .any(|h| *h == *registry || *h == jailer::registry_of(registry));
+            check_credentials(registry, &creds, plain).await?;
+            let path = save_credentials(registry, &creds, authfile.as_deref())?;
             println!(
                 "Login succeeded for {registry} (saved to {})",
                 path.display()

@@ -981,3 +981,21 @@ async fn pushed_images_are_signed_and_verified() {
         "application/vnd.dev.cosign.simplesigning.v1+json"
     );
 }
+
+#[tokio::test]
+async fn login_checks_credentials_with_the_registry() {
+    let (addr, _) = start_mock_registry().await;
+    let registry = addr.to_string();
+    let creds = |password: &str| Credentials {
+        username: "me".to_owned(),
+        password: password.to_owned(),
+    };
+    jailer::auth::check_credentials(&registry, &creds("secret"), true)
+        .await
+        .unwrap();
+    let err = jailer::auth::check_credentials(&registry, &creds("bad"), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("login refused for me"), "{err}");
+}

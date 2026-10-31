@@ -70,6 +70,18 @@ async fn handle_registry(
 
     // Check Bearer token flow
     if path == "/token" {
+        // The password `bad` is a wrong one (`me:bad`).
+        let basic = req
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if basic == "Basic bWU6YmFk" {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Full::new(Bytes::new()))
+                .unwrap());
+        }
         let body = serde_json::json!({"token": "test-bearer-token"}).to_string();
         return Ok(Response::builder()
             .status(StatusCode::OK)

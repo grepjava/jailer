@@ -132,6 +132,107 @@ pub fn save_credentials(
     Ok(path)
 }
 
+/// Checks `creds` with `registry` as `docker login` does: asks for the
+/// registry's API root, and when that wants a login, gives the credentials
+/// to it (Basic) or to the token service it names (Bearer). A registry that
+/// asks for no login takes any credentials.
+pub async fn check_credentials(
+    registry: &str,
+    creds: &Credentials,
+    plain_http: bool,
+) -> Result<(), Error> {
+    let registry = registry_of(registry);
+    // Docker Hub's API is not at `docker.io`.
+    let host = if registry == "docker.io" {
+        "registry-1.docker.io"
+    } else {
+        registry.as_str()
+    };
+    let scheme = if plain_http { "http" } else { "https" };
+    let fail = |e: String| Error::Registry(format!("{registry}: {e}"));
+    let refused = || {
+        Error::Registry(format!(
+            "{registry}: login refused for {}: wrong username, password or token",
+            creds.username
+        ))
+    };
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("jailer/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| fail(e.to_string()))?;
+    let root = format!("{scheme}://{host}/v2/");
+    let resp = http
+        .get(&root)
+        .send()
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Err(fail(format!("HTTP {} from {root}", resp.status())));
+    }
+    let challenge = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let (kind, params) = challenge.split_once(' ').unwrap_or((&challenge, ""));
+    let req = if kind.eq_ignore_ascii_case("basic") {
+        http.get(&root)
+    } else if kind.eq_ignore_ascii_case("bearer") {
+        let params = parse_challenge(params);
+        let realm = params
+            .get("realm")
+            .ok_or_else(|| fail(format!("auth challenge without realm: {challenge}")))?;
+        let mut query = vec![("account", creds.username.as_str())];
+        if let Some(service) = params.get("service") {
+            query.push(("service", service));
+        }
+        http.get(realm).query(&query)
+    } else {
+        return Err(fail(format!("unknown auth challenge: {challenge}")));
+    };
+    let resp = req
+        .basic_auth(&creds.username, Some(&creds.password))
+        .send()
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    match resp.status() {
+        s if s.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(refused()),
+        s => Err(fail(format!("HTTP {s} logging in"))),
+    }
+}
+
+/// `realm="...",service="..."`, the parameters of an auth challenge.
+fn parse_challenge(s: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut rest = s.trim();
+    while let Some((key, after)) = rest.split_once('=') {
+        let key = key
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_ascii_lowercase();
+        let (value, next) = match after.strip_prefix('"') {
+            Some(quoted) => match quoted.find('"') {
+                Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                None => (quoted, ""),
+            },
+            None => match after.find(',') {
+                Some(end) => (&after[..end], &after[end..]),
+                None => (after, ""),
+            },
+        };
+        out.insert(key, value.to_owned());
+        rest = next.trim_start_matches(',').trim();
+    }
+    out
+}
+
 fn default_auth_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(p) = std::env::var("REGISTRY_AUTH_FILE") {
@@ -161,6 +262,18 @@ fn default_write_auth_path() -> Result<PathBuf, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenges_give_realm_and_service() {
+        let p = parse_challenge(
+            r#"realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull""#,
+        );
+        assert_eq!(p["realm"], "https://ghcr.io/token");
+        assert_eq!(p["service"], "ghcr.io");
+        let p = parse_challenge(r#"realm=https://r/t, service="a,b""#);
+        assert_eq!(p["realm"], "https://r/t");
+        assert_eq!(p["service"], "a,b");
+    }
 
     #[test]
     fn reads_username_password_and_base64_auth() {
