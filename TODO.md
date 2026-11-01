@@ -8,21 +8,22 @@ people building images for Legion.
 - [x] **Multi-architecture images.** `jailer manifest push <target>
   <source>...` publishes an OCI index naming one image per platform, from
   local images and images already pushed from other architectures' build
-  hosts. Tested against a mock registry and Docker's `registry:2`, and
-  the test suite passes on arm64 (FreeBSD 15.1 VM); still to try against
-  GHCR, with the aarch64 tarball's upload.
+  hosts. Tested against a mock registry and Docker's `registry:2`, and on
+  GHCR: an amd64 image pushed from one host and an arm64 one from another,
+  one signed index naming both, each architecture pulling its own. The
+  test suite passes on arm64 (FreeBSD 15.1 VM).
 
-- [ ] **Packaging.** v0.4.0 is released with an amd64 tarball, built by
-  `scripts/release.sh`, and the port in `ports/sysutils/jailer` builds
-  and packages 0.4.0 (portlint clean), with Legion's git crates fetched by
-  the ports framework (`scripts/port-crates.sh` lists them) and libzstd
-  from `archivers/zstd`. An aarch64 tarball is built (on a FreeBSD 15.1
-  arm64 VM, all tests passing) but not yet uploaded; both tarballs need
-  15.1 or later (libc's FBSD_1.9). Still to do: submitting the port to
-  FreeBSD so that `pkg install jailer` works; then link it from Legion's
-  `docs/IMAGES.md`. At
-  each release: set `DISTVERSION`, run `scripts/port-crates.sh`, then
-  `make makesum package` and `portlint -AC` on a FreeBSD host.
+- [ ] **Packaging.** v0.4.0 is released with amd64 and aarch64 tarballs,
+  built by `scripts/release.sh` on FreeBSD 15.1 (they need its libc,
+  FBSD_1.9), and the port in `ports/sysutils/jailer` builds and packages
+  0.4.0 (portlint clean), with Legion's git crates fetched by the ports
+  framework (`scripts/port-crates.sh` lists them) and libzstd from
+  `archivers/zstd`. Still to do: submitting the port to FreeBSD so that
+  `pkg install jailer` works; then link it from Legion's `docs/IMAGES.md`.
+  At each release: set `DISTVERSION`, run `scripts/port-crates.sh`, then
+  `make makesum package` and `portlint -AC` on a FreeBSD host, and build
+  the tarballs on both architectures' hosts at once (`release.sh` writes
+  one `SHA256SUMS` for all of them).
 
 ## 2. Build speed
 
