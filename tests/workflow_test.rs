@@ -1083,4 +1083,40 @@ async fn copy_follows_links_only_inside_the_root() {
     assert!(err.to_string().contains("not found"), "{err}");
     write_cf("FROM scratch\nCOPY escape/secret /s\n");
     assert!(build(&store, &runtime, &opts("out:2")).await.is_err());
+
+    // `ADD` opens an archive: one that is a link to the host's is not.
+    {
+        let mut b = tar::Builder::new(std::fs::File::create(outside.join("x.tar")).unwrap());
+        b.append_path_with_name(outside.join("secret"), "secret")
+            .unwrap();
+        b.finish().unwrap();
+    }
+    symlink(outside.join("x.tar"), ctx.join("backup.tar")).unwrap();
+    write_cf("FROM scratch\nADD backup.tar /x/\n");
+    let err = build(&store, &runtime, &opts("out:3")).await.unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
+
+    // A directory the build makes is in a layer: `WORKDIR`'s, and a
+    // copied one, with its source's mode.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(ctx.join("private/inner")).unwrap();
+    std::fs::set_permissions(ctx.join("private"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_cf("FROM scratch\nCOPY f /seed\nWORKDIR /empty\nCOPY private /private\n");
+    let image = build(&store, &runtime, &opts("dirs:1"))
+        .await
+        .unwrap()
+        .image;
+    let root = tmp.path().join("dirs");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    assert!(root.join("empty").is_dir());
+    assert_eq!(image.config.config.working_dir, "/empty");
+    let mode = |p: &str| {
+        std::fs::metadata(root.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert!(root.join("private/inner").is_dir());
+    assert_eq!(mode("private"), 0o700);
 }

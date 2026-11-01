@@ -426,7 +426,10 @@ pub fn create_diff_layer(
 
     let mut changed: Vec<String> = Vec::new();
     for (path, meta) in &after.entries {
-        if before.entries.get(path) != Some(meta) {
+        // A file linked to another, or no longer linked, has changed even
+        // if its contents have not.
+        if before.entries.get(path) != Some(meta) || before.links.get(path) != after.links.get(path)
+        {
             changed.push(path.clone());
         }
     }
@@ -731,6 +734,32 @@ mod tests {
         let ino = |p: &str| std::fs::metadata(target.join(p)).unwrap().ino();
         assert_eq!(ino("bin/chfn"), ino("bin/chsh"));
         assert_eq!(ino("bin/chfn"), ino("bin/chpass"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linking_or_unlinking_alike_files_is_a_change() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), "same").unwrap();
+        std::fs::write(root.join("b"), "same").unwrap();
+        let tar_out = t.path().join("l.tar");
+        let gz_out = t.path().join("l.tar.gz");
+        let diff = |before: &TreeState| {
+            create_diff_layer(before, &root, &tar_out, &gz_out, Compression::Gzip).unwrap()
+        };
+
+        let before = TreeState::capture(&root).unwrap();
+        std::fs::remove_file(root.join("b")).unwrap();
+        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        let (layer, linked) = diff(&before);
+        assert!(layer.is_some(), "linking is a change");
+
+        std::fs::remove_file(root.join("b")).unwrap();
+        std::fs::write(root.join("b"), "same").unwrap();
+        let (layer, _) = diff(&linked);
+        assert!(layer.is_some(), "unlinking is a change");
     }
 
     #[test]

@@ -684,6 +684,9 @@ does, and save them to
 or
 .Ar path ;
 credentials the registry refuses are not saved.
+Only the registry's entry changes: the file's other settings, such as
+.Ql credsStore ,
+are kept, and a file that is not valid JSON is left as it is.
 With
 .Fl -password-stdin
 the password or token is the first line of standard input, kept out of

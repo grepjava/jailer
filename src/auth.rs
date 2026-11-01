@@ -120,19 +120,25 @@ pub fn save_credentials(
         Some(p) => p.to_path_buf(),
         None => default_write_auth_path()?,
     };
-    let mut cfg: AuthFile = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => AuthFile::default(),
+    // Only this registry's entry changes: the file's other settings
+    // (`credsStore`, `credHelpers`, other registries) are kept, and a file
+    // that does not parse is left alone.
+    let mut cfg: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| Error::Registry(format!("{}: not an auth file: {e}", path.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
     };
+    let not_object = || Error::Registry(format!("{}: not an auth file", path.display()));
+    let auths = cfg
+        .as_object_mut()
+        .ok_or_else(not_object)?
+        .entry("auths")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(not_object)?;
     let encoded = STANDARD.encode(format!("{}:{}", creds.username, creds.password));
-    cfg.auths.insert(
-        registry.to_owned(),
-        AuthEntry {
-            username: String::new(),
-            password: String::new(),
-            auth: encoded,
-        },
-    );
+    auths.insert(registry.to_owned(), serde_json::json!({ "auth": encoded }));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -302,5 +308,34 @@ mod tests {
         let g = from_json(json, "ghcr.io").unwrap().unwrap();
         assert_eq!((g.username.as_str(), g.password.as_str()), ("me", "tok"));
         assert!(from_json(json, "quay.io").unwrap().is_none());
+    }
+
+    #[test]
+    fn saving_keeps_the_files_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"auths": {"quay.io": {"auth": "eDp5"}}, "credsStore": "pass",
+                "credHelpers": {"gcr.io": "gcloud"}}"#,
+        )
+        .unwrap();
+        let creds = Credentials {
+            username: "me".to_owned(),
+            password: "tok".to_owned(),
+        };
+        save_credentials("ghcr.io", &creds, Some(&path)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["credsStore"], "pass");
+        assert_eq!(v["credHelpers"]["gcr.io"], "gcloud");
+        assert_eq!(v["auths"]["quay.io"]["auth"], "eDp5");
+        let g = from_json(&text, "ghcr.io").unwrap().unwrap();
+        assert_eq!((g.username.as_str(), g.password.as_str()), ("me", "tok"));
+
+        // A file that does not parse is not replaced.
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(save_credentials("ghcr.io", &creds, Some(&path)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
     }
 }

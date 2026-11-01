@@ -186,7 +186,7 @@ pub fn check_image(config: &ImageConfig, rootfs: Option<&Path>) -> CheckReport {
                 .iter()
                 .find_map(|e| e.strip_prefix("PATH="))
                 .unwrap_or(DEFAULT_PATH);
-            if !program_exists_in_root(root, program, path_var) {
+            if !program_exists_in_root(root, program, path_var, &config.config.working_dir) {
                 report.error(
                     "LEGION009",
                     format!(
@@ -230,18 +230,30 @@ fn dir_non_empty(path: &Path) -> bool {
         .is_some_and(|mut it| it.next().is_some())
 }
 
-fn program_exists_in_root(root: &Path, program: &str, path_var: &str) -> bool {
+/// Whether `program` runs in the image at `root`: found as execve(2) and
+/// the shell find it, with relative paths from `work_dir`, and links
+/// followed inside `root`.
+fn program_exists_in_root(root: &Path, program: &str, path_var: &str, work_dir: &str) -> bool {
+    let work_dir = if work_dir.is_empty() { "/" } else { work_dir };
+    let from_work_dir = |p: &str| {
+        if p.starts_with('/') {
+            p.to_owned()
+        } else {
+            format!("{}/{p}", work_dir.trim_end_matches('/'))
+        }
+    };
     let candidates: Vec<String> = if program.contains('/') {
-        vec![program.to_owned()]
+        vec![from_work_dir(program)]
     } else {
         path_var
             .split(':')
-            .map(|d| format!("{}/{program}", if d.is_empty() { "." } else { d }))
+            .map(|d| from_work_dir(&format!("{}/{program}", if d.is_empty() { "." } else { d })))
             .collect()
     };
     for cand in candidates {
-        let rel = cand.trim_start_matches('/');
-        let full = root.join(rel);
+        let Ok(full) = crate::build::resolve_in_jail(root, &cand, true) else {
+            continue;
+        };
         if let Ok(meta) = std::fs::metadata(&full)
             && meta.is_file()
         {
@@ -322,5 +334,33 @@ mod tests {
         let r2 = check_image(&bad_user_cfg, Some(t.path()));
         assert!(r2.has_errors());
         assert!(r2.findings.iter().any(|f| f.code == "LEGION008"));
+
+        // Relative commands are found from the working directory.
+        std::fs::create_dir_all(t.path().join("app")).unwrap();
+        std::fs::copy(&sh, t.path().join("app/start")).unwrap();
+        let relative = |cmd: &str, work_dir: &str| ImageConfig {
+            config: Config {
+                cmd: vec![cmd.to_owned()],
+                working_dir: work_dir.to_owned(),
+                ..good_cfg.config.clone()
+            },
+            ..good_cfg.clone()
+        };
+        let found = |cfg: &ImageConfig| !check_image(cfg, Some(t.path())).has_errors();
+        assert!(found(&relative("./start", "/app")));
+        assert!(found(&relative("app/start", "/")));
+        assert!(!found(&relative("./start", "/")));
+        assert!(found(&relative("../start", "/app/bin")));
+        assert!(found(&relative("../../app/start", "/app")));
+        let path_up = ImageConfig {
+            config: Config {
+                cmd: vec!["start".to_owned()],
+                working_dir: "/app/bin".to_owned(),
+                env: vec!["PATH=../:/bin".to_owned()],
+                ..good_cfg.config.clone()
+            },
+            ..good_cfg.clone()
+        };
+        assert!(found(&path_up));
     }
 }

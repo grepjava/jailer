@@ -97,6 +97,10 @@ ENV GREETING=legion-ready
 WORKDIR /app
 COPY --chmod=0755 hello-service /usr/local/bin/hello-service
 RUN /bin/sh -c "echo built-inside-jail > /app/stamp.txt"
+RUN mkdir -p /usr/home && { [ -e /home ] || ln -s usr/home /home; }
+WORKDIR /home/app
+RUN /bin/sh -c "pwd > here.txt"
+WORKDIR /app
 USER nobody
 ENTRYPOINT ["/usr/local/bin/hello-service"]
 CMD ["default-arg"]

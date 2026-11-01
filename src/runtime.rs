@@ -306,11 +306,13 @@ mod containers {
                 Ok::<_, Error>(())
             };
             if let Err(e) = started.await {
-                let _ = rt.remove(&id).await;
                 if let Some((held, ip)) = lease {
+                    // What attach did, if anything: its pf rules and epair.
+                    net::detach(sys, &id);
                     drop(held);
                     let _ = leases.release(ip, &id);
                 }
+                let _ = rt.remove(&id).await;
                 return Err(e);
             }
             drop(lease);
@@ -331,6 +333,9 @@ mod containers {
             Ok(id) => Ok(id),
             Err(e) => {
                 if let Some(p) = pod {
+                    // Its published ports must not reach whoever takes its
+                    // address next.
+                    unplug(rt, sys, leases, &p).await;
                     let _ = rt.remove(&p).await;
                 }
                 Err(e)

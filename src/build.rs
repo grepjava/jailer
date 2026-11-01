@@ -17,7 +17,7 @@ use crate::containerfile::{
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
 use crate::registry::{Credentials, sha256};
-use crate::runtime::{JailRuntime, Step, StepMount, StepNetwork, target};
+use crate::runtime::{JailRuntime, Step, StepMount, StepNetwork};
 use crate::store::{CachedLayer, CachedStep, Image, Pin, StorageMode, Store, chain_ids, hex_of};
 use crate::{Error, Reference, users};
 
@@ -603,9 +603,17 @@ async fn execute_instruction(
                 };
                 format!("{}/{}", base.trim_end_matches('/'), expanded)
             };
-            let _ = target(&stage.root, &new_wd, false)?;
+            // A directory it makes goes into a layer of its own, as in Docker.
+            let dir = resolve_in_root(&stage.root, &new_wd, true)?;
             stage.config.config.working_dir = new_wd;
-            record_history(&mut stage.config, &sp.raw, true);
+            if dir.is_dir() {
+                record_history(&mut stage.config, &sp.raw, true);
+            } else {
+                let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
+                std::fs::create_dir_all(&dir)?;
+                commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
+                stage.cache_key = copy_key(stage, &sp.raw);
+            }
         }
         Instruction::User(u) => {
             stage.config.config.user = expand_vars(u, vars);
@@ -772,6 +780,9 @@ async fn execute_instruction(
                         .collect();
                     let sys = &**store.sys();
                     crate::runtime::limit(sys, &name, &opts.limits)?;
+                    // Legion's steps take no links in their working
+                    // directory, as `/home` (`usr/home`) is in FreeBSD's.
+                    let work_dir = without_links(&stage.root, &stage.config.config.working_dir)?;
                     let code = runtime
                         .run_step(&Step {
                             name: &name,
@@ -779,7 +790,7 @@ async fn execute_instruction(
                             argv: &argv,
                             env: &run_env,
                             user: &stage.config.config.user,
-                            work_dir: &stage.config.config.working_dir,
+                            work_dir: &work_dir,
                             mounts: &mounts.mounts,
                             network: if run_opts.no_network {
                                 StepNetwork::None
@@ -1086,7 +1097,16 @@ fn any_ignored(context_dir: &Path, dir: &Path, ignore: &IgnoreMatcher) -> bool {
 /// A digest of a file's or directory tree's contents and modes.
 fn content_digest(path: &Path) -> Result<String, Error> {
     if !path.is_dir() {
-        return Ok(sha256(&std::fs::read(path)?));
+        let bytes = std::fs::read(path)?;
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::fs::PermissionsExt;
+            let mut bytes = bytes;
+            let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+            bytes.extend_from_slice(format!("\0{mode:o}").as_bytes());
+            bytes
+        };
+        return Ok(sha256(&bytes));
     }
     let state = TreeState::capture(path)?;
     let mut text = String::new();
@@ -1466,9 +1486,17 @@ fn apply_copy(
                 &skip,
             )?;
         } else if is_add && is_archive_name(&src_path) {
+            // Read, not copied: a link to it is followed inside the root.
+            let archive = resolve_below(src_root, &src_path, true)?;
+            if !std::fs::symlink_metadata(&archive).is_ok_and(|m| m.is_file()) {
+                return Err(Error::Build(format!(
+                    "line {line_no}: archive {} not found",
+                    src_path.display()
+                )));
+            }
             std::fs::create_dir_all(&dst_base)?;
             let tmp_tar = tempfile::NamedTempFile::new()?;
-            layer::decompress(&src_path, "", tmp_tar.path())?;
+            layer::decompress(&archive, "", tmp_tar.path())?;
             layer::extract(tmp_tar.path(), &dst_base)?;
         } else if spec.parents {
             let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
@@ -1564,14 +1592,27 @@ fn safe_join_in_root(root: &Path, rel: &str) -> Result<PathBuf, Error> {
 /// the host, so a link in an image or the context must not take what is
 /// read or written there outside its root. A link at the end is followed
 /// only if `follow_last`; what does not exist yet is kept as named.
-fn resolve_in_root(root: &Path, rel: &str, follow_last: bool) -> Result<PathBuf, Error> {
+pub(crate) fn resolve_in_root(root: &Path, rel: &str, follow_last: bool) -> Result<PathBuf, Error> {
     safe_join_in_root(root, rel)?;
+    resolve_in_jail(root, rel, follow_last)
+}
+
+/// [`resolve_in_root`], with `..` in `path` allowed, as a jail on `root`
+/// takes it: a command's path in an image, not a path a Containerfile
+/// names.
+pub(crate) fn resolve_in_jail(
+    root: &Path,
+    path: &str,
+    follow_last: bool,
+) -> Result<PathBuf, Error> {
+    let rel = path;
     // What is left to walk, last first.
     let mut todo: Vec<std::ffi::OsString> = Path::new(rel)
         .components()
         .rev()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s.to_owned()),
+            Component::ParentDir => Some("..".into()),
             _ => None,
         })
         .collect();
@@ -1611,6 +1652,17 @@ fn resolve_in_root(root: &Path, rel: &str, follow_last: bool) -> Result<PathBuf,
         }
     }
     Ok(done)
+}
+
+/// `path`, a path in the root filesystem at `root`, as the same path with
+/// no links in it; `""` stays `""`.
+fn without_links(root: &Path, path: &str) -> Result<String, Error> {
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    let full = resolve_in_jail(root, path, true)?;
+    let rel = full.strip_prefix(root).unwrap_or(&full);
+    Ok(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
 }
 
 /// `path`, below `root`, with its links resolved by [`resolve_in_root`].
@@ -1655,7 +1707,17 @@ impl Copier {
         dst_dir: &Path,
         skip: &dyn Fn(&str) -> bool,
     ) -> Result<(), Error> {
+        let made = std::fs::symlink_metadata(dst_dir).is_err();
         std::fs::create_dir_all(dst_dir)?;
+        // A directory the copy makes has its source's mode, so that a 0700
+        // one stays closed; one already there keeps its own.
+        #[cfg(unix)]
+        if made && self.chmod.is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(src_dir)?.permissions().mode() & 0o7777;
+            std::fs::set_permissions(dst_dir, std::fs::Permissions::from_mode(mode))?;
+        }
+        let _ = made;
         apply_perms(dst_dir, self.chown, self.chmod)?;
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
@@ -1884,6 +1946,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_mounted_files_mode_is_in_its_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("run.sh");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        let at = |mode| {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::content_digest(&f).unwrap()
+        };
+        assert_ne!(at(0o644), at(0o755));
+        assert_eq!(at(0o644), at(0o644));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn links_are_followed_inside_the_root() {
         use super::resolve_in_root;
         use std::os::unix::fs::symlink;
@@ -1902,5 +1979,15 @@ mod tests {
         assert_eq!(at("/abs", true), root.join("etc"));
         assert!(resolve_in_root(&root, "/loop", true).is_err());
         assert!(resolve_in_root(&root, "../x", true).is_err());
+        // A command's path may have `..`; it stops at the root.
+        let jail = |p: &str| super::resolve_in_jail(&root, p, true).unwrap();
+        assert_eq!(jail("/usr/home/../../etc"), root.join("etc"));
+        assert_eq!(jail("../../x"), root.join("x"));
+        // A step's working directory, as Legion takes it.
+        assert_eq!(
+            super::without_links(&root, "/home/app").unwrap(),
+            "/usr/home/app"
+        );
+        assert_eq!(super::without_links(&root, "").unwrap(), "");
     }
 }
