@@ -24,10 +24,30 @@ fn real_freebsd_jail_build_run_export_workflow() {
 
     let zfs_root = format!("zroot/jailer-test-{}", std::process::id());
 
-    // Ensure cleanup of test ZFS dataset on exit
+    // Ensure cleanup of test ZFS dataset on exit, and first of any container
+    // a failed assertion left running, which would hold the dataset (and a
+    // pod's epair, pf anchor and address).
     struct ZfsGuard(String, std::path::PathBuf);
     impl Drop for ZfsGuard {
         fn drop(&mut self) {
+            let jailer = |args: &[&str]| {
+                let state = self.1.join("state");
+                let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+                c.arg("--state-dir")
+                    .arg(&state)
+                    .args(["--zfs-root", &self.0]);
+                c.args(args).output().ok()
+            };
+            if let Some(ps) = jailer(&["ps", "-a"]) {
+                let ps = String::from_utf8_lossy(&ps.stdout);
+                for id in ps
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split_whitespace().next())
+                {
+                    jailer(&["rm", "-f", id]);
+                }
+            }
             let _ = Command::new("zfs")
                 .args(["destroy", "-r", &self.0])
                 .status();
