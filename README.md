@@ -56,16 +56,17 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
 
 ## Installing
 
-Release tarballs for FreeBSD 15.1 and later (amd64 so far) are on the
-[releases page](https://github.com/grepjava/jailer/releases). They are
-built on 15.1, whose libc 15.0's lacks, so on 15.0 build from source or
-the port.
+Release tarballs for FreeBSD 15.1 and later, amd64 and aarch64, are on
+the [releases page](https://github.com/grepjava/jailer/releases). They
+are built on 15.1 and need its libc, so on 15.0 build from source or the
+port.
 
 ```sh
-fetch https://github.com/grepjava/jailer/releases/download/v0.4.0/jailer-0.4.0-freebsd15-amd64.tar.gz
-tar xzf jailer-0.4.0-freebsd15-amd64.tar.gz
-install -s jailer-0.4.0-freebsd15-amd64/bin/jailer /usr/local/bin/
-install -m 444 jailer-0.4.0-freebsd15-amd64/man/man1/jailer.1 /usr/local/share/man/man1/
+t=jailer-0.4.0-freebsd15-$(uname -p)
+fetch https://github.com/grepjava/jailer/releases/download/v0.4.0/$t.tar.gz
+tar xzf $t.tar.gz
+install -s $t/bin/jailer /usr/local/bin/
+install -m 444 $t/man/man1/jailer.1 /usr/local/share/man/man1/
 ```
 
 Or build the port in `ports/sysutils/jailer` from a ports tree:
