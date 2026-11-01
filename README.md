@@ -76,8 +76,8 @@ are built on 15.1 and need its libc, so on 15.0 build from source or the
 port.
 
 ```sh
-t=jailer-0.5.0-freebsd15-$(uname -p)
-fetch https://github.com/grepjava/jailer/releases/download/v0.5.0/$t.tar.gz
+t=jailer-0.5.1-freebsd15-$(uname -p)
+fetch https://github.com/grepjava/jailer/releases/download/v0.5.1/$t.tar.gz
 tar xzf $t.tar.gz
 install -s $t/bin/jailer /usr/local/bin/
 install -m 444 $t/man/man1/jailer.1 /usr/local/share/man/man1/
@@ -105,8 +105,8 @@ Tag the version, then build a tarball per architecture on FreeBSD hosts and
 attach them to the GitHub release (`-n` builds into `dist/` only):
 
 ```sh
-git tag v0.5.0 && git push origin v0.5.0
-scripts/release.sh v0.5.0 user@amd64-host user@arm64-host
+git tag v0.5.1 && git push origin v0.5.1
+scripts/release.sh v0.5.1 user@amd64-host user@arm64-host
 ```
 
 After a dependency change, `scripts/port-crates.sh` regenerates the port's
