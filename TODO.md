@@ -13,17 +13,18 @@ people building images for Legion.
   one signed index naming both, each architecture pulling its own. The
   test suite passes on arm64 (FreeBSD 15.1 VM).
 
-- [ ] **Packaging.** v0.4.0 is released with amd64 and aarch64 tarballs,
+- [ ] **Packaging.** v0.5.0 is released with amd64 and aarch64 tarballs,
   built by `scripts/release.sh` on FreeBSD 15.1 (they need its libc,
-  FBSD_1.9), and the port in `ports/sysutils/jailer` builds and packages
-  0.4.0 (portlint clean), with Legion's git crates fetched by the ports
+  FBSD_1.9). The port in `ports/sysutils/jailer` is at 0.5.0 (FreeBSD 15+,
+  amd64 and aarch64), with Legion's git crates fetched by the ports
   framework (`scripts/port-crates.sh` lists them) and libzstd from
-  `archivers/zstd`. Still to do: submitting the port to FreeBSD so that
-  `pkg install jailer` works; then link it from Legion's `docs/IMAGES.md`.
-  At each release: set `DISTVERSION`, run `scripts/port-crates.sh`, then
-  `make makesum package` and `portlint -AC` on a FreeBSD host, and build
-  the tarballs on both architectures' hosts at once (`release.sh` writes
-  one `SHA256SUMS` for all of them).
+  `archivers/zstd`; `poudriere testport` passes on 15.1 amd64, and its
+  `git format-patch` against freebsd-ports main is ready. Still to do:
+  file it on Bugzilla (with Legion's sysutils/legion), then link jailer
+  from Legion's `docs/IMAGES.md`. At each release: set `DISTVERSION`, run
+  `scripts/port-crates.sh`, then `make makesum package` and `portlint
+  -AC` on a FreeBSD host, and build the tarballs on both architectures'
+  hosts at once (`release.sh` writes one `SHA256SUMS` for all of them).
 
 ## 2. Build speed
 
