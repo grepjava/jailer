@@ -880,8 +880,6 @@ async fn run() -> Result<()> {
                     .with_context(|| format!("--label {kv:?} must be KEY=VALUE"))?;
                 parsed_labels.insert(k.to_owned(), v.to_owned());
             }
-            let resolved_creds =
-                resolve_credentials("docker.io", creds.as_deref(), authfile.as_deref())?;
             let res = jailer::build::build(
                 &store,
                 &runtime,
@@ -892,7 +890,10 @@ async fn run() -> Result<()> {
                     build_args: parsed_args,
                     target: target.clone(),
                     backend: *backend,
-                    creds: resolved_creds,
+                    creds: jailer::auth::CredsSource {
+                        creds: creds.clone(),
+                        authfile: authfile.clone(),
+                    },
                     strict_lint: *strict,
                     no_cache: *no_cache,
                     squash: *squash,

@@ -50,6 +50,20 @@ impl AuthEntry {
     }
 }
 
+/// Where a command's registry credentials come from, looked up for each
+/// registry it talks to: `--creds`, else `--authfile` or the standard files.
+#[derive(Debug, Clone, Default)]
+pub struct CredsSource {
+    pub creds: Option<String>,
+    pub authfile: Option<PathBuf>,
+}
+
+impl CredsSource {
+    pub fn for_registry(&self, registry: &str) -> Result<Option<Credentials>, Error> {
+        resolve_credentials(registry, self.creds.as_deref(), self.authfile.as_deref())
+    }
+}
+
 /// Parses `--creds user[:password]` or resolves credentials for `registry`
 /// from `authfile` or standard Docker/Podman auth file locations.
 pub fn resolve_credentials(

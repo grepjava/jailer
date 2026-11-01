@@ -97,7 +97,7 @@ CMD ["--serve"]
             build_args: BTreeMap::new(),
             target: None,
             backend: BuildBackend::Native,
-            creds: None,
+            creds: Default::default(),
             strict_lint: true,
             no_cache: false,
             squash: false,
@@ -261,7 +261,7 @@ async fn manifest_push_publishes_one_image_per_platform() {
             build_args: BTreeMap::new(),
             target: None,
             backend: BuildBackend::Native,
-            creds: None,
+            creds: Default::default(),
             strict_lint: false,
             no_cache: false,
             squash: false,
@@ -419,7 +419,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
         build_args: BTreeMap::new(),
         target: None,
         backend: BuildBackend::Native,
-        creds: None,
+        creds: Default::default(),
         strict_lint: false,
         no_cache: false,
         squash: false,
@@ -670,7 +670,7 @@ async fn cache_trim_drops_least_recently_used_layers() {
                 build_args: BTreeMap::new(),
                 target: None,
                 backend: BuildBackend::Native,
-                creds: None,
+                creds: Default::default(),
                 strict_lint: false,
                 no_cache: false,
                 squash: false,
@@ -778,7 +778,7 @@ async fn registry_cache_carries_steps_to_another_store() {
             build_args: BTreeMap::new(),
             target: None,
             backend: BuildBackend::Native,
-            creds: None,
+            creds: Default::default(),
             strict_lint: false,
             no_cache: false,
             squash: false,
@@ -904,7 +904,7 @@ async fn pushed_images_are_signed_and_verified() {
             build_args: BTreeMap::new(),
             target: None,
             backend: BuildBackend::Native,
-            creds: None,
+            creds: Default::default(),
             strict_lint: false,
             no_cache: false,
             squash: false,
@@ -998,4 +998,89 @@ async fn login_checks_credentials_with_the_registry() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("login refused for me"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_follows_links_only_inside_the_root() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "host\n").unwrap();
+    std::fs::write(ctx.join("f"), "f\n").unwrap();
+    // Links to the host's directory, absolute and relative.
+    symlink(&outside, ctx.join("escape")).unwrap();
+    symlink("../../../../../../../../..", ctx.join("up")).unwrap();
+
+    let sys = Arc::new(FakeSys::new());
+    let store = Arc::new(
+        jailer::store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        Config {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    let opts = |tag: &str| BuildOptions {
+        context_dir: ctx.clone(),
+        containerfile: None,
+        tag: tag.to_owned(),
+        build_args: BTreeMap::new(),
+        target: None,
+        backend: BuildBackend::Native,
+        creds: Default::default(),
+        strict_lint: false,
+        no_cache: false,
+        squash: false,
+        cache_max: None,
+        secrets: BTreeMap::new(),
+        ssh: BTreeMap::new(),
+        jail_params: Vec::new(),
+        labels: BTreeMap::new(),
+        timestamp: None,
+        limits: Default::default(),
+        compression: Default::default(),
+        cpuset: None,
+        annotations: BTreeMap::new(),
+        cache_from: Vec::new(),
+        cache_to: None,
+    };
+    let write_cf = |text: &str| std::fs::write(ctx.join("Containerfile"), text).unwrap();
+
+    // Written through a link the image has, the file stays in the image.
+    write_cf("FROM scratch\nCOPY escape up /\nCOPY f /escape/f\nCOPY f /up/g\n");
+    let image = build(&store, &runtime, &opts("in:1")).await.unwrap().image;
+    assert!(!outside.join("f").exists());
+    let root = tmp.path().join("root");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    let rel = outside.strip_prefix("/").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join(rel).join("f")).unwrap(),
+        "f\n"
+    );
+    // `..` stops at the root.
+    assert_eq!(std::fs::read_to_string(root.join("g")).unwrap(), "f\n");
+
+    // Read through a link in the context, the host's files are not found.
+    let secret = format!("up{}/secret", outside.display());
+    write_cf(&format!("FROM scratch\nCOPY {secret} /s\n"));
+    let err = build(&store, &runtime, &opts("out:1")).await.unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
+    write_cf("FROM scratch\nCOPY escape/secret /s\n");
+    assert!(build(&store, &runtime, &opts("out:2")).await.is_err());
 }

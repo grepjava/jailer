@@ -38,7 +38,8 @@ pub struct BuildOptions {
     pub build_args: BTreeMap<String, String>,
     pub target: Option<String>,
     pub backend: BuildBackend,
-    pub creds: Option<Credentials>,
+    /// Credentials, looked up for the registry of each image pulled.
+    pub creds: crate::auth::CredsSource,
     pub strict_lint: bool,
     /// Run every step instead of reusing cached `RUN` results.
     pub no_cache: bool,
@@ -294,7 +295,13 @@ pub async fn build(
                 Some(img) => img,
                 None => {
                     println!("Pulling base image {base_ref}...");
-                    store.pull(&base_ref, opts.creds.as_ref(), "root").await?;
+                    store
+                        .pull(
+                            &base_ref,
+                            pull_creds(&opts.creds, &base_ref)?.as_ref(),
+                            "root",
+                        )
+                        .await?;
                     store.pin_image(&pin, &base_ref).await?.ok_or_else(|| {
                         Error::Build(format!(
                             "base image {base_ref} was removed during the build"
@@ -492,6 +499,11 @@ struct BuildEnv<'a> {
 /// Extracts the image `name` (pulled if missing, pinned for the build) at
 /// `at`, for `COPY --from` or `RUN --mount=type=bind,from=` naming an image
 /// rather than a stage.
+/// The credentials for pulling `name`, from its own registry.
+fn pull_creds(creds: &crate::auth::CredsSource, name: &str) -> Result<Option<Credentials>, Error> {
+    creds.for_registry(&Reference::parse(name)?.registry)
+}
+
 async fn extract_image(
     env: BuildEnv<'_>,
     name: &str,
@@ -503,7 +515,9 @@ async fn extract_image(
         Some(img) => img,
         None => {
             println!("Pulling {name}...");
-            store.pull(name, env.opts.creds.as_ref(), "root").await?;
+            store
+                .pull(name, pull_creds(&env.opts.creds, name)?.as_ref(), "root")
+                .await?;
             store.pin_image(pin, name).await?.ok_or_else(|| {
                 Error::Build(format!(
                     "line {line}: image {name} was removed during the build"
@@ -880,7 +894,7 @@ impl RunMounts {
                             }
                         },
                     };
-                    let src = safe_join_in_root(&root, source.trim_start_matches('/'))
+                    let src = resolve_in_root(&root, source.trim_start_matches('/'), true)
                         .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
                     let rel = src
                         .strip_prefix(context_dir)
@@ -901,7 +915,7 @@ impl RunMounts {
                         if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
                         {
                             let skip = |rel: &str| ignore.is_ignored(rel);
-                            let copier = Copier::new(None, None, false);
+                            let copier = Copier::new(&scratch, None, None, false);
                             copier.dir(context_dir, &src, &scratch, &skip)?;
                             copier.finish()?;
                             out.temp.push(scratch.clone());
@@ -1388,10 +1402,10 @@ fn apply_copy(
         || dest_expanded == "."
         || spec.parents
         || spec.sources.len() + spec.heredocs.len() > 1;
-    let dst_base = safe_join_in_root(&stage.root, &dest_in_container)?;
+    let dst_base = resolve_in_root(&stage.root, &dest_in_container, true)?;
     // A stage's or an image's files keep their flags; the context's do not,
     // as Docker keeps nothing of the host's.
-    let copier = Copier::new(chown_ids, spec.chmod, spec.from.is_some());
+    let copier = Copier::new(&stage.root, chown_ids, spec.chmod, spec.from.is_some());
     let place_file = |src: &Path, dst_base: &Path| -> Result<(), Error> {
         let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
             std::fs::create_dir_all(dst_base)?;
@@ -1420,7 +1434,7 @@ fn apply_copy(
             Some((pivot, rest)) if spec.parents => (pivot.to_owned(), format!("{pivot}/{rest}")),
             _ => (String::new(), src_pat.clone()),
         };
-        let pivot_root = safe_join_in_root(src_root, pivot.trim_start_matches('/'))
+        let pivot_root = resolve_in_root(src_root, pivot.trim_start_matches('/'), true)
             .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
         let matches = resolve_source_paths(src_root, &pattern, line_no)?;
         if matches.is_empty() {
@@ -1445,7 +1459,7 @@ fn apply_copy(
                 src_root,
                 &src_path,
                 &if spec.parents {
-                    dst_base.join(&kept)
+                    resolve_below(&stage.root, &dst_base.join(&kept), true)?
                 } else {
                     dst_base.clone()
                 },
@@ -1458,8 +1472,12 @@ fn apply_copy(
             layer::extract(tmp_tar.path(), &dst_base)?;
         } else if spec.parents {
             let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
+            let parent = resolve_below(&stage.root, &parent, true)?;
             std::fs::create_dir_all(&parent)?;
-            copier.entry(&src_path, &dst_base.join(&kept))?;
+            let name = kept
+                .file_name()
+                .ok_or_else(|| Error::Build(format!("line {line_no}: invalid source")))?;
+            copier.entry(&src_path, &parent.join(name))?;
         } else {
             place_file(&src_path, &dst_base)?;
         }
@@ -1485,7 +1503,14 @@ fn resolve_source_paths(
     safe_join_in_root(src_root, trimmed)
         .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
     let mut found = vec![src_root.to_path_buf()];
-    for comp in trimmed.split('/').filter(|c| !c.is_empty() && *c != ".") {
+    let comps: Vec<&str> = trimmed
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    for (i, comp) in comps.iter().enumerate() {
+        // A link on the way is followed inside `src_root`; one at the end is
+        // copied as a link.
+        let last = i + 1 == comps.len();
         let mut next = Vec::new();
         for dir in &found {
             if comp.contains(['*', '?', '[']) {
@@ -1505,6 +1530,12 @@ fn resolve_source_paths(
                     next.push(p);
                 }
             }
+        }
+        if !last {
+            next = next
+                .iter()
+                .map(|p| resolve_below(src_root, p, true))
+                .collect::<Result<_, _>>()?;
         }
         found = next;
     }
@@ -1527,10 +1558,73 @@ fn safe_join_in_root(root: &Path, rel: &str) -> Result<PathBuf, Error> {
     Ok(out)
 }
 
+/// `rel`, a path in a root filesystem, under `root`, with the links on its
+/// way followed as they would be in a jail on `root`: an absolute link
+/// starts again from `root`, and `..` stops there. A build runs as root on
+/// the host, so a link in an image or the context must not take what is
+/// read or written there outside its root. A link at the end is followed
+/// only if `follow_last`; what does not exist yet is kept as named.
+fn resolve_in_root(root: &Path, rel: &str, follow_last: bool) -> Result<PathBuf, Error> {
+    safe_join_in_root(root, rel)?;
+    // What is left to walk, last first.
+    let mut todo: Vec<std::ffi::OsString> = Path::new(rel)
+        .components()
+        .rev()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_owned()),
+            _ => None,
+        })
+        .collect();
+    let mut done = root.to_path_buf();
+    let mut depth = 0usize;
+    let mut links = 0;
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            if depth > 0 {
+                done.pop();
+                depth -= 1;
+            }
+            continue;
+        }
+        let next = done.join(&name);
+        let is_link = std::fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink());
+        if is_link && (follow_last || !todo.is_empty()) {
+            links += 1;
+            if links > 40 {
+                return Err(Error::Build(format!("path {rel:?}: too many links")));
+            }
+            let link = std::fs::read_link(&next)?;
+            if link.has_root() {
+                done = root.to_path_buf();
+                depth = 0;
+            }
+            for c in link.components().rev() {
+                match c {
+                    Component::Normal(s) => todo.push(s.to_owned()),
+                    Component::ParentDir => todo.push("..".into()),
+                    _ => {}
+                }
+            }
+        } else {
+            done = next;
+            depth += 1;
+        }
+    }
+    Ok(done)
+}
+
+/// `path`, below `root`, with its links resolved by [`resolve_in_root`].
+fn resolve_below(root: &Path, path: &Path, follow_last: bool) -> Result<PathBuf, Error> {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    resolve_in_root(root, &rel.to_string_lossy().replace('\\', "/"), follow_last)
+}
+
 /// Copies files for one `COPY`: owners and modes as it asks, the names
 /// of a hard-linked file linked again, and (from a stage or an image) file
 /// flags, set at the end, since they may refuse what follows.
 struct Copier {
+    /// The root filesystem copied into, which its links stay inside.
+    root: PathBuf,
     chown: Option<(u32, u32)>,
     chmod: Option<u32>,
     keep_flags: bool,
@@ -1541,8 +1635,9 @@ struct Copier {
 }
 
 impl Copier {
-    fn new(chown: Option<(u32, u32)>, chmod: Option<u32>, keep_flags: bool) -> Self {
+    fn new(root: &Path, chown: Option<(u32, u32)>, chmod: Option<u32>, keep_flags: bool) -> Self {
         Copier {
+            root: root.to_path_buf(),
             chown,
             chmod,
             keep_flags,
@@ -1571,6 +1666,8 @@ impl Copier {
             }
             let target = dst_dir.join(entry.file_name());
             if std::fs::symlink_metadata(&path)?.is_dir() {
+                // A directory already there may be a link, as `/home` is.
+                let target = resolve_below(&self.root, &target, true)?;
                 self.dir(root, &path, &target, skip)?;
             } else {
                 self.entry(&path, &target)?;
@@ -1746,7 +1843,7 @@ async fn build_with_buildah(
 
 #[cfg(test)]
 mod tests {
-    use super::rfc3339;
+    use super::{pull_creds, rfc3339};
 
     #[test]
     fn times_are_given_as_image_configs_give_them() {
@@ -1754,5 +1851,56 @@ mod tests {
         assert_eq!(rfc3339(951_825_599), "2000-02-29T11:59:59Z");
         assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(rfc3339(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn images_are_pulled_with_their_own_registrys_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let authfile = tmp.path().join("auth.json");
+        std::fs::write(
+            &authfile,
+            r#"{"auths": {
+                "ghcr.io": {"username": "gh", "password": "a"},
+                "https://index.docker.io/v1/": {"username": "hub", "password": "b"}
+            }}"#,
+        )
+        .unwrap();
+        let source = crate::auth::CredsSource {
+            creds: None,
+            authfile: Some(authfile),
+        };
+        let user = |name: &str| pull_creds(&source, name).unwrap().map(|c| c.username);
+        assert_eq!(user("ghcr.io/me/base:15.1").as_deref(), Some("gh"));
+        assert_eq!(user("freebsd/base:15.1").as_deref(), Some("hub"));
+        assert_eq!(user("quay.io/me/base:1"), None);
+        // `--creds` is for every registry.
+        let given = crate::auth::CredsSource {
+            creds: Some("me:pw".to_owned()),
+            authfile: None,
+        };
+        let c = pull_creds(&given, "ghcr.io/me/base:15.1").unwrap().unwrap();
+        assert_eq!((c.username.as_str(), c.password.as_str()), ("me", "pw"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_followed_inside_the_root() {
+        use super::resolve_in_root;
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("usr/home")).unwrap();
+        symlink("usr/home", root.join("home")).unwrap();
+        symlink("/etc", root.join("abs")).unwrap();
+        symlink("../../../..", root.join("usr/up")).unwrap();
+        symlink("loop", root.join("loop")).unwrap();
+        let at = |p: &str, last| resolve_in_root(&root, p, last).unwrap();
+        assert_eq!(at("/home/app", true), root.join("usr/home/app"));
+        assert_eq!(at("/abs/rc.conf", true), root.join("etc/rc.conf"));
+        assert_eq!(at("usr/up/etc", true), root.join("etc"));
+        assert_eq!(at("/abs", false), root.join("abs"));
+        assert_eq!(at("/abs", true), root.join("etc"));
+        assert!(resolve_in_root(&root, "/loop", true).is_err());
+        assert!(resolve_in_root(&root, "../x", true).is_err());
     }
 }
