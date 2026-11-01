@@ -1380,6 +1380,9 @@ async fn containers(cli: &Cli) -> Result<()> {
                 }
                 NetworkArg::None => Network::None,
             };
+            if network == Network::Bridge {
+                jailer::net::check_subnet()?;
+            }
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
 
             // When running in foreground without `-d`, default to removing the

@@ -438,6 +438,11 @@ on jailer's bridge,
 (10.88.0.1/16), an address from 10.88.0.0/16 and a default route through
 the bridge; pf translates its traffic out of the host's default
 interface.
+Podman's default network
+.Pq Li cni-podman0
+has the same addresses, so
+.Nm
+refuses to start a pod while another interface routes them.
 .Nm stop
 and
 .Nm rm

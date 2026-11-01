@@ -148,6 +148,49 @@ pub fn missing_hooks(main_rules: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The interface that `route -n get` says an address in jailer's subnet
+/// goes out of, if a route other than the default one covers it.
+pub fn subnet_route(route_get: &str) -> Option<&str> {
+    let field = |name: &str| {
+        route_get
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(name))
+            .map(str::trim)
+            .next()
+    };
+    match field("destination:") {
+        None | Some("default") | Some("0.0.0.0") => None,
+        Some(_) => field("interface:"),
+    }
+}
+
+/// Fails if another interface, such as Podman's `cni-podman0`, which has
+/// 10.88.0.0/16 too, already routes jailer's subnet: the pods' traffic
+/// would go there instead.
+pub fn check_subnet() -> Result<(), Error> {
+    #[cfg(target_os = "freebsd")]
+    {
+        let probe = Ipv4Addr::from(u32::from(SUBNET.addr) + 2).to_string();
+        let out = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", &probe])
+            .output()?;
+        if let Some(other) = subnet_route(&String::from_utf8_lossy(&out.stdout))
+            && other != BRIDGE
+        {
+            let whose = if other.starts_with("cni-podman") {
+                "Podman's network"
+            } else {
+                "another network"
+            };
+            return Err(Error::Runtime(format!(
+                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: {whose} has the same addresses; remove it (ifconfig {other} destroy) or use --network none",
+                SUBNET.addr, SUBNET.prefix
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Makes the bridge, turns on forwarding and loads the NAT rules: what
 /// every pod on the bridge needs. Fails, saying what to add, if pf.conf
 /// does not call jailer's anchors.
@@ -345,6 +388,22 @@ mod tests {
     use legion_sys::FakeSys;
 
     use super::*;
+
+    #[test]
+    fn another_interface_routing_the_subnet_is_found() {
+        let get = |dest: &str, iface: &str| {
+            format!(
+                "   route to: 10.88.0.2\ndestination: {dest}\n       mask: 255.255.0.0\n        fib: 0\n  interface: {iface}\n      flags: <UP,DONE>\n"
+            )
+        };
+        assert_eq!(subnet_route(&get("10.88.0.0", "jailer0")), Some("jailer0"));
+        assert_eq!(
+            subnet_route(&get("10.88.0.0", "cni-podman0")),
+            Some("cni-podman0")
+        );
+        assert_eq!(subnet_route(&get("default", "re0")), None);
+        assert_eq!(subnet_route(""), None);
+    }
 
     #[test]
     fn ports_read_as_docker_writes_them() {
