@@ -102,10 +102,17 @@ pub fn detect_template(dir: &Path) -> Template {
 /// Infers the binary/service name from `Cargo.toml`, `go.mod`, or the directory name.
 pub fn detect_app_name(dir: &Path) -> String {
     if let Ok(cargo) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+        // The `name` in `[package]`, not a workspace's or a dependency's.
+        let mut in_package = false;
         for line in cargo.lines() {
             let t = line.trim();
-            if let Some(rest) = t.strip_prefix("name")
-                && let Some((_, val)) = rest.split_once('=')
+            if t.starts_with('[') {
+                in_package = t == "[package]";
+                continue;
+            }
+            if in_package
+                && let Some((key, val)) = t.split_once('=')
+                && key.trim() == "name"
             {
                 let name = val.trim().trim_matches('"').trim_matches('\'');
                 if !name.is_empty() {
@@ -291,6 +298,13 @@ mod tests {
         .unwrap();
         assert_eq!(detect_template(t.path()), Template::Rust);
         assert_eq!(detect_app_name(t.path()), "demo-svc");
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\n[workspace.package]\nname = \"ws\"\n[package]\nnamespace = \"x\"\nname = \"app\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_app_name(other.path()), "app");
 
         let out = scaffold(&InitOptions {
             dir: t.path().to_path_buf(),

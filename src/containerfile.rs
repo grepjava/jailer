@@ -761,7 +761,6 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
     })
 }
 
-/// `1024`, `64k`, `512m`, `2g` (optionally with a trailing `b`) in bytes.
 /// A size such as `512`, `64k`, `100m` or `10g` (a trailing `b` is allowed).
 pub fn parse_size(v: &str) -> Option<u64> {
     let lower = v.to_ascii_lowercase();
@@ -900,7 +899,8 @@ fn parse_key_values(
                 "line {line_no}: expected KEY=VALUE in `{what}`, got `{tok}`"
             )));
         };
-        out.push((k.to_owned(), unquote(v)));
+        // The tokens' quotes are already gone: `A="\"x\""` keeps `"x"`.
+        out.push((k.to_owned(), v.to_owned()));
     }
     Ok(out)
 }
@@ -1163,6 +1163,21 @@ CMD ["--serve"]
         assert_eq!(cf.stages[0].name.as_deref(), Some("builder"));
         assert_eq!(cf.stages[0].instructions.len(), 3);
         assert_eq!(cf.stages[1].instructions.len(), 4);
+    }
+
+    #[test]
+    fn env_values_keep_quotes_inside_quotes() {
+        let cf =
+            Containerfile::parse("FROM scratch\nENV A=\"\\\"x\\\"\" B='\"y\"' C=\"a b\" D=plain\n")
+                .unwrap();
+        let Instruction::Env(kv) = &cf.stages[0].instructions[0].instruction else {
+            panic!("not ENV");
+        };
+        let got: Vec<(&str, &str)> = kv.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            got,
+            [("A", "\"x\""), ("B", "\"y\""), ("C", "a b"), ("D", "plain")]
+        );
     }
 
     #[test]

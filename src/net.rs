@@ -2,7 +2,7 @@
 //! Legion's own `PodNetwork`: an epair whose host end joins a bridge and
 //! whose other end moves into the pod's jail, with the bridge as its
 //! default route. The bridge is jailer's own, `jailer0` on 10.77.0.0/16
-//! (not 10.77.0.0/16, Podman's default network), IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
+//! (not 10.88.0.0/16, Podman's default network), IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
 //! node keeps its `legion0` to itself. NAT to the outside and
 //! published ports are pf rules in anchors under `jailer/`, which the
 //! host's pf.conf must call.
