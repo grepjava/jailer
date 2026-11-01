@@ -101,7 +101,7 @@ fail with a clear message.
   clone of its base image's top layer, or of a snapshot of the stage it is
   built on, kept under `<zfs-root>/build` and destroyed with the build.
 - [x] **Network for `run --vnet`**: an epair on jailer's own bridge
-  (`jailer0`, 10.88.0.0/16), NAT out and `-p` published ports through pf
+  (`jailer0`, 10.77.0.0/16), NAT out and `-p` published ports through pf
   anchors under `jailer/`; `--network none` for loopback only.
 - [x] **Legion's `PodNetwork`** makes `jailer0` and the pods' epairs
   (Legion v0.1.4), IPv4 only and with a 1500-byte MTU.

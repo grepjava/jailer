@@ -382,12 +382,12 @@ CMD ["default-arg"]
         ]);
         let ps = cmd(&["ps"]);
         assert!(
-            ps.contains("10.88.0.") && ps.contains("18080:8080/tcp"),
+            ps.contains("10.77.0.") && ps.contains("18080:8080/tcp"),
             "{ps}"
         );
         let ip = ps
             .split_whitespace()
-            .find(|w| w.starts_with("10.88.0."))
+            .find(|w| w.starts_with("10.77.0."))
             .unwrap()
             .to_owned();
         // From outside: the host's own connections to its addresses go

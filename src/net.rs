@@ -1,8 +1,8 @@
 //! Networking for `jailer run --vnet`, as a Legion node gives a pod, with
 //! Legion's own `PodNetwork`: an epair whose host end joins a bridge and
 //! whose other end moves into the pod's jail, with the bridge as its
-//! default route. The bridge is jailer's own, `jailer0` on 10.88.0.0/16,
-//! IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
+//! default route. The bridge is jailer's own, `jailer0` on 10.77.0.0/16
+//! (not 10.77.0.0/16, Podman's default network), IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
 //! node keeps its `legion0` to itself. NAT to the outside and
 //! published ports are pf rules in anchors under `jailer/`, which the
 //! host's pf.conf must call.
@@ -25,7 +25,7 @@ use crate::Error;
 
 pub const BRIDGE: &str = "jailer0";
 pub const SUBNET: Ipv4Net = Ipv4Net {
-    addr: Ipv4Addr::new(10, 88, 0, 0),
+    addr: Ipv4Addr::new(10, 77, 0, 0),
     prefix: 16,
 };
 /// Where addresses taken are kept; gone at boot, as the jails are.
@@ -164,9 +164,9 @@ pub fn subnet_route(route_get: &str) -> Option<&str> {
     }
 }
 
-/// Fails if another interface, such as Podman's `cni-podman0`, which has
-/// 10.88.0.0/16 too, already routes jailer's subnet: the pods' traffic
-/// would go there instead.
+/// Fails if another interface, a VPN's or a network another tool made,
+/// already routes jailer's subnet: the pods' traffic would go there
+/// instead.
 pub fn check_subnet() -> Result<(), Error> {
     #[cfg(target_os = "freebsd")]
     {
@@ -177,13 +177,8 @@ pub fn check_subnet() -> Result<(), Error> {
         if let Some(other) = subnet_route(&String::from_utf8_lossy(&out.stdout))
             && other != BRIDGE
         {
-            let whose = if other.starts_with("cni-podman") {
-                "Podman's network"
-            } else {
-                "another network"
-            };
             return Err(Error::Runtime(format!(
-                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: {whose} has the same addresses; remove it (ifconfig {other} destroy) or use --network none",
+                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: another network has the same addresses; remove it or use --network none",
                 SUBNET.addr, SUBNET.prefix
             )));
         }
@@ -393,14 +388,11 @@ mod tests {
     fn another_interface_routing_the_subnet_is_found() {
         let get = |dest: &str, iface: &str| {
             format!(
-                "   route to: 10.88.0.2\ndestination: {dest}\n       mask: 255.255.0.0\n        fib: 0\n  interface: {iface}\n      flags: <UP,DONE>\n"
+                "   route to: 10.77.0.2\ndestination: {dest}\n       mask: 255.255.0.0\n        fib: 0\n  interface: {iface}\n      flags: <UP,DONE>\n"
             )
         };
-        assert_eq!(subnet_route(&get("10.88.0.0", "jailer0")), Some("jailer0"));
-        assert_eq!(
-            subnet_route(&get("10.88.0.0", "cni-podman0")),
-            Some("cni-podman0")
-        );
+        assert_eq!(subnet_route(&get("10.77.0.0", "jailer0")), Some("jailer0"));
+        assert_eq!(subnet_route(&get("10.0.0.0", "tun0")), Some("tun0"));
         assert_eq!(subnet_route(&get("default", "re0")), None);
         assert_eq!(subnet_route(""), None);
     }
@@ -439,7 +431,7 @@ mod tests {
         assert_eq!(sys.sysctl("net.inet.ip.forwarding").as_deref(), Some("1"));
         assert_eq!(
             sys.anchor(NAT_ANCHOR).unwrap(),
-            "nat on re0 inet from 10.88.0.0/16 to ! 10.88.0.0/16 -> (re0)\n"
+            "nat on re0 inet from 10.77.0.0/16 to ! 10.77.0.0/16 -> (re0)\n"
         );
 
         let tmp = tempfile::tempdir().unwrap();
@@ -449,7 +441,7 @@ mod tests {
         let ports = ["8080:80".parse().unwrap()];
         let held = leases.lock().unwrap();
         let ip = held.allocate(&sys, &ports).unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 88, 0, 2));
+        assert_eq!(ip, Ipv4Addr::new(10, 77, 0, 2));
         held.record(ip, pod, &ports).unwrap();
         attach(&sys, pod, ip, &ports).unwrap();
         assert_eq!(
@@ -463,12 +455,12 @@ mod tests {
         );
         assert_eq!(
             sys.anchor("jailer/89abcdef0123").unwrap(),
-            "rdr pass on ! jailer0 inet proto tcp from any to any port 8080 -> 10.88.0.2 port 80\n"
+            "rdr pass on ! jailer0 inet proto tcp from any to any port 8080 -> 10.77.0.2 port 80\n"
         );
 
         // The next pod gets the next address, and not the same port.
         let next = held.allocate(&sys, &[]).unwrap();
-        assert_eq!(next, Ipv4Addr::new(10, 88, 0, 3));
+        assert_eq!(next, Ipv4Addr::new(10, 77, 0, 3));
         let clash = held
             .allocate(&sys, &["10.0.0.1:8080:81".parse().unwrap()])
             .unwrap_err();
@@ -478,11 +470,11 @@ mod tests {
         // A lease whose jail is gone is free again; releasing it as
         // another pod changes nothing.
         leases.release(ip, "someone-else").unwrap();
-        assert!(tmp.path().join("10.88.0.2").exists());
+        assert!(tmp.path().join("10.77.0.2").exists());
         sys.remove_jail(pod);
         assert_eq!(leases.lock().unwrap().allocate(&sys, &[]).unwrap(), ip);
         leases.release(ip, pod).unwrap();
-        assert!(!tmp.path().join("10.88.0.2").exists());
+        assert!(!tmp.path().join("10.77.0.2").exists());
 
         detach(&sys, pod);
         assert!(sys.interface(&host_interface(pod)).is_none());
