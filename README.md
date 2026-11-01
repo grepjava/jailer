@@ -34,6 +34,20 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
   - Warns on `Containerfile` settings Legion ignores (`HEALTHCHECK`) and uncleaned `pkg` caches (`/var/cache/pkg`, `/var/db/pkg/repos`).
 - **Offline archives for `legion image load`:** `jailer export app.tar` writes an `oci-archive` tarball annotated with `org.opencontainers.image.ref.name`, ready for `legion image load app.tar --zfs-root zroot/legion`.
 
+## Compared with other tools
+
+Other FreeBSD tools, as their own documentation described them in November 2026:
+
+| Tool | What it is for | OCI images |
+|---|---|---|
+| [Podman](https://podman.io) and [Buildah](https://buildah.io) with [ocijail](https://github.com/dfr/ocijail) | Docker-compatible engine; its FreeBSD port is marked experimental | Builds, runs, pushes and pulls |
+| [AppJail](https://github.com/DtxdF/AppJail) | Jail manager with Makejails; `appjail oci` runs OCI images as jails | Runs; builds through Buildah |
+| [Bastille](https://github.com/BastilleBSD/bastille) | Jail manager with Bastillefile templates | None; exports its own archives |
+| [pot](https://github.com/bsdpot/pot) | Jail manager with flavours, Potluck images and Nomad scheduling | None; its own image format |
+| [iocage](https://github.com/freebsd/iocage) | Jail manager | None |
+
+`jailer` overlaps most with Podman and Buildah. It differs in being one binary with no container stack to install, in running images with Legion's own jail code so a local run behaves as on a Legion node, and in `jailer check`. It is not a service manager: it has no restart policies or boot-time start, so for long-running jails on one host, Bastille, AppJail, pot or Podman fit better.
+
 ## Commands
 
 | Command | Description |
