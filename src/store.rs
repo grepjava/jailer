@@ -140,7 +140,9 @@ pub async fn prune(store: &Store, all_cache: bool) -> Result<usize, Error> {
 }
 
 /// Removes the directories of `RUN --mount=type=cache`, but those a build
-/// is using: it holds the lock beside each.
+/// is using: it holds the lock beside each. The lock files stay: a build
+/// waiting on one it opened would otherwise hold a lock no other build
+/// sees, on a file another build has made anew.
 fn prune_run_caches(dir: &Path) -> Result<(), Error> {
     let Ok(listed) = std::fs::read_dir(dir) else {
         return Ok(());
@@ -154,7 +156,6 @@ fn prune_run_caches(dir: &Path) -> Result<(), Error> {
         let lock = std::fs::File::create(&lock_path)?;
         if lock.try_lock().is_ok() {
             crate::layer::remove_tree(&path)?;
-            let _ = std::fs::remove_file(&lock_path);
         }
     }
     Ok(())
@@ -246,7 +247,7 @@ mod tests {
         held.lock_shared().unwrap();
         super::prune_run_caches(t.path()).unwrap();
         assert!(!t.path().join("idle").exists());
-        assert!(!t.path().join("idle.lock").exists());
+        assert!(t.path().join("idle.lock").exists());
         assert!(t.path().join("busy/f").exists());
     }
 }

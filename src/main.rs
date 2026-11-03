@@ -1414,7 +1414,9 @@ async fn containers(cli: &Cli) -> Result<()> {
             });
             let spec = RunSpec {
                 name,
-                image: image.references[0].clone(),
+                // The name asked for, as `ps` shows it, of an image's names.
+                image: name_given(&image.references, &image_ref)
+                    .unwrap_or_else(|| image.references[0].clone()),
                 entrypoint: entrypoint.iter().cloned().collect(),
                 command: cmd_args,
                 env: env_map,

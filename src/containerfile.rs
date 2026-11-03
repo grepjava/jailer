@@ -353,6 +353,7 @@ fn join_logical_lines(input: &str, escape: char) -> Result<Vec<Logical>, Error> 
     let lines: Vec<&str> = input.lines().map(|l| l.trim_end_matches('\r')).collect();
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut continued = false;
     let mut start_line = 1usize;
     let mut idx = 0;
 
@@ -360,26 +361,28 @@ fn join_logical_lines(input: &str, escape: char) -> Result<Vec<Logical>, Error> 
         let line = lines[idx];
         idx += 1;
         let trimmed = line.trim();
-        if current.is_empty() {
+        // As in Docker: a continued line goes on with the next as it is,
+        // its leading space kept, the text before the escape too; comment
+        // and blank lines in between are skipped.
+        let piece = if continued {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            line.trim_end()
+        } else {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             start_line = idx;
-        } else if trimmed.starts_with('#') {
-            // Comment line inside a multi-line continuation is skipped.
+            trimmed
+        };
+        if let Some(without_escape) = piece.strip_suffix(escape) {
+            current.push_str(without_escape);
+            continued = true;
             continue;
         }
-        if let Some(without_escape) = line.trim_end().strip_suffix(escape) {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(without_escape.trim());
-            continue;
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(trimmed);
+        current.push_str(piece);
+        continued = false;
         let text = std::mem::take(&mut current);
         let mut heredocs = Vec::new();
         let verb = text.split_whitespace().next().unwrap_or("");
@@ -1628,7 +1631,21 @@ COPY a\\b `
         let cf = Containerfile::parse("\n# escape=`\nFROM scratch\nRUN a \\\n b\n").unwrap();
         assert_eq!(
             cf.stages[0].instructions[0].instruction,
-            Instruction::Run(CommandForm::Shell("a b".into()), RunOptions::default())
+            Instruction::Run(CommandForm::Shell("a  b".into()), RunOptions::default())
+        );
+        // As in Docker, a line goes on with the next as it is: a word split
+        // across lines is one word, and blank and comment lines in between
+        // are skipped.
+        let cf = Containerfile::parse(
+            "FROM scratch\nRUN fetch http://x/lo\\\nng/path \\\n\n# note\n  && done\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cf.stages[0].instructions[0].instruction,
+            Instruction::Run(
+                CommandForm::Shell("fetch http://x/long/path   && done".into()),
+                RunOptions::default()
+            )
         );
         assert!(Containerfile::parse("# escape=x\nFROM scratch\n").is_err());
     }

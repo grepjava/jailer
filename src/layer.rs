@@ -243,6 +243,16 @@ impl TreeState {
     /// Like `capture`, but reuses `prev`'s digest for files whose stat
     /// fingerprint has not changed since `prev` was taken of the same tree.
     pub fn capture_from(root: &Path, prev: Option<&TreeState>) -> Result<Self, Error> {
+        Self::capture_with(root, prev, true)
+    }
+
+    /// Like `capture`, for a tree that is not a root filesystem, such as
+    /// the build context: its `dev` is a directory like any other.
+    pub fn capture_tree(root: &Path) -> Result<Self, Error> {
+        Self::capture_with(root, None, false)
+    }
+
+    fn capture_with(root: &Path, prev: Option<&TreeState>, rootfs: bool) -> Result<Self, Error> {
         let mut state = Self::default();
         // A file changed within a second of this capture could change again
         // without its stamp changing on a filesystem with coarse timestamps,
@@ -253,7 +263,13 @@ impl TreeState {
             - 1;
         let mut inodes = Inodes::new();
         if root.exists() {
-            walk_capture(root, root, prev, racy_after, &mut state, &mut inodes)?;
+            let walk = Walk {
+                root,
+                prev,
+                racy_after,
+                rootfs,
+            };
+            walk_capture(&walk, root, &mut state, &mut inodes)?;
         }
         for names in inodes.into_values().filter(|n| n.len() > 1) {
             let first = names.iter().min().expect("names").clone();
@@ -265,14 +281,27 @@ impl TreeState {
     }
 }
 
-fn walk_capture(
-    root: &Path,
-    dir: &Path,
-    prev: Option<&TreeState>,
+/// What a [`walk_capture`] keeps to, all the way down.
+struct Walk<'a> {
+    root: &'a Path,
+    prev: Option<&'a TreeState>,
     racy_after: i64,
+    /// A root filesystem, whose `dev` is devfs in a jail, not its own.
+    rootfs: bool,
+}
+
+fn walk_capture(
+    walk: &Walk<'_>,
+    dir: &Path,
     out: &mut TreeState,
     inodes: &mut Inodes,
 ) -> Result<(), Error> {
+    let Walk {
+        root,
+        prev,
+        racy_after,
+        rootfs,
+    } = *walk;
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(|e| e.file_name());
     for entry in children {
@@ -282,7 +311,7 @@ fn walk_capture(
             .map_err(|e| Error::Extract(e.to_string()))?;
         let rel_str = normalize_rel(rel);
         // Skip pseudo mounts inside a build root if any exist.
-        if rel_str == "dev" || rel_str.starts_with("dev/") {
+        if rootfs && (rel_str == "dev" || rel_str.starts_with("dev/")) {
             continue;
         }
         let meta = std::fs::symlink_metadata(&full)?;
@@ -317,7 +346,7 @@ fn walk_capture(
                     flags,
                 },
             );
-            walk_capture(root, &full, prev, racy_after, out, inodes)?;
+            walk_capture(walk, &full, out, inodes)?;
         } else if meta.is_file() {
             let stamp = Stamp::of(&meta);
             let reused = prev.and_then(|p| {
@@ -831,6 +860,34 @@ mod tests {
         assert_eq!(flags_text(0x0002_0000), "schg");
         assert_eq!(flags_text(0x0000_0001 | 0x0000_0002), "nodump,uchg");
         assert_eq!(flags_text(0), "");
+    }
+
+    #[test]
+    fn a_file_becomes_a_directory_and_an_empty_directory_a_file() {
+        let t = tempfile::tempdir().unwrap();
+        let (root, target) = (t.path().join("root"), t.path().join("target"));
+        for r in [&root, &target] {
+            std::fs::create_dir_all(r.join("empty")).unwrap();
+            std::fs::write(r.join("opt"), "a file").unwrap();
+        }
+        let before = TreeState::capture(&root).unwrap();
+        std::fs::remove_file(root.join("opt")).unwrap();
+        std::fs::create_dir_all(root.join("opt")).unwrap();
+        std::fs::write(root.join("opt/inside"), "in").unwrap();
+        std::fs::remove_dir(root.join("empty")).unwrap();
+        std::fs::write(root.join("empty"), "now a file").unwrap();
+        let tar_out = t.path().join("layer.tar");
+        let gz_out = t.path().join("layer.tar.gz");
+        create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip).unwrap();
+        apply(&tar_out, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("opt/inside")).unwrap(),
+            "in"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("empty")).unwrap(),
+            "now a file"
+        );
     }
 
     #[cfg(unix)]

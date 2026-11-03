@@ -64,6 +64,18 @@ impl CheckReport {
     }
 }
 
+/// Whether a command in `text` runs pkg (or pkg-static) to `verb`, as
+/// `pkg install`, `pkg -y install` or `/usr/sbin/pkg-static install` do.
+fn runs_pkg(text: &str, verb: &str) -> bool {
+    text.split(['&', ';', '|', '\n']).any(|command| {
+        let mut words = command.split_whitespace();
+        words
+            .by_ref()
+            .any(|w| matches!(w.rsplit('/').next(), Some("pkg" | "pkg-static")))
+            && words.any(|w| w == verb)
+    })
+}
+
 /// Checks a parsed `Containerfile` for settings Legion does not use or
 /// FreeBSD image anti-patterns, in the stage built: `target`, or the last.
 pub fn check_containerfile(cf: &Containerfile, target: Option<&str>) -> CheckReport {
@@ -98,7 +110,7 @@ pub fn check_containerfile(cf: &Containerfile, target: Option<&str>) -> CheckRep
                     matches!(m, crate::containerfile::RunMount::Cache { target, .. }
                         if target.trim_end_matches('/') == "/var/cache/pkg")
                 });
-                if text.contains("pkg install") && !text.contains("pkg clean") && !cached {
+                if runs_pkg(&text, "install") && !runs_pkg(&text, "clean") && !cached {
                     report.warn(
                         "LEGION002",
                         format!(
@@ -336,6 +348,9 @@ mod tests {
                 .any(|f| f.code == "LEGION002")
         };
         assert!(pkg("RUN pkg install -y curl"));
+        assert!(pkg("RUN pkg -y install curl"));
+        assert!(pkg("RUN /usr/sbin/pkg-static install -y curl && echo done"));
+        assert!(!pkg("RUN pkg -y install curl && pkg clean -ay"));
         assert!(!pkg(
             "RUN --mount=type=cache,target=/var/cache/pkg pkg install -y curl"
         ));

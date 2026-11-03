@@ -931,50 +931,21 @@ impl RunMounts {
             locks: Vec::new(),
             placed: Vec::new(),
         };
-        for (i, m) in opts.mounts.iter().enumerate() {
+        let mounts: Vec<RunMount> = opts.mounts.iter().map(|m| m.expanded(vars)).collect();
+        let caches = lock_caches(&mut out, store.dir(), &mounts, tmp_dir, step_no)?;
+        for (i, m) in mounts.iter().enumerate() {
             let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
-            let m = &m.expanded(vars);
             match m {
                 RunMount::Cache {
                     id,
                     target,
                     read_only,
-                    sharing,
                     mode,
                     uid,
                     gid,
+                    ..
                 } => {
-                    let caches = store.dir().join("run-cache");
-                    let name = next_key("", &[id]);
-                    let mut dir = caches.join(&name);
-                    std::fs::create_dir_all(&caches)?;
-                    // Held for the step, shared or not as `sharing` says;
-                    // `prune --cache` leaves a cache held alone.
-                    let lock = std::fs::File::create(caches.join(format!("{name}.lock")))?;
-                    let shared = *sharing == Sharing::Shared;
-                    let tried = if shared {
-                        lock.try_lock_shared()
-                    } else {
-                        lock.try_lock()
-                    };
-                    match tried {
-                        Ok(()) => out.locks.push(lock),
-                        // Another build has it: this one gets its own.
-                        Err(std::fs::TryLockError::WouldBlock) if *sharing == Sharing::Private => {
-                            dir = scratch.with_extension("cache");
-                            out.temp.push(dir.clone());
-                        }
-                        Err(std::fs::TryLockError::WouldBlock) => {
-                            println!(" ---> Waiting for cache {id:?}, in use by another build");
-                            if shared {
-                                lock.lock_shared()?;
-                            } else {
-                                lock.lock()?;
-                            }
-                            out.locks.push(lock);
-                        }
-                        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-                    }
+                    let dir = caches[&next_key("", &[id])].clone();
                     if !dir.exists() {
                         std::fs::create_dir_all(&dir)?;
                         set_owner_mode(&dir, *uid, *gid, *mode)?;
@@ -1151,6 +1122,70 @@ impl RunMounts {
         }
         Ok(out)
     }
+}
+
+/// Locks each cache `mounts` use, once however many of them name it and
+/// in the order of their names, so that a step cannot wait for itself nor
+/// two builds for each other: shared for `sharing=shared`, else alone,
+/// as the strictest mount of it asks. `prune --cache` leaves a cache that
+/// is held. Returns each cache's directory by name: a `private` one in use
+/// elsewhere is an empty one of this step's.
+fn lock_caches(
+    out: &mut RunMounts,
+    store_dir: &Path,
+    mounts: &[RunMount],
+    tmp_dir: &Path,
+    step_no: usize,
+) -> Result<BTreeMap<String, PathBuf>, Error> {
+    let strictness = |s: Sharing| match s {
+        Sharing::Shared => 0,
+        Sharing::Private => 1,
+        Sharing::Locked => 2,
+    };
+    let mut wanted: BTreeMap<String, (&str, Sharing)> = BTreeMap::new();
+    for m in mounts {
+        if let RunMount::Cache { id, sharing, .. } = m {
+            let w = wanted
+                .entry(next_key("", &[id]))
+                .or_insert((id.as_str(), *sharing));
+            if strictness(*sharing) > strictness(w.1) {
+                w.1 = *sharing;
+            }
+        }
+    }
+    let caches = store_dir.join("run-cache");
+    let mut dirs = BTreeMap::new();
+    for (name, (id, sharing)) in wanted {
+        std::fs::create_dir_all(&caches)?;
+        let mut dir = caches.join(&name);
+        let lock = std::fs::File::create(caches.join(format!("{name}.lock")))?;
+        let shared = sharing == Sharing::Shared;
+        let tried = if shared {
+            lock.try_lock_shared()
+        } else {
+            lock.try_lock()
+        };
+        match tried {
+            Ok(()) => out.locks.push(lock),
+            // Another build has it: this one gets its own.
+            Err(std::fs::TryLockError::WouldBlock) if sharing == Sharing::Private => {
+                dir = tmp_dir.join(format!("cache-{step_no}-{name}"));
+                out.temp.push(dir.clone());
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                println!(" ---> Waiting for cache {id:?}, in use by another build");
+                if shared {
+                    lock.lock_shared()?;
+                } else {
+                    lock.lock()?;
+                }
+                out.locks.push(lock);
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        dirs.insert(name, dir);
+    }
+    Ok(dirs)
 }
 
 impl RunMounts {
@@ -1342,7 +1377,7 @@ fn content_digest(path: &Path) -> Result<String, Error> {
         };
         return Ok(sha256(&bytes));
     }
-    let state = TreeState::capture(path)?;
+    let state = TreeState::capture_tree(path)?;
     let mut text = String::new();
     for (p, e) in &state.entries {
         text.push_str(&format!(
@@ -2464,6 +2499,18 @@ mod tests {
         };
         assert_ne!(at(0o644), at(0o755));
         assert_eq!(at(0o644), at(0o644));
+    }
+
+    #[test]
+    fn a_mounted_trees_dev_is_in_its_digest() {
+        // A context's `dev` is its own, not a jail's devfs.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dev")).unwrap();
+        let at = |text: &str| {
+            std::fs::write(tmp.path().join("dev/input.txt"), text).unwrap();
+            super::content_digest(tmp.path()).unwrap()
+        };
+        assert_ne!(at("one"), at("two"));
     }
 
     #[cfg(unix)]

@@ -1005,7 +1005,7 @@ COPY --from=base /d /d
 COPY --from=base /queue /queue
 ARG ID=c
 ADD --chown=nobody:nobody --chmod=4755 a.tar /arc/
-RUN --mount=type=cache,id=$ID,target=/c,sharing=locked{cache_opts} sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
+RUN --mount=type=cache,id=$ID,target=/c,sharing=locked{cache_opts} --mount=type=cache,id=$ID,target=/c2,sharing=locked sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
 CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); echo $1 $3:$4; done; test -p /queue && echo pipe; cat /rc"]
 "#
             ),

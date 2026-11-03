@@ -190,8 +190,14 @@ pub async fn verify(
         if key.verify(&payload, &signature).is_err() {
             continue;
         }
-        let signed: serde_json::Value = serde_json::from_slice(&payload)?;
-        if signed["critical"]["image"]["docker-manifest-digest"] == digest.as_str() {
+        // A payload this key signed that is not an image signature, or
+        // not of this image, is passed over for the next.
+        let Ok(signed) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if signed["critical"]["type"] == "cosign container image signature"
+            && signed["critical"]["image"]["docker-manifest-digest"] == digest.as_str()
+        {
             return Ok(digest);
         }
     }
