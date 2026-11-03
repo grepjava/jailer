@@ -53,7 +53,8 @@ fail with a clear message.
 - [x] **`RUN --mount=type=bind,from=<image>`**, and `.containerignore`
   applied to context bind mounts.
 - [x] **`RUN --mount=type=ssh`** and `build --ssh`: jailer relays the
-  agent through a socket of the step's own (nullfs cannot mount sockets).
+  agent through a socket of the step's own, bound at the target in the
+  stage's root for the step (nullfs cannot mount sockets).
 - [x] **Heredocs** in `RUN`, `COPY` and `ADD`, including `#!` scripts.
 - [x] **`ADD <url>`**, with `--checksum=sha256:...`. Git URLs are not
   supported.
@@ -72,6 +73,18 @@ fail with a clear message.
   names.
 - [x] **`build --param` and `--sysv`**: jail parameters and SysV IPC for
   `RUN` steps.
+- [ ] **Expand variables while tokenizing, as Docker does.** Words are
+  split and unquoted at parse time and expanded at build time, with an
+  escaped or single-quoted `$` kept as `\$` in between. Two cases still
+  differ from Docker:
+  - An escaped backslash before a variable (`ENV P=a\\$VAR`) gives
+    `a$VAR`, not `a\` and the value.
+  - With `# escape=` set to a backtick, a literal `\` before `$` (as in
+    `C:\$VAR`) still stops the expansion.
+
+  Fix: keep each word's raw text and quoting in the parsed instruction,
+  then unquote, unescape (with the file's escape character) and expand in
+  one pass at build time, as BuildKit's shell lexer does.
 
 ## 4. Nice to have
 
