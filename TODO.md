@@ -73,18 +73,36 @@ fail with a clear message.
   names.
 - [x] **`build --param` and `--sysv`**: jail parameters and SysV IPC for
   `RUN` steps.
-- [ ] **Expand variables while tokenizing, as Docker does.** Words are
-  split and unquoted at parse time and expanded at build time, with an
-  escaped or single-quoted `$` kept as `\$` in between. Two cases still
-  differ from Docker:
-  - An escaped backslash before a variable (`ENV P=a\\$VAR`) gives
-    `a$VAR`, not `a\` and the value.
-  - With `# escape=` set to a backtick, a literal `\` before `$` (as in
-    `C:\$VAR`) still stops the expansion.
+- [ ] **Expand variables while tokenizing, as Docker does.** A `\` just
+  before a `$` can stop a variable from expanding, in two cases (with
+  `ARG VAR=x`):
 
-  Fix: keep each word's raw text and quoting in the parsed instruction,
-  then unquote, unescape (with the file's escape character) and expand in
-  one pass at build time, as BuildKit's shell lexer does.
+  | Containerfile | Docker | jailer |
+  |---|---|---|
+  | `ENV P=a\\$VAR` | `a\x` | `a$VAR` |
+  | `# escape=` (a backtick), then `ENV P=C:\$VAR` | `C:\x` | `C:$VAR` |
+
+  Both are rare: a literal backslash right before a variable, mostly in
+  Windows-style paths.
+
+  Why: jailer handles a word in two passes. At parse time it splits the
+  word and takes its quotes and escapes away. At build time, once the
+  values of build args and `ENV` are known, it expands `$VAR`. An escaped
+  `$` (`\$`) or one in single quotes (`'$VAR'`) must not expand. The first
+  pass can only pass that on by leaving a `\` before the `$`, and the
+  second pass reads any `\` before a `$` as that mark. So a real
+  backslash that ends up before a `$` is taken for the mark. In the
+  first case it is the backslash `\\` stands for. In the second, with
+  the backtick as the escape, `\` is an ordinary character.
+
+  Fix: do it in one pass, as BuildKit's shell lexer does. Keep each
+  word's raw text in the parsed instruction. Then at build time read it
+  once, character by character: quotes, escapes (with the file's escape
+  character) and variables together, so an escaped `$` is known as such
+  and needs no mark. It touches every instruction that takes words (ARG,
+  ENV, LABEL, COPY and ADD, EXPOSE, VOLUME, FROM, WORKDIR, USER,
+  STOPSIGNAL, mount options), so it wants a test of each against
+  Docker's results.
 
 ## 4. Nice to have
 
