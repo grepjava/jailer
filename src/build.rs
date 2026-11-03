@@ -754,7 +754,7 @@ async fn execute_instruction(
                     run_env.push(format!("{k}={v}"));
                 }
             }
-            let mounts =
+            let mut mounts =
                 RunMounts::prepare(env, completed_stages, vars, step_no, run_opts, sp.line).await?;
             for e in &mounts.env {
                 let name = e.split('=').next().unwrap_or("");
@@ -819,6 +819,7 @@ async fn execute_instruction(
                         )));
                     }
                     let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
+                    mounts.place_ssh(&stage.root, sp.line)?;
                     let mut id = [0u8; 6];
                     getrandom::fill(&mut id).expect("random bytes");
                     let name: String = std::iter::once("jailer_build_".to_owned())
@@ -881,8 +882,21 @@ struct RunMounts {
     temp: Vec<PathBuf>,
     /// Variables the step gets, such as `SSH_AUTH_SOCK`.
     env: Vec<String>,
+    /// SSH agents to give the step, placed by [`RunMounts::place_ssh`].
+    ssh: Vec<SshMount>,
     /// Tasks relaying SSH agent connections, stopped on drop.
     relays: Vec<tokio::task::JoinHandle<()>>,
+    /// What placing the agents made in the root: sockets, and the
+    /// directories made for them, deepest first. Removed on drop.
+    placed: Vec<PathBuf>,
+}
+
+struct SshMount {
+    agent: PathBuf,
+    target: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 impl RunMounts {
@@ -910,7 +924,9 @@ impl RunMounts {
             },
             temp: Vec::new(),
             env: Vec::new(),
+            ssh: Vec::new(),
             relays: Vec::new(),
+            placed: Vec::new(),
         };
         for (i, m) in opts.mounts.iter().enumerate() {
             let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
@@ -1039,10 +1055,15 @@ impl RunMounts {
                         }
                         continue;
                     };
-                    std::fs::write(&scratch, value)?;
+                    write_private(&scratch, value)?;
                     out.temp.push(scratch.clone());
                     set_owner_mode(&scratch, *uid, *gid, *mode)?;
+                    // Not the value: a key may be shared in a registry cache.
                     out.key.push_str(&format!("\0secret {id} {target}"));
+                    if (*mode, *uid, *gid) != (0o400, 0, 0) {
+                        out.key
+                            .push_str(&format!(" mode={mode:o} uid={uid} gid={gid}"));
+                    }
                     out.mounts.push(StepMount::Nullfs {
                         source: scratch,
                         target: target.clone(),
@@ -1072,28 +1093,23 @@ impl RunMounts {
                         }
                         continue;
                     };
-                    // nullfs mounts files and directories, not sockets: the
-                    // step gets a socket of its own in a directory mounted at
-                    // the target's, and jailer relays its connections.
-                    let (dir, name) = match target.rsplit_once('/') {
-                        Some((d, n)) if !n.is_empty() => (if d.is_empty() { "/" } else { d }, n),
-                        _ => {
-                            return Err(Error::Build(format!(
-                                "line {line}: ssh mount target {target:?}: give a socket path"
-                            )));
-                        }
-                    };
-                    std::fs::create_dir_all(&scratch)?;
-                    out.temp.push(scratch.clone());
-                    let sock = scratch.join(name);
-                    out.relays.push(relay_ssh_agent(&sock, agent, line)?);
-                    set_owner_mode(&sock, *uid, *gid, *mode)?;
+                    if !target.rsplit_once('/').is_some_and(|(_, n)| !n.is_empty()) {
+                        return Err(Error::Build(format!(
+                            "line {line}: ssh mount target {target:?}: give a socket path"
+                        )));
+                    }
                     out.key.push_str(&format!("\0ssh {id} {target}"));
+                    if (*mode, *uid, *gid) != (0o600, 0, 0) {
+                        out.key
+                            .push_str(&format!(" mode={mode:o} uid={uid} gid={gid}"));
+                    }
                     out.env.push(format!("SSH_AUTH_SOCK={target}"));
-                    out.mounts.push(StepMount::Nullfs {
-                        source: scratch,
-                        target: dir.to_owned(),
-                        read_only: false,
+                    out.ssh.push(SshMount {
+                        agent: agent.clone(),
+                        target: target.clone(),
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
                     });
                 }
             }
@@ -1102,10 +1118,62 @@ impl RunMounts {
     }
 }
 
+impl RunMounts {
+    /// Puts a socket relaying each SSH agent at its target in `root`, for
+    /// the step only: nullfs mounts files and directories, not sockets, and
+    /// a directory mounted for one would hide what the image has there.
+    /// Called once the tree before the step is taken, so that neither the
+    /// socket nor a directory made for it is in the step's layer.
+    fn place_ssh(&mut self, root: &Path, line: usize) -> Result<(), Error> {
+        for m in std::mem::take(&mut self.ssh) {
+            let (dir, name) = m.target.rsplit_once('/').unwrap_or(("", &m.target));
+            let dir = resolve_in_root(root, dir.trim_start_matches('/'), true)
+                .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
+            let mut missing = Vec::new();
+            let mut d = dir.as_path();
+            while std::fs::symlink_metadata(d).is_err() {
+                missing.push(d.to_path_buf());
+                d = d.parent().unwrap_or(root);
+            }
+            std::fs::create_dir_all(&dir)?;
+            let sock = dir.join(name);
+            let relay = if std::fs::symlink_metadata(&sock).is_ok() {
+                Err(Error::Build(format!(
+                    "line {line}: ssh mount target {:?} is already in the image",
+                    m.target
+                )))
+            } else {
+                relay_ssh_agent(&dir, name, &m.agent, line)
+            };
+            match relay {
+                Ok(r) => {
+                    self.relays.push(r);
+                    self.placed.push(sock.clone());
+                    self.placed.extend(missing);
+                }
+                Err(e) => {
+                    self.placed.extend(missing);
+                    return Err(e);
+                }
+            }
+            set_owner_mode(&sock, m.uid, m.gid, m.mode)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for RunMounts {
     fn drop(&mut self) {
         for r in &self.relays {
             r.abort();
+        }
+        for p in &self.placed {
+            // A directory the step put something in stays, in its layer.
+            if p.is_dir() {
+                let _ = std::fs::remove_dir(p);
+            } else {
+                let _ = std::fs::remove_file(p);
+            }
         }
         for p in &self.temp {
             let _ = layer::remove_tree(p);
@@ -1113,15 +1181,20 @@ impl Drop for RunMounts {
     }
 }
 
-/// Listens at `sock` and passes each connection on to the SSH agent at
-/// `agent`.
+/// Listens at `name` in `dir` and passes each connection on to the SSH
+/// agent at `agent`.
 #[cfg(unix)]
 fn relay_ssh_agent(
-    sock: &Path,
+    dir: &Path,
+    name: &str,
     agent: &Path,
     line: usize,
 ) -> Result<tokio::task::JoinHandle<()>, Error> {
-    let listener = tokio::net::UnixListener::bind(sock)
+    let listener = bind_socket(dir, name)
+        .and_then(|l| {
+            l.set_nonblocking(true)?;
+            tokio::net::UnixListener::from_std(l)
+        })
         .map_err(|e| Error::Build(format!("line {line}: ssh mount: {e}")))?;
     let agent = agent.to_path_buf();
     Ok(tokio::spawn(async move {
@@ -1136,8 +1209,68 @@ fn relay_ssh_agent(
     }))
 }
 
+/// A socket listening at `name` in `dir`, bound there by `bindat(2)`: a
+/// path in a stage's root may be longer than a socket address holds.
+#[cfg(target_os = "freebsd")]
+fn bind_socket(dir: &Path, name: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn bindat(
+            fd: libc::c_int,
+            s: libc::c_int,
+            addr: *const libc::sockaddr,
+            len: libc::socklen_t,
+        ) -> libc::c_int;
+    }
+    let last = std::io::Error::last_os_error;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: plain system calls on a valid path and address, and on
+    // descriptors owned here from the moment they are made.
+    unsafe {
+        let d = libc::open(c.as_ptr(), libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if d < 0 {
+            return Err(last());
+        }
+        let d = OwnedFd::from_raw_fd(d);
+        let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if s < 0 {
+            return Err(last());
+        }
+        let s = OwnedFd::from_raw_fd(s);
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = name.as_bytes();
+        if bytes.len() >= addr.sun_path.len() {
+            return Err(std::io::Error::other(format!(
+                "socket name {name:?} is too long"
+            )));
+        }
+        for (dst, b) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if bindat(d.as_raw_fd(), s.as_raw_fd(), (&raw const addr).cast(), len) != 0
+            || libc::listen(s.as_raw_fd(), 128) != 0
+        {
+            return Err(last());
+        }
+        Ok(std::os::unix::net::UnixListener::from(s))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "freebsd")))]
+fn bind_socket(dir: &Path, name: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    std::os::unix::net::UnixListener::bind(dir.join(name))
+}
+
 #[cfg(not(unix))]
-fn relay_ssh_agent(_: &Path, _: &Path, line: usize) -> Result<tokio::task::JoinHandle<()>, Error> {
+fn relay_ssh_agent(
+    _: &Path,
+    _: &str,
+    _: &Path,
+    line: usize,
+) -> Result<tokio::task::JoinHandle<()>, Error> {
     Err(Error::Build(format!(
         "line {line}: ssh mounts need a FreeBSD host"
     )))
@@ -2050,6 +2183,17 @@ fn apply_perms(
     Ok(())
 }
 
+/// Writes `data` to a new file at `path`, readable only by its owner from
+/// the start.
+fn write_private(path: &Path, data: &[u8]) -> Result<(), Error> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    std::io::Write::write_all(&mut o.open(path)?, data)?;
+    Ok(())
+}
+
 fn set_env(env: &mut Vec<String>, key: &str, value: &str) {
     let prefix = format!("{key}=");
     if let Some(slot) = env.iter_mut().find(|e| e.starts_with(&prefix)) {
@@ -2149,11 +2293,7 @@ async fn build_with_buildah(
     for (i, (id, data)) in opts.secrets.iter().enumerate() {
         std::fs::create_dir_all(&secrets_dir)?;
         let path = secrets_dir.join(i.to_string());
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        std::io::Write::write_all(&mut o.open(&path)?, data)?;
+        write_private(&path, data)?;
         cmd.arg("--secret")
             .arg(format!("id={id},src={}", path.display()));
     }

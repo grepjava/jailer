@@ -232,8 +232,10 @@ RUN env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null \
 WORKDIR /app
 COPY . .
 USER nobody
-CMD ["/usr/local/bin/python3", "-m", "{app_name}"]
-"#
+CMD ["/usr/local/bin/python3", "-m", "{module}"]
+"#,
+            // A module's name has no hyphens: `my-app` is `my_app`.
+            module = app_name.replace('-', "_")
         ),
         Template::C => format!(
             r#"# Syntax: FreeBSD OCI image for Legion

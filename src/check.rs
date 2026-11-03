@@ -87,12 +87,18 @@ pub fn check_containerfile(cf: &Containerfile, target: Option<&str>) -> CheckRep
                     ),
                 );
             }
-            Instruction::Run(cmd, _) => {
+            Instruction::Run(cmd, opts) => {
                 let text = match cmd {
                     crate::containerfile::CommandForm::Shell(s) => s.clone(),
                     crate::containerfile::CommandForm::Exec(v) => v.join(" "),
                 };
-                if text.contains("pkg install") && !text.contains("pkg clean") {
+                // A cache mounted there keeps the packages out of the layer,
+                // and cleaning would empty the cache.
+                let cached = opts.mounts.iter().any(|m| {
+                    matches!(m, crate::containerfile::RunMount::Cache { target, .. }
+                        if target.trim_end_matches('/') == "/var/cache/pkg")
+                });
+                if text.contains("pkg install") && !text.contains("pkg clean") && !cached {
                     report.warn(
                         "LEGION002",
                         format!(
@@ -319,6 +325,20 @@ mod tests {
                 .count(),
             1
         );
+
+        // `pkg install` over a cache mount of /var/cache/pkg leaves nothing
+        // to clean.
+        let pkg = |run: &str| {
+            let cf = Containerfile::parse(&format!("FROM scratch\n{run}\n")).unwrap();
+            check_containerfile(&cf, None)
+                .findings
+                .iter()
+                .any(|f| f.code == "LEGION002")
+        };
+        assert!(pkg("RUN pkg install -y curl"));
+        assert!(!pkg(
+            "RUN --mount=type=cache,target=/var/cache/pkg pkg install -y curl"
+        ));
 
         // With `--target`, the stage built is checked, not the last.
         let cf = Containerfile::parse(

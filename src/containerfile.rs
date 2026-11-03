@@ -949,11 +949,19 @@ fn parse_key_values(
     Ok(out)
 }
 
+/// Splits `s` into words, taking quotes and escapes away. A `$` escaped
+/// or in single quotes is left as `\$`, which [`expand_vars`] keeps.
 fn tokenize_words(s: &str, escape: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut chars = s.chars().peekable();
     let mut quote: Option<char> = None;
+    let literal = |cur: &mut String, c: char| {
+        if c == '$' {
+            cur.push('\\');
+        }
+        cur.push(c);
+    };
 
     while let Some(c) = chars.next() {
         match quote {
@@ -962,8 +970,10 @@ fn tokenize_words(s: &str, escape: char) -> Vec<String> {
                     quote = None;
                 } else if c == escape && q == '"' {
                     if let Some(next) = chars.next() {
-                        cur.push(next);
+                        literal(&mut cur, next);
                     }
+                } else if q == '\'' {
+                    literal(&mut cur, c);
                 } else {
                     cur.push(c);
                 }
@@ -977,7 +987,7 @@ fn tokenize_words(s: &str, escape: char) -> Vec<String> {
                     }
                 } else if c == escape {
                     if let Some(next) = chars.next() {
-                        cur.push(next);
+                        literal(&mut cur, next);
                     }
                 } else {
                     cur.push(c);
@@ -1263,6 +1273,20 @@ CMD ["--serve"]
             "freebsd-runtime:15.1"
         );
         assert_eq!(expand_vars("${MISSING:-fallback}", &vars), "fallback");
+
+        // An escaped `$`, or one in single quotes, is not expanded.
+        let Instruction::Env(pairs) = parse_instruction(
+            "ENV",
+            r#"A=\$REL B='$REL' C="\$REL" D="$REL""#,
+            1,
+            '\\',
+            vec![],
+        )
+        .unwrap() else {
+            panic!("not ENV")
+        };
+        let values: Vec<String> = pairs.iter().map(|(_, v)| expand_vars(v, &vars)).collect();
+        assert_eq!(values, ["$REL", "$REL", "$REL", "15.1"]);
 
         let ig = IgnoreMatcher::parse("target/\n*.log\n!keep.log\n");
         assert!(ig.is_ignored("target/debug/app"));

@@ -412,7 +412,9 @@ pub fn create_diff_layer(
     let mut deleted: Vec<String> = Vec::new();
     for old_path in before.entries.keys() {
         if !after.entries.contains_key(old_path) {
-            // Only emit a whiteout if its parent directory was not also deleted.
+            // Only emit a whiteout if its parent directory was not also
+            // deleted. One whose parent is now a file or a link is kept:
+            // it empties the directory before the layer replaces it.
             let parent_deleted = Path::new(old_path)
                 .parent()
                 .map(normalize_rel)
@@ -629,6 +631,25 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(target.join("usr/local/bin/app")).unwrap(),
             "#!/bin/sh\necho hi\n"
+        );
+
+        // A directory replaced by a file: whiteouts below it come first, so
+        // that an extractor going in order empties it before the file.
+        let before = TreeState::capture(&root).unwrap();
+        remove_tree(&root.join("etc")).unwrap();
+        std::fs::write(root.join("etc"), "now a file").unwrap();
+        create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip).unwrap();
+        let mut archive = tar::Archive::new(File::open(&tar_out).unwrap());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["etc/.wh.keep.conf", "etc"]);
+        apply(&tar_out, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("etc")).unwrap(),
+            "now a file"
         );
     }
 

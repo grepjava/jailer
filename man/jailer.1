@@ -187,6 +187,11 @@ as a file at
 mode 0400 unless
 .Cm mode
 says otherwise.
+A step runs again when its secret's
+.Cm mode , uid
+or
+.Cm gid
+changes, but not when its value does.
 A missing secret is skipped, or fails the build with
 .Cm required .
 .It Fl -mount Ns = Ns Cm type=ssh
@@ -211,7 +216,9 @@ as a socket at
 named by
 .Ev SSH_AUTH_SOCK
 in the step.
-The target's directory is replaced for the step.
+The socket is there for the step only, and in no layer; the rest of
+its directory stays as the image has it.
+A target already in the image fails the build.
 The socket has mode 0600 and belongs to root unless
 .Cm mode , uid
 and

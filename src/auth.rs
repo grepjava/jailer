@@ -143,7 +143,13 @@ pub fn save_credentials(
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(&cfg)?;
-    std::fs::write(&path, bytes)?;
+    // A new file is its owner's alone from the start; one there already
+    // (or a link to one, as dotfiles keep it) is written in place.
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    std::io::Write::write_all(&mut file.open(&path)?, &bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -377,9 +377,19 @@ mod containers {
         id: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        let pod = pod_of(rt, id).await?;
         rt.stop(id, timeout).await?;
-        if let Some(p) = pod {
+        stop_pod(rt, sys, leases, id).await
+    }
+
+    /// Stops the pod of a container that has stopped, freeing its address
+    /// and ports.
+    pub async fn stop_pod(
+        rt: &JailRuntime,
+        sys: &dyn Sys,
+        leases: &Leases,
+        id: &str,
+    ) -> Result<(), Error> {
+        if let Some(p) = pod_of(rt, id).await? {
             match rt.stop(&p, Duration::ZERO).await {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
                 _ => {}
@@ -411,7 +421,7 @@ mod containers {
 }
 
 #[cfg(unix)]
-pub use containers::{create, remove, stop};
+pub use containers::{create, remove, stop, stop_pod};
 
 /// Elsewhere than FreeBSD there are no jails: the store and builds work,
 /// up to a `RUN` step.

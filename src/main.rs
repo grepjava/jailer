@@ -1067,7 +1067,10 @@ async fn run() -> Result<()> {
                 (Some(out), [img]) => (img.clone(), out.clone()),
                 (Some(out), []) => (default_local_image_for_cwd(), out.clone()),
                 (None, [single]) => {
-                    if single.ends_with(".tar") || single.contains(['/', '\\']) {
+                    // An image the store has, as `localhost/app:1`, is the
+                    // image; otherwise a path is the output.
+                    let is_image = !single.ends_with(".tar") && store.find(single)?.is_some();
+                    if !is_image && (single.ends_with(".tar") || single.contains(['/', '\\'])) {
                         (default_local_image_for_cwd(), PathBuf::from(single))
                     } else {
                         (single.clone(), PathBuf::from("app.tar"))
@@ -1120,8 +1123,14 @@ async fn run() -> Result<()> {
             }
 
             let (_, store, _) = open_context(&cli, true)?;
+            // A directory's image is tagged as `jailer build` tags it.
             let img_lookup = if target == "." {
                 default_local_image_for_cwd()
+            } else if path.is_dir() {
+                format!(
+                    "localhost/{}:latest",
+                    detect_app_name(path).to_ascii_lowercase()
+                )
             } else {
                 target.clone()
             };
@@ -1427,6 +1436,8 @@ async fn containers(cli: &Cli) -> Result<()> {
                 if let Err(e) = runtime.start(&id).await {
                     if *rm {
                         let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
+                    } else {
+                        let _ = jailer::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
                     }
                     return Err(e.into());
                 }
@@ -1436,6 +1447,9 @@ async fn containers(cli: &Cli) -> Result<()> {
             let code = runtime.run_attached(&id, *interactive, *tty).await;
             if auto_rm {
                 let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
+            } else {
+                // Kept by `--name`, stopped: its pod lets go of its ports.
+                let _ = jailer::runtime::stop_pod(&runtime, &*sys, &leases, &id).await;
             }
             let code = code?;
             if code != 0 {
