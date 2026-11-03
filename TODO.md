@@ -90,12 +90,12 @@ fail with a clear message.
   client are Legion's `legion-image`, and containers and `RUN` steps
   Legion's `legion-jail` (v0.1.1): `jailer run` gets Legion's security
   defaults, and `--vnet` runs a pod as a node does.
-- [ ] **Same config, different layers.** Legion's store keeps one image
+- [x] **Same config, different layers.** Legion's store keeps one image
   per config digest, so a gzip and a zstd build of one Containerfile
   (same diff_ids, so same config) become one image: the later build's
   layers replace the earlier's under both tags, and the record's manifest
-  digest stays the first build's. Fixed in Legion's main (an image is its
-  config and manifest digests together); move to the next Legion tag.
+  digest stays the first build's. Fixed in Legion v0.1.7 (an image is its
+  config and manifest digests together).
 
 ## 5. Later
 

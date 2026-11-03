@@ -937,9 +937,9 @@ impl RunMounts {
                     let src =
                         if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
                         {
-                            let skip = |rel: &str| ignore.is_ignored(rel);
+                            let skip = |p: &Path| ignore.is_ignored(&rel_path(p, context_dir));
                             let copier = Copier::new(&scratch, None, None, false);
-                            copier.dir(context_dir, &src, &scratch, &skip)?;
+                            copier.dir(&src, &scratch, &skip)?;
                             copier.finish()?;
                             out.temp.push(scratch.clone());
                             scratch
@@ -1274,7 +1274,9 @@ impl CopyExtras {
             .map(|s| expand_vars(s, vars))
             .filter(|s| is_add && is_url(s))
             .collect();
-        if spec.checksum.is_some() && (urls.len() != 1 || spec.sources.len() != 1) {
+        if spec.checksum.is_some()
+            && (urls.len() != 1 || spec.sources.len() != 1 || !spec.heredocs.is_empty())
+        {
             return Err(Error::Build(format!(
                 "line {line}: ADD --checksum needs exactly one http(s) source"
             )));
@@ -1405,7 +1407,15 @@ fn apply_copy(
             .collect::<Vec<_>>()
             .join("\n"),
     );
-    let skip = |rel: &str| (use_ignore && ignore.is_ignored(rel)) || exclude.is_ignored(rel);
+    let ignored = |p: &Path| use_ignore && ignore.is_ignored(&rel_path(p, src_root));
+    // `--exclude` is matched below each source, and a source by its name.
+    let excluded = |p: &Path, source: &Path| {
+        exclude.is_ignored(&if p == source {
+            rel_path(p, src_root).rsplit('/').next().unwrap_or("").to_owned()
+        } else {
+            rel_path(p, source)
+        })
+    };
 
     let chown_ids = match &spec.chown {
         Some(ch) => {
@@ -1468,17 +1478,21 @@ fn apply_copy(
         };
         let pivot_root = resolve_in_root(src_root, pivot.trim_start_matches('/'), true)
             .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
-        let matches = resolve_source_paths(src_root, &pattern, line_no)?;
+        // A source .containerignore leaves out is not in the context.
+        let matches: Vec<PathBuf> = resolve_source_paths(src_root, &pattern, line_no)?
+            .into_iter()
+            .filter(|m| !ignored(m))
+            .collect();
         if matches.is_empty() {
             return Err(Error::Build(format!(
                 "line {line_no}: source {src_pat:?} not found"
             )));
         }
         for m in matches {
-            let rel = m.strip_prefix(src_root).unwrap_or(&m);
-            if skip(&rel.to_string_lossy().replace('\\', "/")) {
+            if excluded(&m, &m) {
                 continue;
             }
+            let rel = m.strip_prefix(src_root).unwrap_or(&m);
             let kept = m.strip_prefix(&pivot_root).unwrap_or(rel).to_path_buf();
             matched_sources.push((m, kept));
         }
@@ -1488,14 +1502,13 @@ fn apply_copy(
         let meta = std::fs::symlink_metadata(&src_path)?;
         if meta.is_dir() {
             copier.dir(
-                src_root,
                 &src_path,
                 &if spec.parents {
                     resolve_below(&stage.root, &dst_base.join(&kept), true)?
                 } else {
                     dst_base.clone()
                 },
-                &skip,
+                &|p| ignored(p) || excluded(p, &src_path),
             )?;
         } else if is_add && is_archive_name(&src_path) {
             // Read, not copied: a link to it is followed inside the root.
@@ -1506,10 +1519,10 @@ fn apply_copy(
                     src_path.display()
                 )));
             }
+            // tar finds the compression itself; the archive has no diff_id
+            // to check.
             std::fs::create_dir_all(&dst_base)?;
-            let tmp_tar = tempfile::NamedTempFile::new()?;
-            layer::decompress(&archive, "", tmp_tar.path())?;
-            layer::extract(tmp_tar.path(), &dst_base)?;
+            layer::extract(&archive, &dst_base)?;
         } else if spec.parents {
             let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
             let parent = resolve_below(&stage.root, &parent, true)?;
@@ -1526,6 +1539,14 @@ fn apply_copy(
         place_file(extra, &dst_base)?;
     }
     copier.finish()
+}
+
+/// `p` below `base`, with `/` between its components.
+fn rel_path(p: &Path, base: &Path) -> String {
+    p.strip_prefix(base)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn is_archive_name(p: &Path) -> bool {
@@ -1714,10 +1735,9 @@ impl Copier {
     /// names (by path below `root`).
     fn dir(
         &self,
-        root: &Path,
         src_dir: &Path,
         dst_dir: &Path,
-        skip: &dyn Fn(&str) -> bool,
+        skip: &dyn Fn(&Path) -> bool,
     ) -> Result<(), Error> {
         let made = std::fs::symlink_metadata(dst_dir).is_err();
         std::fs::create_dir_all(dst_dir)?;
@@ -1734,15 +1754,14 @@ impl Copier {
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
             let path = entry.path();
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            if skip(&rel.to_string_lossy().replace('\\', "/")) {
+            if skip(&path) {
                 continue;
             }
             let target = dst_dir.join(entry.file_name());
             if std::fs::symlink_metadata(&path)?.is_dir() {
                 // A directory already there may be a link, as `/home` is.
                 let target = resolve_below(&self.root, &target, true)?;
-                self.dir(root, &path, &target, skip)?;
+                self.dir(&path, &target, skip)?;
             } else {
                 self.entry(&path, &target)?;
             }
@@ -1754,8 +1773,17 @@ impl Copier {
     /// Copies the file or link `src` to `dst`, replacing what is there.
     fn entry(&self, src: &Path, dst: &Path) -> Result<(), Error> {
         let meta = std::fs::symlink_metadata(src)?;
+        let key = layer::inode(&meta).filter(|_| !meta.file_type().is_symlink());
+        if let Some(key) = key
+            && self.linked.borrow().get(&key).is_some_and(|first| first == dst)
+        {
+            // Copied there already, by another name for the same file.
+            return Ok(());
+        }
         if std::fs::symlink_metadata(dst).is_ok() {
             layer::remove_tree(dst)?;
+            // What was there is no longer a copy to link to.
+            self.linked.borrow_mut().retain(|_, p| !p.starts_with(dst));
         }
         if meta.file_type().is_symlink() {
             #[cfg(unix)]
@@ -1766,7 +1794,7 @@ impl Copier {
             #[cfg(windows)]
             let _ = std::fs::copy(src, dst);
         } else {
-            if let Some(key) = layer::inode(&meta) {
+            if let Some(key) = key {
                 let first = self.linked.borrow().get(&key).cloned();
                 if let Some(first) = first {
                     // The first copy has the owner, mode and flags.

@@ -1021,6 +1021,8 @@ pub struct IgnoreMatcher {
 #[derive(Debug, Clone)]
 struct IgnoreRule {
     negated: bool,
+    /// Begun with `/`: matched from the context's top only.
+    anchored: bool,
     pattern: String,
 }
 
@@ -1046,11 +1048,14 @@ impl IgnoreMatcher {
                 Some(rest) => (true, rest.trim()),
                 None => (false, t),
             };
-            let pat = pat.trim_matches('/').replace('\\', "/");
+            let pat = pat.replace('\\', "/");
+            let anchored = pat.starts_with('/');
+            let pat = pat.trim_matches('/');
             if !pat.is_empty() {
                 rules.push(IgnoreRule {
                     negated,
-                    pattern: pat,
+                    anchored,
+                    pattern: pat.to_owned(),
                 });
             }
         }
@@ -1064,7 +1069,7 @@ impl IgnoreMatcher {
         }
         let mut ignored = false;
         for rule in &self.rules {
-            if matches_ignore(&rule.pattern, &rel) {
+            if matches_ignore(rule, &rel) {
                 ignored = !rule.negated;
             }
         }
@@ -1072,21 +1077,20 @@ impl IgnoreMatcher {
     }
 }
 
-fn matches_ignore(pattern: &str, path: &str) -> bool {
-    if pattern == "*" || pattern == "**" {
-        return true;
-    }
-    if path == pattern || path.starts_with(&format!("{pattern}/")) {
-        return true;
-    }
-    // Match basename if pattern has no `/`
-    if !pattern.contains('/') {
-        let base = path.rsplit('/').next().unwrap_or(path);
-        if glob_match(pattern, base) {
+/// Whether `rule` matches `path` or a directory it is in. A pattern
+/// without `/`, unless anchored, matches a name at any depth.
+fn matches_ignore(rule: &IgnoreRule, path: &str) -> bool {
+    let pattern = rule.pattern.as_str();
+    let by_name = !rule.anchored && !pattern.contains('/');
+    let mut prefix_end = 0;
+    for comp in path.split('/') {
+        prefix_end += comp.len();
+        if glob_match(pattern, &path[..prefix_end]) || (by_name && glob_match(pattern, comp)) {
             return true;
         }
+        prefix_end += 1;
     }
-    glob_match(pattern, path)
+    false
 }
 
 pub fn glob_match(pat: &str, text: &str) -> bool {
@@ -1098,7 +1102,21 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
 fn glob_rec(p: &[char], t: &[char]) -> bool {
     match (p.first(), t.first()) {
         (None, None) => true,
-        (Some('*'), _) => glob_rec(&p[1..], t) || (!t.is_empty() && glob_rec(p, &t[1..])),
+        // `**` crosses directories, and `**/` may stand for none.
+        (Some('*'), _) if p.get(1) == Some(&'*') => {
+            let mut rest = &p[2..];
+            while rest.first() == Some(&'*') {
+                rest = &rest[1..];
+            }
+            if rest.first() == Some(&'/') && glob_rec(&rest[1..], t) {
+                return true;
+            }
+            (0..=t.len()).any(|i| glob_rec(rest, &t[i..]))
+        }
+        // `*` stays within a name.
+        (Some('*'), _) => {
+            glob_rec(&p[1..], t) || (t.first().is_some_and(|c| *c != '/') && glob_rec(p, &t[1..]))
+        }
         (Some('?'), Some(c)) if *c != '/' => glob_rec(&p[1..], &t[1..]),
         (Some('['), Some(c)) if *c != '/' => match glob_class(&p[1..], *c) {
             Some((hit, rest)) => hit && glob_rec(rest, &t[1..]),
@@ -1194,6 +1212,17 @@ CMD ["--serve"]
         assert!(ig.is_ignored("build.log"));
         assert!(!ig.is_ignored("keep.log"));
         assert!(!ig.is_ignored("src/main.rs"));
+
+        // `/` anchors; `*` stays within a name, `**` does not; a directory
+        // matched leaves out what is in it.
+        let ig = IgnoreMatcher::parse("/build\na/*.txt\nlogs/**/*.log\nsecret\n");
+        assert!(ig.is_ignored("build/out"));
+        assert!(!ig.is_ignored("src/build"));
+        assert!(ig.is_ignored("a/b.txt"));
+        assert!(!ig.is_ignored("a/b/c.txt"));
+        assert!(ig.is_ignored("logs/x.log"));
+        assert!(ig.is_ignored("logs/1/2/x.log"));
+        assert!(ig.is_ignored("deep/secret/key"));
     }
 
     #[test]

@@ -255,7 +255,16 @@ the context's) root, and
 .Ql ..
 stops there, so a copy never reads or writes outside it.
 .It
-.Cm COPY Fl -exclude Ns = Ns Ar pattern ,
+.Cm COPY Fl -exclude Ns = Ns Ar pattern
+(matched below each source, as
+.Pa .containerignore
+patterns are below the context: one without
+.Ql /
+names a file at any depth, a leading
+.Ql /
+anchors it, and only
+.Ql **
+crosses directories),
 .Fl -parents ,
 which keeps each source's path below the destination
 (or the part after

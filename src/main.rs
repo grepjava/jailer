@@ -480,7 +480,15 @@ pub enum Commands {
 fn parse_secrets(specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
     for spec in specs {
-        let kv: BTreeMap<&str, &str> = spec.split(',').filter_map(|p| p.split_once('=')).collect();
+        let mut kv = BTreeMap::new();
+        for part in spec.split(',') {
+            match part.split_once('=') {
+                Some((k @ ("id" | "src" | "source" | "env"), v)) => {
+                    kv.insert(k, v);
+                }
+                _ => bail!("--secret {spec:?}: {part:?} is not id=, src= or env="),
+            }
+        }
         let id = kv
             .get("id")
             .with_context(|| format!("--secret {spec:?}: give id=ID"))?;

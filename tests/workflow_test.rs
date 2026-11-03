@@ -615,6 +615,64 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
             .iter()
             .all(|d| d.media_type.ends_with("tar+gzip"))
     );
+    // One config with other blobs is another image: the zstd build keeps
+    // its own.
+    let kept = store.get("localhost/zstd:1").unwrap().unwrap();
+    assert_eq!(kept.digest, zstd.digest);
+    assert!(
+        kept.layer_descriptors
+            .iter()
+            .all(|d| d.media_type.ends_with("tar+zstd"))
+    );
+
+    // `ADD` unpacks an archive from the context, compressed or not.
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(pack.join("inner")).unwrap();
+    std::fs::write(pack.join("inner/packed.txt"), "packed").unwrap();
+    for (name, flag) in [("plain.tar", "-cf"), ("zipped.tar.gz", "-czf")] {
+        let status = std::process::Command::new("tar")
+            .arg(flag)
+            .arg(ctx.join(name))
+            .arg("-C")
+            .arg(&pack)
+            .arg("inner")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    write_cf("FROM scratch\nADD plain.tar /plain/\nADD zipped.tar.gz /zipped/\n".to_owned());
+    let unpacked = build(&store, &runtime, &opts("unpacked:1"))
+        .await
+        .unwrap()
+        .image;
+    let got = files(&unpacked);
+    assert_eq!(got["plain/inner/packed.txt"], "packed");
+    assert_eq!(got["zipped/inner/packed.txt"], "packed");
+
+    // `--exclude` is matched below the source; a source .containerignore
+    // leaves out is not found, and `/` anchors a pattern at the top.
+    write_cf("FROM scratch\nCOPY --exclude=sub/x.md docs /docs/\n".to_owned());
+    let excluded = build(&store, &runtime, &opts("excluded:1"))
+        .await
+        .unwrap()
+        .image;
+    let got = files(&excluded);
+    assert!(got.contains_key("docs/README.md"));
+    assert!(!got.contains_key("docs/sub/x.md"));
+    std::fs::write(ctx.join(".containerignore"), "/guide.txt\nonbuild.txt\n").unwrap();
+    write_cf("FROM scratch\nCOPY docs /docs/\n".to_owned());
+    let anchored = build(&store, &runtime, &opts("anchored:1"))
+        .await
+        .unwrap()
+        .image;
+    assert!(files(&anchored).contains_key("docs/guide.txt"));
+    write_cf("FROM scratch\nCOPY onbuild.txt /o.txt\n".to_owned());
+    let err = build(&store, &runtime, &opts("ignored:1"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not found"), "{err}");
+    std::fs::remove_file(ctx.join(".containerignore")).unwrap();
 
     // Failures name the problem.
     for (cf, msg) in [

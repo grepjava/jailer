@@ -197,8 +197,9 @@ pub fn check_image(config: &ImageConfig, rootfs: Option<&Path>) -> CheckReport {
         }
 
         if !config.config.working_dir.is_empty() {
-            let wd = root.join(config.config.working_dir.trim_start_matches('/'));
-            if !wd.is_dir() {
+            // Links in it are followed inside the image, as the jail would.
+            let wd = crate::build::resolve_in_jail(root, &config.config.working_dir, true);
+            if !wd.is_ok_and(|wd| wd.is_dir()) {
                 report.warn(
                     "LEGION010",
                     format!(
