@@ -73,36 +73,18 @@ fail with a clear message.
   names.
 - [x] **`build --param` and `--sysv`**: jail parameters and SysV IPC for
   `RUN` steps.
-- [ ] **Expand variables while tokenizing, as Docker does.** A `\` just
-  before a `$` can stop a variable from expanding, in two cases (with
-  `ARG VAR=x`):
-
-  | Containerfile | Docker | jailer |
-  |---|---|---|
-  | `ENV P=a\\$VAR` | `a\x` | `a$VAR` |
-  | `# escape=` (a backtick), then `ENV P=C:\$VAR` | `C:\x` | `C:$VAR` |
-
-  Both are rare: a literal backslash right before a variable, mostly in
-  Windows-style paths.
-
-  Why: jailer handles a word in two passes. At parse time it splits the
-  word and takes its quotes and escapes away. At build time, once the
-  values of build args and `ENV` are known, it expands `$VAR`. An escaped
-  `$` (`\$`) or one in single quotes (`'$VAR'`) must not expand. The first
-  pass can only pass that on by leaving a `\` before the `$`, and the
-  second pass reads any `\` before a `$` as that mark. So a real
-  backslash that ends up before a `$` is taken for the mark. In the
-  first case it is the backslash `\\` stands for. In the second, with
-  the backtick as the escape, `\` is an ordinary character.
-
-  Fix: do it in one pass, as BuildKit's shell lexer does. Keep each
-  word's raw text in the parsed instruction. Then at build time read it
-  once, character by character: quotes, escapes (with the file's escape
-  character) and variables together, so an escaped `$` is known as such
-  and needs no mark. It touches every instruction that takes words (ARG,
-  ENV, LABEL, COPY and ADD, EXPOSE, VOLUME, FROM, WORKDIR, USER,
-  STOPSIGNAL, mount options), so it wants a test of each against
-  Docker's results.
+- [x] **A `\` before a `$` no longer stops a variable expanding.** With
+  `ARG VAR=x`, `ENV P=a\\$VAR` gives `a\x`, and with a backtick as the
+  escape `ENV P=C:\$VAR` gives `C:\x`, as in Docker (both gave a literal
+  `$VAR` before). The parser takes quotes and escapes away and the build
+  expands variables later, so a `$` that must not expand (escaped, or in
+  single quotes) is handed on with a mark. That mark was a `\`, which a
+  word can also hold for real; it is now a character no Containerfile
+  holds, and the parser's words expand with `expand_word`, where a `\`
+  is plain text. Text as written (a here-document's body, mount options)
+  still takes `\$` for `$`. `WORKDIR`, `USER`, `STOPSIGNAL` and the
+  one-value `ENV` now have quotes and escapes taken away throughout, not
+  only around the whole value.
 
 ## 4. Nice to have
 

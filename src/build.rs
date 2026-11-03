@@ -12,7 +12,7 @@ use clap::ValueEnum;
 use crate::check::{CheckReport, check_containerfile, check_image};
 use crate::containerfile::{
     self, Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, Sharing,
-    expand_vars, glob_match,
+    expand_vars, expand_word, glob_match,
 };
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
@@ -177,7 +177,7 @@ pub async fn build(
     for (k, def) in &cf.global_args {
         let v = match build_args.get(k) {
             Some(v) => Some(v.clone()),
-            None => def.as_ref().map(|d| expand_vars(d, &from_vars)),
+            None => def.as_ref().map(|d| expand_word(d, &from_vars)),
         };
         if let Some(v) = v {
             global_vars.insert(k.clone(), v.clone());
@@ -236,9 +236,9 @@ pub async fn build(
     }
 
     for stage_def in &cf.stages {
-        let base_ref = expand_vars(&stage_def.base, &from_vars);
+        let base_ref = expand_word(&stage_def.base, &from_vars);
         if let Some(p) = &stage_def.platform {
-            let p = expand_vars(p, &from_vars);
+            let p = expand_word(p, &from_vars);
             let mut parts = p.split('/');
             if parts.next() != Some("freebsd") || parts.next() != Some(oci::arch()) {
                 return Err(Error::Build(format!(
@@ -603,7 +603,7 @@ async fn execute_instruction(
                 if let Some(val) = cli_build_args.get(name) {
                     vars.insert(name.clone(), val.clone());
                 } else if let Some(def) = default {
-                    let expanded = expand_vars(def, vars);
+                    let expanded = expand_word(def, vars);
                     vars.insert(name.clone(), expanded);
                 } else if let Some(val) = global_args.get(name) {
                     vars.entry(name.clone()).or_insert_with(|| val.clone());
@@ -615,7 +615,7 @@ async fn execute_instruction(
             // Each value sees the variables as they were before this `ENV`.
             let before = vars.clone();
             for (k, v) in pairs {
-                let expanded = expand_vars(v, &before);
+                let expanded = expand_word(v, &before);
                 vars.insert(k.clone(), expanded.clone());
                 set_env(&mut stage.config.config.env, k, &expanded);
             }
@@ -623,13 +623,13 @@ async fn execute_instruction(
         }
         Instruction::Label(pairs) => {
             for (k, v) in pairs {
-                let expanded = expand_vars(v, vars);
+                let expanded = expand_word(v, vars);
                 stage.config.config.labels.insert(k.clone(), expanded);
             }
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Workdir(wd) => {
-            let expanded = expand_vars(wd, vars);
+            let expanded = expand_word(wd, vars);
             let new_wd = if expanded.starts_with('/') {
                 expanded
             } else {
@@ -653,12 +653,12 @@ async fn execute_instruction(
             }
         }
         Instruction::User(u) => {
-            stage.config.config.user = expand_vars(u, vars);
+            stage.config.config.user = expand_word(u, vars);
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Expose(ports) => {
             for p in ports {
-                let expanded = expand_vars(p, vars);
+                let expanded = expand_word(p, vars);
                 let key = if expanded.contains('/') {
                     expanded
                 } else {
@@ -674,7 +674,7 @@ async fn execute_instruction(
         }
         Instruction::Volume(vols) => {
             for v in vols {
-                let expanded = expand_vars(v, vars);
+                let expanded = expand_word(v, vars);
                 stage
                     .config
                     .config
@@ -684,7 +684,7 @@ async fn execute_instruction(
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Stopsignal(sig) => {
-            stage.config.config.stop_signal = expand_vars(sig, vars);
+            stage.config.config.stop_signal = expand_word(sig, vars);
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Shell(sh) => {
@@ -710,7 +710,7 @@ async fn execute_instruction(
         Instruction::Copy(spec) | Instruction::Add(spec) => {
             let is_add = matches!(sp.instruction, Instruction::Add(_));
             let spec = &CopySpec {
-                from: spec.from.as_ref().map(|f| expand_vars(f, vars)),
+                from: spec.from.as_ref().map(|f| expand_word(f, vars)),
                 ..spec.clone()
             };
             let extras = CopyExtras::prepare(spec, vars, tmp_dir, is_add, sp.line).await?;
@@ -1493,7 +1493,7 @@ impl CopyExtras {
         let urls: Vec<String> = spec
             .sources
             .iter()
-            .map(|s| expand_vars(s, vars))
+            .map(|s| expand_word(s, vars))
             .filter(|s| is_add && is_url(s))
             .collect();
         if spec.checksum.is_some()
@@ -1542,7 +1542,7 @@ impl CopyExtras {
             let sum = spec
                 .checksum
                 .as_ref()
-                .map(|c| containerfile::checksum(&expand_vars(c, vars)))
+                .map(|c| containerfile::checksum(&expand_word(c, vars)))
                 .transpose()
                 .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
             download(url, &path, sum.as_deref(), line).await?;
@@ -1632,7 +1632,7 @@ fn apply_copy(
         &spec
             .exclude
             .iter()
-            .map(|p| expand_vars(p, vars))
+            .map(|p| expand_word(p, vars))
             .collect::<Vec<_>>()
             .join("\n"),
     );
@@ -1652,7 +1652,7 @@ fn apply_copy(
 
     let chown_ids = match &spec.chown {
         Some(ch) => {
-            let expanded = expand_vars(ch, vars);
+            let expanded = expand_word(ch, vars);
             let passwd = std::fs::read_to_string(stage.root.join("etc/passwd")).unwrap_or_default();
             let group = std::fs::read_to_string(stage.root.join("etc/group")).unwrap_or_default();
             let acc = users::resolve(&expanded, &passwd, &group)
@@ -1662,7 +1662,7 @@ fn apply_copy(
         None => None,
     };
 
-    let dest_expanded = expand_vars(&spec.destination, vars);
+    let dest_expanded = expand_word(&spec.destination, vars);
     let dest_in_container = if dest_expanded.starts_with('/') {
         dest_expanded.clone()
     } else {
@@ -1696,7 +1696,7 @@ fn apply_copy(
     // Each match, with the path `--parents` keeps for it.
     let mut matched_sources: Vec<(PathBuf, PathBuf)> = Vec::new();
     for raw_src in &spec.sources {
-        let src_pat = expand_vars(raw_src, vars);
+        let src_pat = expand_word(raw_src, vars);
         if is_add && is_url(&src_pat) {
             continue;
         }

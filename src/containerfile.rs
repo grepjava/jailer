@@ -608,8 +608,8 @@ fn parse_instruction(
         "LABEL" => Ok(Instruction::Label(parse_key_values(
             rest, line_no, "LABEL", escape,
         )?)),
-        "WORKDIR" => Ok(Instruction::Workdir(unquote(rest.trim()))),
-        "USER" => Ok(Instruction::User(unquote(rest.trim()))),
+        "WORKDIR" => Ok(Instruction::Workdir(unquote_word(rest, escape))),
+        "USER" => Ok(Instruction::User(unquote_word(rest, escape))),
         "COPY" => Ok(Instruction::Copy(parse_copy(
             rest, line_no, true, escape, heredocs,
         )?)),
@@ -631,7 +631,7 @@ fn parse_instruction(
                 Ok(Instruction::Volume(tokenize_words(rest, escape)))
             }
         }
-        "STOPSIGNAL" => Ok(Instruction::Stopsignal(unquote(rest.trim()))),
+        "STOPSIGNAL" => Ok(Instruction::Stopsignal(unquote_word(rest, escape))),
         "HEALTHCHECK" => Ok(Instruction::Healthcheck(rest.trim().to_owned())),
         "SHELL" => {
             let arr = try_parse_json_array(rest).ok_or_else(|| {
@@ -915,7 +915,7 @@ fn parse_copy(
         let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         rest = tail.trim_start();
         let (name, value) = match flag[2..].split_once('=') {
-            Some((n, v)) => (n, Some(unquote(v))),
+            Some((n, v)) => (n, Some(unquote_word(v, escape))),
             None => (&flag[2..], None),
         };
         let need = || {
@@ -994,7 +994,7 @@ fn parse_key_values(
                 "line {line_no}: `{what}` needs a key and value"
             )));
         };
-        return Ok(vec![(k.to_owned(), unquote(v))]);
+        return Ok(vec![(k.to_owned(), unquote_word(v, escape))]);
     }
     let mut out = Vec::new();
     for tok in tokens {
@@ -1009,18 +1009,32 @@ fn parse_key_values(
     Ok(out)
 }
 
-/// Splits `s` into words, taking quotes and escapes away. A `$` escaped
-/// or in single quotes is left as `\$`, which [`expand_vars`] keeps.
+/// Stands for a `$` that is not to expand, escaped or in single quotes,
+/// in the words the parser keeps: [`expand_word`] gives it back as `$`. A
+/// `\` could not mark it, as a word may hold a real `\` before a `$`.
+const LITERAL_DOLLAR: char = '\u{E000}';
+
+/// Splits `s` into words, taking quotes and escapes away; expand them with
+/// [`expand_word`].
 fn tokenize_words(s: &str, escape: char) -> Vec<String> {
+    scan_words(s, escape, true)
+}
+
+/// `s` as one word, its quotes and escapes taken away, as `WORKDIR` and
+/// the like take it; expand it with [`expand_word`].
+fn unquote_word(s: &str, escape: char) -> String {
+    scan_words(s.trim(), escape, false)
+        .pop()
+        .unwrap_or_default()
+}
+
+fn scan_words(s: &str, escape: char, split: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     let mut quote: Option<char> = None;
     let literal = |cur: &mut String, c: char| {
-        if c == '$' {
-            cur.push('\\');
-        }
-        cur.push(c);
+        cur.push(if c == '$' { LITERAL_DOLLAR } else { c });
     };
 
     while let Some(c) = chars.next() {
@@ -1041,7 +1055,7 @@ fn tokenize_words(s: &str, escape: char) -> Vec<String> {
             None => {
                 if c == '"' || c == '\'' {
                     quote = Some(c);
-                } else if c.is_whitespace() {
+                } else if split && c.is_whitespace() {
                     if !cur.is_empty() {
                         out.push(std::mem::take(&mut cur));
                     }
@@ -1061,25 +1075,25 @@ fn tokenize_words(s: &str, escape: char) -> Vec<String> {
     out
 }
 
-/// `s` without the quotes around it; in single quotes, a `$` is left as
-/// `\$`, which [`expand_vars`] keeps.
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].to_owned()
-    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-        s[1..s.len() - 1].replace('$', "\\$")
-    } else {
-        s.to_owned()
-    }
+/// Expands a word the parser kept (from [`tokenize_words`] and the like):
+/// its escapes are gone, so a `\` in it is a character like any other.
+pub fn expand_word(word: &str, vars: &BTreeMap<String, String>) -> String {
+    expand(word, vars, false).replace(LITERAL_DOLLAR, "$")
 }
 
-/// Expands `$VAR`, `${VAR}`, `${VAR:-default}`, and `${VAR:+alt}` using `vars`.
+/// Expands text as written, such as a here-document's: there `\$` is a
+/// `$` that does not expand.
 pub fn expand_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
+    expand(input, vars, true)
+}
+
+/// Expands `$VAR`, `${VAR}`, `${VAR:-default}`, and `${VAR:+alt}` using
+/// `vars`; with `escapes`, `\$` stands for `$`.
+fn expand(input: &str, vars: &BTreeMap<String, String>, escapes: bool) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&'$') {
+        if escapes && c == '\\' && chars.peek() == Some(&'$') {
             out.push(chars.next().unwrap());
             continue;
         }
@@ -1347,14 +1361,27 @@ CMD ["--serve"]
         .unwrap() else {
             panic!("not ENV")
         };
-        let values: Vec<String> = pairs.iter().map(|(_, v)| expand_vars(v, &vars)).collect();
+        let values: Vec<String> = pairs.iter().map(|(_, v)| expand_word(v, &vars)).collect();
         assert_eq!(values, ["$REL", "$REL", "$REL", "15.1"]);
+        // A real backslash before a variable is kept and the variable
+        // expands: `\\` is one, and so is `\` when a backtick is the escape.
+        let env = |text: &str, escape: char| match parse_instruction("ENV", text, 1, escape, vec![])
+            .unwrap()
+        {
+            Instruction::Env(pairs) => expand_word(&pairs[0].1, &vars),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(env(r"P=a\\$REL", '\\'), r"a\15.1");
+        assert_eq!(env(r"P=C:\$REL", '`'), r"C:\15.1");
+        assert_eq!(env(r"P=C:`$REL", '`'), "C:$REL");
+        // The legacy form, one value with spaces.
+        assert_eq!(env(r"P a\\$REL b", '\\'), r"a\15.1 b");
         let Instruction::Workdir(wd) =
             parse_instruction("WORKDIR", "'/$REL'", 1, '\\', vec![]).unwrap()
         else {
             panic!("not WORKDIR")
         };
-        assert_eq!(expand_vars(&wd, &vars), "/$REL");
+        assert_eq!(expand_word(&wd, &vars), "/$REL");
 
         let ig = IgnoreMatcher::parse("target/\n*.log\n!keep.log\n");
         assert!(ig.is_ignored("target/debug/app"));
