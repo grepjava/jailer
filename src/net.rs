@@ -342,6 +342,15 @@ impl Locked<'_> {
     /// The lowest free address, refused if another pod publishes one of
     /// `ports` already.
     pub fn allocate(&self, sys: &dyn Sys, ports: &[Port]) -> Result<Ipv4Addr, Error> {
+        for (i, p) in ports.iter().enumerate() {
+            if ports[..i].iter().any(|q| p.clashes(q)) {
+                return Err(Error::Runtime(format!(
+                    "port {}/{} is given twice",
+                    p.host,
+                    p.proto.as_str()
+                )));
+            }
+        }
         let live = self.live(sys)?;
         for (_, lease) in &live {
             if let Some(p) = ports
@@ -471,6 +480,13 @@ mod tests {
             .allocate(&sys, &["10.0.0.1:8080:81".parse().unwrap()])
             .unwrap_err();
         assert!(clash.to_string().contains("8080/tcp"), "{clash}");
+        let twice = held
+            .allocate(
+                &sys,
+                &["9090:80".parse().unwrap(), "9090:81".parse().unwrap()],
+            )
+            .unwrap_err();
+        assert!(twice.to_string().contains("given twice"), "{twice}");
         drop(held);
 
         // Releasing a lease as another pod changes nothing.

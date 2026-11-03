@@ -151,6 +151,9 @@ pub enum EntryKind {
     Dir,
     File,
     Symlink,
+    /// A named pipe, as `mkfifo` makes. Sockets and devices are left out:
+    /// they are made when a container runs, not kept in an image.
+    Fifo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,9 +349,32 @@ fn walk_capture(
                     flags,
                 },
             );
+        } else if is_fifo(&meta) {
+            out.entries.insert(
+                rel_str,
+                EntryMeta {
+                    kind: EntryKind::Fifo,
+                    mode,
+                    uid,
+                    gid,
+                    size: 0,
+                    digest_or_link: String::new(),
+                    flags,
+                },
+            );
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn is_fifo(meta: &std::fs::Metadata) -> bool {
+    std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type())
+}
+
+#[cfg(not(unix))]
+pub fn is_fifo(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn file_sha256(path: &Path) -> Result<String, Error> {
@@ -436,6 +462,17 @@ pub fn create_diff_layer(
         }
     }
     let changed = after.with_link_groups(changed);
+    // A layer's `.wh.` names are whiteouts: a file so named would delete
+    // its sibling instead of being there.
+    if let Some(p) = changed.iter().find(|p| {
+        Path::new(p)
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(WHITEOUT))
+    }) {
+        return Err(Error::Extract(format!(
+            "{p}: a name beginning with {WHITEOUT} cannot be kept in an image layer"
+        )));
+    }
 
     if deleted.is_empty() && changed.is_empty() {
         return Ok((None, after));
@@ -573,6 +610,12 @@ fn append_path_to_tar<W: Write>(
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             builder.append_link(&mut header, rel, &meta.digest_or_link)?;
+        }
+        EntryKind::Fifo => {
+            header.set_entry_type(tar::EntryType::Fifo);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append_data(&mut header, rel, std::io::empty())?;
         }
         EntryKind::File => {
             let f = File::open(&full)?;
@@ -788,6 +831,33 @@ mod tests {
         assert_eq!(flags_text(0x0002_0000), "schg");
         assert_eq!(flags_text(0x0000_0001 | 0x0000_0002), "nodump,uchg");
         assert_eq!(flags_text(0), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_pipes_go_into_layers() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let before = TreeState::capture(&root).unwrap();
+        let c = std::ffi::CString::new(root.join("app/queue").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        let tar_out = t.path().join("layer.tar");
+        let gz_out = t.path().join("layer.tar.gz");
+        create_diff_layer(&before, &root, &tar_out, &gz_out, Compression::Gzip)
+            .unwrap()
+            .0
+            .expect("the pipe is a change");
+        let target = t.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        apply(&tar_out, &target).unwrap();
+        let meta = std::fs::symlink_metadata(target.join("app/queue")).unwrap();
+        assert!(is_fifo(&meta));
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+            0o640
+        );
     }
 
     #[cfg(target_os = "freebsd")]

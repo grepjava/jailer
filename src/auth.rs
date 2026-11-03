@@ -138,6 +138,10 @@ pub fn save_credentials(
         .as_object_mut()
         .ok_or_else(not_object)?;
     let encoded = STANDARD.encode(format!("{}:{}", creds.username, creds.password));
+    // Another spelling of the same registry, as `https://ghcr.io` for
+    // `ghcr.io`, would be read before this entry or after it: it goes.
+    let target = registry_of(registry);
+    auths.retain(|k, _| registry_of(k) != target);
     auths.insert(registry.to_owned(), serde_json::json!({ "auth": encoded }));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -322,7 +326,8 @@ mod tests {
         let path = tmp.path().join("config.json");
         std::fs::write(
             &path,
-            r#"{"auths": {"quay.io": {"auth": "eDp5"}}, "credsStore": "pass",
+            r#"{"auths": {"quay.io": {"auth": "eDp5"}, "https://ghcr.io": {"auth": "b2xkOm9sZA=="}},
+                "credsStore": "pass",
                 "credHelpers": {"gcr.io": "gcloud"}}"#,
         )
         .unwrap();
@@ -336,6 +341,7 @@ mod tests {
         assert_eq!(v["credsStore"], "pass");
         assert_eq!(v["credHelpers"]["gcr.io"], "gcloud");
         assert_eq!(v["auths"]["quay.io"]["auth"], "eDp5");
+        assert!(v["auths"].get("https://ghcr.io").is_none());
         let g = from_json(&text, "ghcr.io").unwrap().unwrap();
         assert_eq!((g.username.as_str(), g.password.as_str()), ("me", "tok"));
 

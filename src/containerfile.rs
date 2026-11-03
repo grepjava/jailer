@@ -82,6 +82,7 @@ pub enum RunMount {
         id: String,
         target: String,
         read_only: bool,
+        sharing: Sharing,
         mode: u32,
         uid: u32,
         gid: u32,
@@ -118,7 +119,46 @@ pub enum RunMount {
     },
 }
 
+/// How builds at the same time use one cache mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sharing {
+    /// All of them at once.
+    #[default]
+    Shared,
+    /// One at a time; the others wait.
+    Locked,
+    /// One; the others get an empty cache of their own.
+    Private,
+}
+
 impl RunMount {
+    /// The mount with build arguments and `ENV` expanded in its names and
+    /// paths.
+    pub fn expanded(&self, vars: &BTreeMap<String, String>) -> RunMount {
+        let x = |s: &String| expand_vars(s, vars);
+        let mut m = self.clone();
+        match &mut m {
+            RunMount::Cache { id, target, .. }
+            | RunMount::Secret { id, target, .. }
+            | RunMount::Ssh { id, target, .. } => {
+                *id = x(id);
+                *target = x(target);
+            }
+            RunMount::Bind {
+                from,
+                source,
+                target,
+                ..
+            } => {
+                *from = from.as_ref().map(x);
+                *source = x(source);
+                *target = x(target);
+            }
+            RunMount::Tmpfs { target, .. } => *target = x(target),
+        }
+        m
+    }
+
     pub fn target(&self) -> &str {
         match self {
             RunMount::Cache { target, .. }
@@ -750,6 +790,16 @@ fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
                     .map_or_else(|| target.clone(), |v| (*v).to_owned()),
                 target,
                 read_only: flag(&kv, "ro")?,
+                sharing: match kv.get("sharing").copied() {
+                    None | Some("shared") => Sharing::Shared,
+                    Some("locked") => Sharing::Locked,
+                    Some("private") => Sharing::Private,
+                    Some(other) => {
+                        return Err(bad(format!(
+                            "sharing={other}: give shared, locked or private"
+                        )));
+                    }
+                },
                 mode: num(&kv, "mode", 8, 0o755)?,
                 uid: num(&kv, "uid", 10, 0)?,
                 gid: num(&kv, "gid", 10, 0)?,
@@ -893,11 +943,12 @@ fn parse_copy(
             }
             "checksum" if !is_copy => {
                 let v = need()?;
-                let hex = v.strip_prefix("sha256:").unwrap_or("");
-                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(bad(format!("--checksum={v}: give sha256:<64 hex digits>")));
-                }
-                spec.checksum = Some(v.to_ascii_lowercase());
+                // One from a build argument is checked when expanded.
+                spec.checksum = Some(if v.contains('$') {
+                    v.to_owned()
+                } else {
+                    checksum(&v).map_err(bad)?
+                });
             }
             _ => return Err(bad(format!("does not support `{flag}`"))),
         }
@@ -914,6 +965,15 @@ fn parse_copy(
     spec.destination = words.pop().unwrap();
     spec.sources = words;
     Ok(spec)
+}
+
+/// An `ADD --checksum` value, checked and in lower case.
+pub fn checksum(v: &str) -> Result<String, String> {
+    let hex = v.strip_prefix("sha256:").unwrap_or("");
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("--checksum={v}: give sha256:<64 hex digits>"));
+    }
+    Ok(v.to_ascii_lowercase())
 }
 
 fn parse_key_values(
@@ -1001,12 +1061,14 @@ fn tokenize_words(s: &str, escape: char) -> Vec<String> {
     out
 }
 
+/// `s` without the quotes around it; in single quotes, a `$` is left as
+/// `\$`, which [`expand_vars`] keeps.
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
-        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
-    {
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         s[1..s.len() - 1].to_owned()
+    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        s[1..s.len() - 1].replace('$', "\\$")
     } else {
         s.to_owned()
     }
@@ -1287,6 +1349,12 @@ CMD ["--serve"]
         };
         let values: Vec<String> = pairs.iter().map(|(_, v)| expand_vars(v, &vars)).collect();
         assert_eq!(values, ["$REL", "$REL", "$REL", "15.1"]);
+        let Instruction::Workdir(wd) =
+            parse_instruction("WORKDIR", "'/$REL'", 1, '\\', vec![]).unwrap()
+        else {
+            panic!("not WORKDIR")
+        };
+        assert_eq!(expand_vars(&wd, &vars), "/$REL");
 
         let ig = IgnoreMatcher::parse("target/\n*.log\n!keep.log\n");
         assert!(ig.is_ignored("target/debug/app"));
@@ -1355,6 +1423,7 @@ CMD ["--serve"]
                     id: "/var/cache/pkg".to_owned(),
                     target: "/var/cache/pkg".to_owned(),
                     read_only: false,
+                    sharing: Sharing::Shared,
                     mode: 0o755,
                     uid: 0,
                     gid: 0,
@@ -1447,6 +1516,9 @@ CMD ["--serve"]
         )
         .unwrap();
         assert_eq!(add.checksum, Some(sum.to_ascii_lowercase()));
+        // One from a build argument is checked once expanded.
+        let add = parse_copy("--checksum=$SUM https://x/y /z", 1, false, '\\', Vec::new());
+        assert_eq!(add.unwrap().checksum.as_deref(), Some("$SUM"));
         assert!(parse_copy("--parents a /b", 1, false, '\\', Vec::new()).is_err());
     }
 

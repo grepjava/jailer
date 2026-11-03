@@ -689,6 +689,25 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert_eq!(got["plain/inner/packed.txt"], "packed");
     assert_eq!(got["zipped/inner/packed.txt"], "packed");
 
+    // A `.wh.` name in an archive is unpacked, then refused: a layer would
+    // hold it as a whiteout.
+    std::fs::write(pack.join("inner/.wh.keep"), "").unwrap();
+    let status = std::process::Command::new("tar")
+        .arg("-cf")
+        .arg(ctx.join("wh.tar"))
+        .arg("-C")
+        .arg(&pack)
+        .arg("inner")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    write_cf("FROM scratch\nADD wh.tar /wh/\n".to_owned());
+    let err = build(&store, &runtime, &opts("wh:1"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("wh/inner/.wh.keep"), "{err}");
+
     // `--exclude` is matched below the source; a source .containerignore
     // leaves out is not found, and `/` anchors a pattern at the top.
     write_cf("FROM scratch\nCOPY --exclude=sub/x.md docs /docs/\n".to_owned());

@@ -11,8 +11,8 @@ use clap::ValueEnum;
 
 use crate::check::{CheckReport, check_containerfile, check_image};
 use crate::containerfile::{
-    self, Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, expand_vars,
-    glob_match,
+    self, Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, Sharing,
+    expand_vars, glob_match,
 };
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
@@ -886,6 +886,8 @@ struct RunMounts {
     ssh: Vec<SshMount>,
     /// Tasks relaying SSH agent connections, stopped on drop.
     relays: Vec<tokio::task::JoinHandle<()>>,
+    /// Locks held on cache mounts shared `locked` or `private`.
+    locks: Vec<std::fs::File>,
     /// What placing the agents made in the root: sockets, and the
     /// directories made for them, deepest first. Removed on drop.
     placed: Vec<PathBuf>,
@@ -926,20 +928,53 @@ impl RunMounts {
             env: Vec::new(),
             ssh: Vec::new(),
             relays: Vec::new(),
+            locks: Vec::new(),
             placed: Vec::new(),
         };
         for (i, m) in opts.mounts.iter().enumerate() {
             let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
+            let m = &m.expanded(vars);
             match m {
                 RunMount::Cache {
                     id,
                     target,
                     read_only,
+                    sharing,
                     mode,
                     uid,
                     gid,
                 } => {
-                    let dir = store.dir().join("run-cache").join(next_key("", &[id]));
+                    let caches = store.dir().join("run-cache");
+                    let name = next_key("", &[id]);
+                    let mut dir = caches.join(&name);
+                    std::fs::create_dir_all(&caches)?;
+                    // Held for the step, shared or not as `sharing` says;
+                    // `prune --cache` leaves a cache held alone.
+                    let lock = std::fs::File::create(caches.join(format!("{name}.lock")))?;
+                    let shared = *sharing == Sharing::Shared;
+                    let tried = if shared {
+                        lock.try_lock_shared()
+                    } else {
+                        lock.try_lock()
+                    };
+                    match tried {
+                        Ok(()) => out.locks.push(lock),
+                        // Another build has it: this one gets its own.
+                        Err(std::fs::TryLockError::WouldBlock) if *sharing == Sharing::Private => {
+                            dir = scratch.with_extension("cache");
+                            out.temp.push(dir.clone());
+                        }
+                        Err(std::fs::TryLockError::WouldBlock) => {
+                            println!(" ---> Waiting for cache {id:?}, in use by another build");
+                            if shared {
+                                lock.lock_shared()?;
+                            } else {
+                                lock.lock()?;
+                            }
+                            out.locks.push(lock);
+                        }
+                        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                    }
                     if !dir.exists() {
                         std::fs::create_dir_all(&dir)?;
                         set_owner_mode(&dir, *uid, *gid, *mode)?;
@@ -965,7 +1000,7 @@ impl RunMounts {
                     target,
                     rw,
                 } => {
-                    let from = from.as_ref().map(|f| expand_vars(f, vars));
+                    let from = from.clone();
                     let (root, origin) = match &from {
                         None => (context_dir.to_path_buf(), "context".to_owned()),
                         Some(name) => match find_stage(completed_stages, name) {
@@ -1504,7 +1539,13 @@ impl CopyExtras {
             let sub = dir.path().join(format!("u{i}"));
             std::fs::create_dir(&sub)?;
             let path = sub.join(name);
-            download(url, &path, spec.checksum.as_deref(), line).await?;
+            let sum = spec
+                .checksum
+                .as_ref()
+                .map(|c| containerfile::checksum(&expand_vars(c, vars)))
+                .transpose()
+                .map_err(|e| Error::Build(format!("line {line}: {e}")))?;
+            download(url, &path, sum.as_deref(), line).await?;
             set_mode(&path, 0o600)?;
             files.push(path);
         }
@@ -1736,12 +1777,12 @@ fn apply_copy(
             // to check.
             std::fs::create_dir_all(&dst_base)?;
             if chown_ids.is_none() && spec.chmod.is_none() {
-                layer::extract(&archive, &dst_base)?;
+                unpack_archive(&archive, &dst_base)?;
             } else {
                 // Unpacked aside, then copied in with the owner and mode
                 // asked for, and the archive's links and flags.
                 let aside = tempfile::Builder::new().prefix("add").tempdir_in(tmp_dir)?;
-                layer::extract(&archive, aside.path())?;
+                unpack_archive(&archive, aside.path())?;
                 let unpacked = Copier::new(&stage.root, chown_ids, spec.chmod, true);
                 let copied = (|| {
                     for entry in std::fs::read_dir(aside.path())? {
@@ -1944,6 +1985,26 @@ fn without_links(root: &Path, path: &str) -> Result<String, Error> {
     Ok(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
 }
 
+/// Unpacks a tar archive `ADD` names into `dst`, with what a layer keeps
+/// (numeric owners, modes, file flags) but every name in it: a `.wh.` file
+/// is an ordinary one here, not a whiteout.
+fn unpack_archive(archive: &Path, dst: &Path) -> Result<(), Error> {
+    let mut cmd = std::process::Command::new("tar");
+    cmd.arg("-x");
+    if cfg!(target_os = "freebsd") {
+        cmd.args(["-p", "--numeric-owner", "--fflags", "--xattrs"]);
+    }
+    let out = cmd.arg("-f").arg(archive).arg("-C").arg(dst).output()?;
+    if !out.status.success() {
+        return Err(Error::Build(format!(
+            "unpacking {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// `path`, below `root`, with its links resolved by [`resolve_in_root`].
 fn resolve_below(root: &Path, path: &Path, follow_last: bool) -> Result<PathBuf, Error> {
     let rel = path.strip_prefix(root).unwrap_or(path);
@@ -2083,6 +2144,9 @@ impl Copier {
             }
             #[cfg(windows)]
             let _ = std::fs::copy(src, dst);
+        } else if layer::is_fifo(&meta) {
+            // Made again: reading one would wait for a writer.
+            make_fifo(dst)?;
         } else {
             if let Some(key) = key {
                 let first = self.linked.borrow().get(&key).cloned();
@@ -2131,6 +2195,26 @@ impl Copier {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Build(format!("{}: NUL in path", path.display())))?;
+    // SAFETY: `c` is a valid NUL-terminated path.
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_fifo(path: &Path) -> Result<(), Error> {
+    Err(Error::Build(format!(
+        "{}: named pipes need a FreeBSD host",
+        path.display()
+    )))
 }
 
 /// The permission bits of `meta`, on a system that has them.

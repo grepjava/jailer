@@ -163,6 +163,14 @@ names it (default
 set it up when first made, and
 .Cm ro
 mounts it read-only; changing any of them runs the step again.
+.Cm sharing
+says how builds at the same time use it:
+.Cm shared
+(the default) all at once,
+.Cm locked
+one at a time, and
+.Cm private
+one, the others each getting an empty cache of their own.
 .It Fl -mount Ns = Ns Cm type=bind , Ns Cm target Ns = Ns Ar path
 The build context, less what
 .Pa .containerignore
@@ -325,6 +333,10 @@ and the other append-only and no-unlink flags, but not
 .Cm uarch ,
 which ZFS sets on every write) and hard links; a layer holds every name
 of a hard-linked file it changes.
+Named pipes are kept; sockets and devices are not.
+A file whose name begins with
+.Ql .wh.
+fails the build: in a layer that name removes a file.
 .Pp
 .Fl -cache-to
 pushes this build's
@@ -730,7 +742,10 @@ Remove build cache entries whose layer is gone, then the layers and blobs
 nothing uses.
 With
 .Fl -cache ,
-clear the build cache first, freeing the layers only it kept.
+clear the build cache first, freeing the layers only it kept, and the
+directories of
+.Cm RUN Fl -mount Ns = Ns Cm type=cache
+that no build is using.
 .It Nm ps Op Fl a
 List running containers, or all with
 .Fl a .
@@ -763,13 +778,28 @@ Default for
 .It Ev JAILER_CACHE_MAX
 Default for
 .Nm build Fl -cache-max .
+.It Ev SOURCE_DATE_EPOCH
+Default for
+.Nm build Fl -timestamp .
+.It Ev REGISTRY_AUTH_FILE
+Registry credentials, read before the files under
+.Sx FILES
+and written by
+.Nm login .
+.It Ev SSH_AUTH_SOCK
+The SSH agent
+.Nm build Fl -ssh
+gives a step when no socket is named.
 .El
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa /var/db/jailer
 Default state directory for root.
 .It Pa ~/.docker/config.json
-Registry credentials.
+Registry credentials, also read from
+.Pa $XDG_RUNTIME_DIR/containers/auth.json
+and
+.Pa ~/.config/containers/auth.json .
 .El
 .Sh EXIT STATUS
 .Ex -std

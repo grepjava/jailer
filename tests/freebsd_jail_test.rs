@@ -985,6 +985,12 @@ fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
         .status()
         .unwrap();
     assert!(tar.success());
+    // A named pipe, which a copy makes again rather than reads.
+    let fifo = Command::new("mkfifo")
+        .arg(ctx.join("queue"))
+        .status()
+        .unwrap();
+    assert!(fifo.success());
     let containerfile = |cache_opts: &str| {
         std::fs::write(
             ctx.join("Containerfile"),
@@ -992,12 +998,15 @@ fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
                 r#"FROM docker.io/freebsd/freebsd-runtime:15.1 AS base
 COPY --chown=nobody:nobody --chmod=0640 f /owned
 COPY --chown=nobody:nobody d /d
+COPY queue /queue
 FROM docker.io/freebsd/freebsd-runtime:15.1
 COPY --from=base /owned /owned
 COPY --from=base /d /d
+COPY --from=base /queue /queue
+ARG ID=c
 ADD --chown=nobody:nobody --chmod=4755 a.tar /arc/
-RUN --mount=type=cache,target=/c{cache_opts} sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
-CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); echo $1 $3:$4; done; cat /rc"]
+RUN --mount=type=cache,id=$ID,target=/c,sharing=locked{cache_opts} sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
+CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); echo $1 $3:$4; done; test -p /queue && echo pipe; cat /rc"]
 "#
             ),
         )
@@ -1031,9 +1040,9 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
                   -rwsr-xr-x nobody:nobody";
     containerfile("");
     jailer(&["build", "-t", "o:1", ctx_arg]);
-    assert_eq!(jailer(&["run", "o:1"]), format!("{owners}\nw"));
+    assert_eq!(jailer(&["run", "o:1"]), format!("{owners}\npipe\nw"));
     // A read-only cache is another step: it runs again, and cannot write.
     containerfile(",ro");
     jailer(&["build", "-t", "o:2", ctx_arg]);
-    assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\nro"));
+    assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\npipe\nro"));
 }

@@ -133,7 +133,31 @@ pub async fn prune(store: &Store, all_cache: bool) -> Result<usize, Error> {
             }
         }
     }
+    if all_cache {
+        prune_run_caches(&store.dir().join("run-cache"))?;
+    }
     Ok(store.prune_locked(&held).await?.len())
+}
+
+/// Removes the directories of `RUN --mount=type=cache`, but those a build
+/// is using: it holds the lock beside each.
+fn prune_run_caches(dir: &Path) -> Result<(), Error> {
+    let Ok(listed) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for e in listed {
+        let path = e?.path();
+        if path.extension().is_some_and(|x| x == "lock") {
+            continue;
+        }
+        let lock_path = path.with_extension("lock");
+        let lock = std::fs::File::create(&lock_path)?;
+        if lock.try_lock().is_ok() {
+            crate::layer::remove_tree(&path)?;
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+    Ok(())
 }
 
 /// Drops the least recently used build cache entries until the layers
@@ -205,4 +229,24 @@ fn cached_names(dir: &Path) -> Result<BTreeSet<String>, legion_image::Error> {
         }
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    #[test]
+    fn pruning_run_caches_leaves_those_in_use() {
+        let t = tempfile::tempdir().unwrap();
+        for name in ["idle", "busy"] {
+            std::fs::create_dir_all(t.path().join(name)).unwrap();
+            std::fs::write(t.path().join(name).join("f"), "x").unwrap();
+        }
+        let held = File::create(t.path().join("busy.lock")).unwrap();
+        held.lock_shared().unwrap();
+        super::prune_run_caches(t.path()).unwrap();
+        assert!(!t.path().join("idle").exists());
+        assert!(!t.path().join("idle.lock").exists());
+        assert!(t.path().join("busy/f").exists());
+    }
 }
