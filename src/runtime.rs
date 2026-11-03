@@ -6,7 +6,6 @@
 //! `--param` over them.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
 
 pub use legion_jail::{
     ANNOTATION_CPUSET, ANNOTATION_JAIL, ANNOTATION_MLOCK, ANNOTATION_PARENT, ANNOTATION_SYSV,
@@ -478,39 +477,6 @@ mod elsewhere {
             ))
         }
     }
-}
-
-/// `dest` (a path in the container) under `root`, made if missing (a file
-/// if `file`) without following links: a link in the image must not send
-/// what is made there outside its root.
-pub fn target(root: &Path, dest: &str, file: bool) -> Result<PathBuf, Error> {
-    let mut path = root.to_path_buf();
-    let parts: Vec<_> = Path::new(dest)
-        .components()
-        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
-        .collect();
-    for (i, c) in parts.iter().enumerate() {
-        let Component::Normal(name) = c else {
-            return Err(Error::Runtime(format!("{dest}: no `..` allowed")));
-        };
-        path.push(name);
-        let last = i + 1 == parts.len();
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Err(Error::Runtime(format!("{dest} goes through a link")));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if last && file {
-                    std::fs::File::create(&path)?;
-                } else {
-                    std::fs::create_dir(&path)?;
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(path)
 }
 
 #[cfg(test)]

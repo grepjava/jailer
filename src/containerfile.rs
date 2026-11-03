@@ -149,10 +149,8 @@ pub struct CopySpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
-    Arg {
-        name: String,
-        default: Option<String>,
-    },
+    /// Names, each with its default if given.
+    Arg(Vec<(String, Option<String>)>),
     Env(Vec<(String, String)>),
     Workdir(String),
     User(String),
@@ -228,8 +226,7 @@ impl Containerfile {
             }
             if stages.is_empty() {
                 if verb_upper == "ARG" {
-                    let (k, v) = parse_arg(rest, line_no)?;
-                    global_args.push((k, v));
+                    global_args.extend(parse_arg(rest, line_no, escape)?);
                     continue;
                 }
                 return Err(Error::Build(format!(
@@ -401,16 +398,48 @@ fn heredoc_markers(text: &str) -> Vec<(String, bool, bool)> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
-    for c in text.chars() {
+    let chars: Vec<char> = text.chars().collect();
+    // Open parentheses of a `$((...))`, where `<<` is a shift.
+    let mut arith = 0usize;
+    let mut skip = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if arith > 0 {
+            match c {
+                '(' => arith += 1,
+                ')' => arith -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        if quote.is_none() && c == '$' && chars[i + 1..].starts_with(&['(', '(']) {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            arith = 2;
+            skip = 2;
+            continue;
+        }
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
             None if c == '"' || c == '\'' => quote = Some(c),
-            None if c.is_whitespace() => {
+            // A word ends at a space or an operator, as in `cat<<EOF>/f`.
+            None if c.is_whitespace() || "|;&()>".contains(c) => {
                 if !word.is_empty() {
                     words.push(std::mem::take(&mut word));
                 }
                 continue;
+            }
+            None if c == '<'
+                && chars.get(i + 1) == Some(&'<')
+                && (i == 0 || chars[i - 1] != '<')
+                && !word.is_empty() =>
+            {
+                words.push(std::mem::take(&mut word));
             }
             None => {}
         }
@@ -490,15 +519,23 @@ fn parse_from(
     Ok((platform, base, alias))
 }
 
-fn parse_arg(rest: &str, line_no: usize) -> Result<(String, Option<String>), Error> {
-    let rest = rest.trim();
-    if rest.is_empty() {
+/// `ARG NAME[=default] ...`: one or more names on a line.
+fn parse_arg(
+    rest: &str,
+    line_no: usize,
+    escape: char,
+) -> Result<Vec<(String, Option<String>)>, Error> {
+    let tokens = tokenize_words(rest.trim(), escape);
+    if tokens.is_empty() {
         return Err(Error::Build(format!("line {line_no}: empty `ARG`")));
     }
-    match rest.split_once('=') {
-        Some((k, v)) => Ok((k.trim().to_owned(), Some(unquote(v.trim())))),
-        None => Ok((rest.to_owned(), None)),
-    }
+    Ok(tokens
+        .into_iter()
+        .map(|t| match t.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (t, None),
+        })
+        .collect())
 }
 
 fn parse_instruction(
@@ -514,10 +551,7 @@ fn parse_instruction(
         )));
     }
     match verb {
-        "ARG" => {
-            let (name, default) = parse_arg(rest, line_no)?;
-            Ok(Instruction::Arg { name, default })
-        }
+        "ARG" => Ok(Instruction::Arg(parse_arg(rest, line_no, escape)?)),
         "ENV" => Ok(Instruction::Env(parse_key_values(
             rest, line_no, "ENV", escape,
         )?)),
@@ -1062,6 +1096,19 @@ impl IgnoreMatcher {
         Self { rules }
     }
 
+    /// Whether a `!` pattern may take back something below the directory
+    /// `dir_rel`, so that a walk must look in it although it is left out.
+    pub fn may_reinclude(&self, dir_rel: &str) -> bool {
+        let dir = format!("{}/", dir_rel.trim_matches('/').replace('\\', "/"));
+        self.rules.iter().filter(|r| r.negated).any(|r| {
+            if !r.anchored && !r.pattern.contains('/') {
+                return true;
+            }
+            let fixed = &r.pattern[..r.pattern.find(['*', '?', '[']).unwrap_or(r.pattern.len())];
+            fixed.starts_with(&dir) || dir.starts_with(fixed)
+        })
+    }
+
     pub fn is_ignored(&self, rel_path: &str) -> bool {
         let rel = rel_path.trim_matches('/').replace('\\', "/");
         if rel.is_empty() {
@@ -1223,6 +1270,30 @@ CMD ["--serve"]
         assert!(ig.is_ignored("logs/x.log"));
         assert!(ig.is_ignored("logs/1/2/x.log"));
         assert!(ig.is_ignored("deep/secret/key"));
+
+        let ig = IgnoreMatcher::parse("sub\n!sub/keep\n");
+        assert!(ig.may_reinclude("sub"));
+        assert!(!ig.may_reinclude("other"));
+        assert!(!IgnoreMatcher::parse("sub\n").may_reinclude("sub"));
+        assert!(IgnoreMatcher::parse("*\n!**/keep\n").may_reinclude("a/b"));
+    }
+
+    #[test]
+    fn several_args_on_a_line_and_heredocs_next_to_operators() {
+        let cf = Containerfile::parse("FROM scratch\nARG A B=\"two words\"\n").unwrap();
+        assert_eq!(
+            cf.stages[0].instructions[0].instruction,
+            Instruction::Arg(vec![
+                ("A".to_owned(), None),
+                ("B".to_owned(), Some("two words".to_owned())),
+            ])
+        );
+        let names = |t: &str| -> Vec<String> {
+            heredoc_markers(t).into_iter().map(|(n, _, _)| n).collect()
+        };
+        assert_eq!(names("cat<<EOF>/file"), ["EOF"]);
+        assert_eq!(names("cat <<A | tr a b && cat <<-'B';"), ["A", "B"]);
+        assert!(names("cat <<<word").is_empty());
     }
 
     #[test]

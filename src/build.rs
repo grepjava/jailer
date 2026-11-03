@@ -93,6 +93,9 @@ struct BuiltStage {
     /// The root's state after the last diff, so the next one hashes only
     /// what changed.
     tree: Option<TreeState>,
+    /// The variables in scope at the stage's end, which a stage built on it
+    /// starts with, its `ARG`s among them.
+    vars: BTreeMap<String, String>,
 }
 
 pub async fn build(
@@ -168,14 +171,19 @@ pub async fn build(
     let mut build_args = predefined.clone();
     build_args.extend(opts.build_args.clone());
 
+    // A global ARG's default may name the ARGs before it.
     let mut global_vars = BTreeMap::new();
+    let mut from_vars = predefined;
     for (k, def) in &cf.global_args {
-        if let Some(v) = build_args.get(k).or(def.as_ref()) {
+        let v = match build_args.get(k) {
+            Some(v) => Some(v.clone()),
+            None => def.as_ref().map(|d| expand_vars(d, &from_vars)),
+        };
+        if let Some(v) = v {
             global_vars.insert(k.clone(), v.clone());
+            from_vars.insert(k.clone(), v);
         }
     }
-    let mut from_vars = predefined;
-    from_vars.extend(global_vars.clone());
 
     // Keeps the base images and new layers from a concurrent `rmi`.
     let pin = store.pin()?;
@@ -228,7 +236,6 @@ pub async fn build(
     }
 
     for stage_def in &cf.stages {
-        let mut vars = BTreeMap::new();
         let base_ref = expand_vars(&stage_def.base, &from_vars);
         if let Some(p) = &stage_def.platform {
             let p = expand_vars(p, &from_vars);
@@ -268,6 +275,7 @@ pub async fn build(
                 shell: Vec::new(),
                 cache_key: root_key(opts, &["scratch"]),
                 tree: None,
+                vars: BTreeMap::new(),
             }
         } else if let Some(prev) = find_stage(&completed_stages, &base_ref) {
             match (&prev.dataset, &dataset) {
@@ -292,6 +300,7 @@ pub async fn build(
                 shell: prev.shell.clone(),
                 cache_key: prev.cache_key.clone(),
                 tree: None,
+                vars: prev.vars.clone(),
             }
         } else {
             println!("Step 0/{}: FROM {base_ref}", stage_def.instructions.len());
@@ -331,10 +340,12 @@ pub async fn build(
                 shell: Vec::new(),
                 cache_key: root_key(opts, &["from", &base_img.id]),
                 tree: None,
+                vars: BTreeMap::new(),
             }
         };
 
         // Seed `vars` with any ENV already present in the base image.
+        let mut vars = std::mem::take(&mut built.vars);
         for kv in &built.config.config.env {
             if let Some((k, v)) = kv.split_once('=') {
                 vars.insert(k.to_owned(), v.to_owned());
@@ -359,6 +370,7 @@ pub async fn build(
             .target
             .as_ref()
             .is_some_and(|t| built.name.as_deref() == Some(t.as_str()));
+        built.vars = vars;
         completed_stages.push(built);
         if reached_target {
             break;
@@ -575,14 +587,27 @@ async fn execute_instruction(
     } = env;
     let (no_cache, context_dir) = (opts.no_cache, opts.context_dir.as_path());
     match &sp.instruction {
-        Instruction::Arg { name, default } => {
-            if let Some(val) = cli_build_args.get(name) {
-                vars.insert(name.clone(), val.clone());
-            } else if let Some(def) = default {
-                let expanded = expand_vars(def, vars);
-                vars.insert(name.clone(), expanded);
-            } else if let Some(val) = global_args.get(name) {
-                vars.entry(name.clone()).or_insert_with(|| val.clone());
+        Instruction::Arg(args) => {
+            for (name, default) in args {
+                // An ENV of the same name goes over an ARG, before or after.
+                let prefix = format!("{name}=");
+                if stage
+                    .config
+                    .config
+                    .env
+                    .iter()
+                    .any(|e| e.starts_with(&prefix))
+                {
+                    continue;
+                }
+                if let Some(val) = cli_build_args.get(name) {
+                    vars.insert(name.clone(), val.clone());
+                } else if let Some(def) = default {
+                    let expanded = expand_vars(def, vars);
+                    vars.insert(name.clone(), expanded);
+                } else if let Some(val) = global_args.get(name) {
+                    vars.entry(name.clone()).or_insert_with(|| val.clone());
+                }
             }
             record_history(&mut stage.config, &sp.raw, true);
         }
@@ -830,7 +855,10 @@ async fn execute_instruction(
                     env.used.lock().unwrap().push((key.clone(), step));
                 }
             }
-            stage.cache_key = key;
+            // What follows depends on what the step made, not only on what
+            // it ran: a step run again may make something else.
+            let top = stage.layers.last().map_or("", String::as_str);
+            stage.cache_key = next_key(&key, &["after", top]);
         }
     }
     Ok(())
@@ -937,9 +965,18 @@ impl RunMounts {
                     let src =
                         if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
                         {
-                            let skip = |p: &Path| ignore.is_ignored(&rel_path(p, context_dir));
+                            let filter = |p: &Path| {
+                                let rel = rel_path(p, context_dir);
+                                if !ignore.is_ignored(&rel) {
+                                    Keep::Yes
+                                } else if ignore.may_reinclude(&rel) {
+                                    Keep::Below
+                                } else {
+                                    Keep::No
+                                }
+                            };
                             let copier = Copier::new(&scratch, None, None, false);
-                            copier.dir(&src, &scratch, &skip)?;
+                            copier.dir(&src, &scratch, &filter)?;
                             copier.finish()?;
                             out.temp.push(scratch.clone());
                             scratch
@@ -1411,7 +1448,11 @@ fn apply_copy(
     // `--exclude` is matched below each source, and a source by its name.
     let excluded = |p: &Path, source: &Path| {
         exclude.is_ignored(&if p == source {
-            rel_path(p, src_root).rsplit('/').next().unwrap_or("").to_owned()
+            rel_path(p, src_root)
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_owned()
         } else {
             rel_path(p, source)
         })
@@ -1440,28 +1481,24 @@ fn apply_copy(
         };
         format!("{}/{}", wd.trim_end_matches('/'), dest_expanded)
     };
-    let dest_is_dir_hint = dest_expanded.ends_with('/')
-        || dest_expanded == "."
-        || spec.parents
-        || spec.sources.len() + spec.heredocs.len() > 1;
     let dst_base = resolve_in_root(&stage.root, &dest_in_container, true)?;
     // A stage's or an image's files keep their flags; the context's do not,
     // as Docker keeps nothing of the host's.
     let copier = Copier::new(&stage.root, chown_ids, spec.chmod, spec.from.is_some());
-    let place_file = |src: &Path, dst_base: &Path| -> Result<(), Error> {
-        let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
-            std::fs::create_dir_all(dst_base)?;
-            dst_base.join(
-                src.file_name()
-                    .ok_or_else(|| Error::Build(format!("line {line_no}: invalid source")))?,
-            )
+    // Whether a path is copied: left out, a directory may still hold
+    // something a `!` pattern takes back.
+    let keep = |p: &Path, source: &Path| {
+        let ig = ignored(p);
+        let ex = excluded(p, source);
+        if !ig && !ex {
+            Keep::Yes
+        } else if (!ig || ignore.may_reinclude(&rel_path(p, src_root)))
+            && (!ex || exclude.may_reinclude(&rel_path(p, source)))
+        {
+            Keep::Below
         } else {
-            if let Some(parent) = dst_base.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            dst_base.to_path_buf()
-        };
-        copier.entry(src, &final_dst)
+            Keep::No
+        }
     };
 
     // Each match, with the path `--parents` keeps for it.
@@ -1478,10 +1515,11 @@ fn apply_copy(
         };
         let pivot_root = resolve_in_root(src_root, pivot.trim_start_matches('/'), true)
             .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
-        // A source .containerignore leaves out is not in the context.
+        // A source .containerignore leaves out is not in the context, but
+        // for what a `!` pattern takes back from a directory.
         let matches: Vec<PathBuf> = resolve_source_paths(src_root, &pattern, line_no)?
             .into_iter()
-            .filter(|m| !ignored(m))
+            .filter(|m| !ignored(m) || (m.is_dir() && ignore.may_reinclude(&rel_path(m, src_root))))
             .collect();
         if matches.is_empty() {
             return Err(Error::Build(format!(
@@ -1498,18 +1536,42 @@ fn apply_copy(
         }
     }
 
+    // As with several sources, many matches go into a directory.
+    let dest_is_dir_hint = dest_expanded.ends_with('/')
+        || dest_expanded == "."
+        || spec.parents
+        || spec.sources.len() + spec.heredocs.len() > 1
+        || matched_sources.len() + extras.len() > 1;
+    let place_file = |src: &Path, dst_base: &Path| -> Result<(), Error> {
+        let final_dst = if dest_is_dir_hint || dst_base.is_dir() {
+            std::fs::create_dir_all(dst_base)?;
+            dst_base.join(
+                src.file_name()
+                    .ok_or_else(|| Error::Build(format!("line {line_no}: invalid source")))?,
+            )
+        } else {
+            if let Some(parent) = dst_base.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            dst_base.to_path_buf()
+        };
+        copier.entry(src, &final_dst)
+    };
+
     for (src_path, kept) in matched_sources {
         let meta = std::fs::symlink_metadata(&src_path)?;
         if meta.is_dir() {
-            copier.dir(
-                &src_path,
-                &if spec.parents {
-                    resolve_below(&stage.root, &dst_base.join(&kept), true)?
-                } else {
-                    dst_base.clone()
-                },
-                &|p| ignored(p) || excluded(p, &src_path),
-            )?;
+            let dst = if spec.parents {
+                resolve_below(&stage.root, &dst_base.join(&kept), true)?
+            } else {
+                dst_base.clone()
+            };
+            let filter = |p: &Path| keep(p, &src_path);
+            if ignored(&src_path) {
+                copier.below(&src_path, &dst, &filter)?;
+            } else {
+                copier.dir(&src_path, &dst, &filter)?;
+            }
         } else if is_add && is_archive_name(&src_path) {
             // Read, not copied: a link to it is followed inside the root.
             let archive = resolve_below(src_root, &src_path, true)?;
@@ -1539,6 +1601,15 @@ fn apply_copy(
         place_file(extra, &dst_base)?;
     }
     copier.finish()
+}
+
+/// Whether a copy takes a path, or leaves it out with what is below it, or
+/// leaves out only the path (a directory) itself.
+#[derive(Clone, Copy)]
+enum Keep {
+    Yes,
+    No,
+    Below,
 }
 
 /// `p` below `base`, with `/` between its components.
@@ -1737,7 +1808,7 @@ impl Copier {
         &self,
         src_dir: &Path,
         dst_dir: &Path,
-        skip: &dyn Fn(&Path) -> bool,
+        filter: &dyn Fn(&Path) -> Keep,
     ) -> Result<(), Error> {
         let made = std::fs::symlink_metadata(dst_dir).is_err();
         std::fs::create_dir_all(dst_dir)?;
@@ -1754,20 +1825,59 @@ impl Copier {
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if skip(&path) {
-                continue;
-            }
             let target = dst_dir.join(entry.file_name());
-            if std::fs::symlink_metadata(&path)?.is_dir() {
-                // A directory already there may be a link, as `/home` is.
-                let target = resolve_below(&self.root, &target, true)?;
-                self.dir(&path, &target, skip)?;
-            } else {
-                self.entry(&path, &target)?;
+            let is_dir = std::fs::symlink_metadata(&path)?.is_dir();
+            match filter(&path) {
+                Keep::No => {}
+                Keep::Below if is_dir => {
+                    self.below(&path, &resolve_below(&self.root, &target, true)?, filter)?;
+                }
+                Keep::Below => {}
+                Keep::Yes if is_dir => {
+                    // A directory already there may be a link, as `/home` is.
+                    let target = resolve_below(&self.root, &target, true)?;
+                    self.dir(&path, &target, filter)?;
+                }
+                Keep::Yes => self.entry(&path, &target)?,
             }
         }
         // After its contents: a flag such as schg refuses them.
         self.keep_flags_of(src_dir, dst_dir)
+    }
+
+    /// Copies what `filter` keeps below `src_dir`, a directory left out
+    /// itself: `dst_dir` is made only for something in it.
+    fn below(
+        &self,
+        src_dir: &Path,
+        dst_dir: &Path,
+        filter: &dyn Fn(&Path) -> Keep,
+    ) -> Result<(), Error> {
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let is_dir = std::fs::symlink_metadata(&path)?.is_dir();
+            let keep = filter(&path);
+            if matches!(keep, Keep::No) || (matches!(keep, Keep::Below) && !is_dir) {
+                continue;
+            }
+            let target = resolve_below(&self.root, &dst_dir.join(entry.file_name()), true)?;
+            match keep {
+                Keep::Below => self.below(&path, &target, filter)?,
+                _ => {
+                    if std::fs::symlink_metadata(dst_dir).is_err() {
+                        std::fs::create_dir_all(dst_dir)?;
+                        apply_perms(dst_dir, self.chown, self.chmod)?;
+                    }
+                    if is_dir {
+                        self.dir(&path, &target, filter)?;
+                    } else {
+                        self.entry(&path, &target)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Copies the file or link `src` to `dst`, replacing what is there.
@@ -1775,7 +1885,11 @@ impl Copier {
         let meta = std::fs::symlink_metadata(src)?;
         let key = layer::inode(&meta).filter(|_| !meta.file_type().is_symlink());
         if let Some(key) = key
-            && self.linked.borrow().get(&key).is_some_and(|first| first == dst)
+            && self
+                .linked
+                .borrow()
+                .get(&key)
+                .is_some_and(|first| first == dst)
         {
             // Copied there already, by another name for the same file.
             return Ok(());
@@ -1845,18 +1959,23 @@ fn apply_perms(
     {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+        // The owner first: a chown may clear setuid and setgid bits.
+        if let Some((uid, gid)) = chown_ids {
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| Error::Build(format!("{}: NUL in path", path.display())))?;
+            if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+                return Err(Error::Build(format!(
+                    "chown {uid}:{gid} {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
         if let Some(mode) = chmod
             && let Ok(meta) = std::fs::symlink_metadata(path)
             && !meta.file_type().is_symlink()
         {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-        }
-        if let Some((uid, gid)) = chown_ids
-            && let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes())
-        {
-            unsafe {
-                libc::lchown(c.as_ptr(), uid, gid);
-            }
         }
     }
     let _ = (path, chown_ids, chmod);

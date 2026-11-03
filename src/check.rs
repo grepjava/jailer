@@ -51,8 +51,16 @@ impl CheckReport {
         self.findings.iter().any(|f| f.severity == Severity::Error)
     }
 
+    /// Adds `other`'s findings but for codes already reported: an image's
+    /// repeat what its Containerfile showed.
     pub fn merge(&mut self, other: CheckReport) {
-        self.findings.extend(other.findings);
+        let seen: std::collections::HashSet<&str> = self.findings.iter().map(|f| f.code).collect();
+        self.findings.extend(
+            other
+                .findings
+                .into_iter()
+                .filter(|f| !seen.contains(f.code)),
+        );
     }
 }
 
@@ -90,7 +98,8 @@ pub fn check_containerfile(cf: &Containerfile) -> CheckReport {
                     );
                 }
             }
-            Instruction::Stopsignal(sig) if state::signal(sig).is_none() => {
+            // One from a variable is checked in the image.
+            Instruction::Stopsignal(sig) if !sig.contains('$') && state::signal(sig).is_none() => {
                 report.error(
                     "LEGION003",
                     format!(
@@ -289,6 +298,23 @@ mod tests {
         assert!(rep.has_errors());
         assert!(rep.findings.iter().any(|f| f.code == "LEGION001"));
         assert!(rep.findings.iter().any(|f| f.code == "LEGION003"));
+
+        // A signal from a variable is the image's to check, and the image
+        // does not repeat what the Containerfile reported.
+        let cf = Containerfile::parse("FROM scratch\nARG SIG=SIGTERM\nSTOPSIGNAL $SIG\n").unwrap();
+        assert!(!check_containerfile(&cf).has_errors());
+        let cf = Containerfile::parse("FROM scratch\nSTOPSIGNAL SIGNOPE\n").unwrap();
+        let mut both = check_containerfile(&cf);
+        let mut cfg = ImageConfig::default();
+        cfg.config.stop_signal = "SIGNOPE".to_owned();
+        both.merge(check_image(&cfg, None));
+        assert_eq!(
+            both.findings
+                .iter()
+                .filter(|f| f.code == "LEGION003")
+                .count(),
+            1
+        );
 
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("etc")).unwrap();

@@ -531,6 +531,46 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert_eq!(labels["after"], "global");
     assert!(vars.config.config.env.contains(&"B=old".to_owned()));
 
+    // A global ARG's default sees the ones before it; a stage built on a
+    // stage has its ARGs; an ENV goes over an ARG of its name; one ARG line
+    // may name several.
+    write_cf(
+        "ARG A=hello\nARG B=${A}-world\nFROM scratch AS parent\nARG B\nARG P=inherited\nFROM parent\nENV E=env\nARG E=arg\nARG X Y=two\nLABEL b=$B p=$P e=$E y=$Y\n"
+            .to_owned(),
+    );
+    let scoped = build(&store, &runtime, &opts("scoped:1"))
+        .await
+        .unwrap()
+        .image;
+    let labels = &scoped.config.config.labels;
+    assert_eq!(labels["b"], "hello-world");
+    assert_eq!(labels["p"], "inherited");
+    assert_eq!(labels["e"], "env");
+    assert_eq!(labels["y"], "two");
+
+    // Many matches of one source go into a directory, as several sources
+    // do, rather than over one another.
+    write_cf("FROM scratch\nCOPY docs/*.* /result\n".to_owned());
+    let many = build(&store, &runtime, &opts("many:1"))
+        .await
+        .unwrap()
+        .image;
+    let got = files(&many);
+    assert!(got.contains_key("result/guide.txt"), "{got:?}");
+    assert!(got.contains_key("result/README.md"), "{got:?}");
+
+    // A `!` pattern takes a file back from a directory left out.
+    std::fs::write(ctx.join(".containerignore"), "docs\n!docs/guide.txt\n").unwrap();
+    write_cf("FROM scratch\nCOPY . /out/\n".to_owned());
+    let taken_back = build(&store, &runtime, &opts("taken-back:1"))
+        .await
+        .unwrap()
+        .image;
+    let got = files(&taken_back);
+    assert_eq!(got["out/docs/guide.txt"], "docs/guide.txt");
+    assert!(!got.contains_key("out/docs/README.md"), "{got:?}");
+    std::fs::remove_file(ctx.join(".containerignore")).unwrap();
+
     // `COPY --from` an image, not a stage, named by an ARG.
     write_cf(
         "FROM scratch AS tools\nFROM scratch\nARG SRC=base:1\nCOPY --from=$SRC /etc/raw.txt /docs/ /copied/\nCOPY --from=tools / /empty/\n"
