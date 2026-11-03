@@ -944,5 +944,95 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
     ]);
     // Run again, the first step makes another /v: the second must run too.
     jailer(&["build", "-t", "c:2", ctx_arg]);
-    assert_eq!(jailer(&["run", "c:2"]), "-rwsr-xr-x nobody:nobody\nnonempty");
+    assert_eq!(
+        jailer(&["run", "c:2"]),
+        "-rwsr-xr-x nobody:nobody\nnonempty"
+    );
+}
+
+#[test]
+fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
+    if !is_root() {
+        eprintln!(
+            "skipping stage_copies_keep_owners_archives_take_flags_and_cache_options_count (requires root)"
+        );
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    let packed = tmp.path().join("packed");
+    std::fs::create_dir_all(ctx.join("d")).unwrap();
+    std::fs::create_dir_all(&packed).unwrap();
+    let mode = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    std::fs::write(ctx.join("f"), "f\n").unwrap();
+    std::fs::write(ctx.join("d/g"), "g\n").unwrap();
+    std::fs::write(packed.join("t"), "#!/bin/sh\n").unwrap();
+    mode(&ctx.join("d"), 0o755);
+    mode(&ctx.join("d/g"), 0o644);
+    mode(&packed.join("t"), 0o644);
+    let tar = Command::new("tar")
+        .arg("-cf")
+        .arg(ctx.join("a.tar"))
+        .arg("-C")
+        .arg(&packed)
+        .arg("t")
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    let containerfile = |cache_opts: &str| {
+        std::fs::write(
+            ctx.join("Containerfile"),
+            format!(
+                r#"FROM docker.io/freebsd/freebsd-runtime:15.1 AS base
+COPY --chown=nobody:nobody --chmod=0640 f /owned
+COPY --chown=nobody:nobody d /d
+FROM docker.io/freebsd/freebsd-runtime:15.1
+COPY --from=base /owned /owned
+COPY --from=base /d /d
+ADD --chown=nobody:nobody --chmod=4755 a.tar /arc/
+RUN --mount=type=cache,target=/c{cache_opts} sh -c 'if (: > /c/x) 2>/dev/null; then echo w; else echo ro; fi > /rc'
+CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); echo $1 $3:$4; done; cat /rc"]
+"#
+            ),
+        )
+        .unwrap();
+    };
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    let ctx_arg = ctx.to_str().unwrap();
+    let owners = "-rw-r----- nobody:nobody\n\
+                  drwxr-xr-x nobody:nobody\n\
+                  -rw-r--r-- nobody:nobody\n\
+                  -rwsr-xr-x nobody:nobody";
+    containerfile("");
+    jailer(&["build", "-t", "o:1", ctx_arg]);
+    assert_eq!(jailer(&["run", "o:1"]), format!("{owners}\nw"));
+    // A read-only cache is another step: it runs again, and cannot write.
+    containerfile(",ro");
+    jailer(&["build", "-t", "o:2", ctx_arg]);
+    assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\nro"));
 }

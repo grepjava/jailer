@@ -423,6 +423,16 @@ fn heredoc_markers(text: &str) -> Vec<(String, bool, bool)> {
             skip = 2;
             continue;
         }
+        // A backslash, but in single quotes, takes the next character as
+        // it is: `\"` does not end a quote, and `\<<` starts no document.
+        if c == '\\' && quote != Some('\'') {
+            word.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                word.push(next);
+                skip = 1;
+            }
+            continue;
+        }
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
@@ -1294,6 +1304,11 @@ CMD ["--serve"]
         assert_eq!(names("cat<<EOF>/file"), ["EOF"]);
         assert_eq!(names("cat <<A | tr a b && cat <<-'B';"), ["A", "B"]);
         assert!(names("cat <<<word").is_empty());
+        // Escaped, neither a quote nor `<<` is what it would be.
+        assert!(names(r#"echo "foo \" <<EOF \" bar""#).is_empty());
+        assert!(names(r"echo \<<EOF").is_empty());
+        assert_eq!(names(r"echo \\ <<EOF"), ["EOF"]);
+        assert_eq!(names(r"echo '\' <<EOF"), ["EOF"]);
     }
 
     #[test]

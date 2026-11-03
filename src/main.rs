@@ -546,7 +546,7 @@ fn parse_ssh(specs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
 #[cfg(unix)]
 fn require_root(what: &str) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        bail!("`jailer {what}` needs root to create jails; run it with sudo or doas");
+        bail!("`jailer {what}` needs root to manage jails; run it with sudo or doas");
     }
     Ok(())
 }
@@ -1115,7 +1115,7 @@ async fn run() -> Result<()> {
             let mut checked_something = false;
             if let Some(cf_path) = cf_candidate {
                 let cf = Containerfile::parse_file(&cf_path)?;
-                report.merge(check_containerfile(&cf));
+                report.merge(check_containerfile(&cf, None));
                 checked_something = true;
             }
 
@@ -1465,10 +1465,12 @@ async fn containers(cli: &Cli) -> Result<()> {
                     continue;
                 }
                 let status = match c.state.as_str() {
-                    "running" => {
-                        let jid = runtime.inspect(&c.id).await?.state.jid;
-                        format!("running (jid {jid}, pid {})", c.pid)
-                    }
+                    "running" => match runtime.inspect(&c.id).await {
+                        Ok(i) => format!("running (jid {}, pid {})", i.state.jid, c.pid),
+                        // Removed since the listing, as by `run --rm`.
+                        Err(e) if e.is_not_found() => continue,
+                        Err(e) => return Err(e.into()),
+                    },
                     "exited" => format!("exited ({})", c.exit_code),
                     other => other.to_owned(),
                 };
@@ -1540,6 +1542,7 @@ async fn containers(cli: &Cli) -> Result<()> {
         }
 
         Commands::Stop { time, container } => {
+            require_root("stop")?;
             let (sys, _, runtime) = open_context(cli, true)?;
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
             let id = runtime.find(container)?;
@@ -1550,6 +1553,7 @@ async fn containers(cli: &Cli) -> Result<()> {
         }
 
         Commands::Rm { force, containers } => {
+            require_root("rm")?;
             let (sys, _, runtime) = open_context(cli, true)?;
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
             for c in containers {

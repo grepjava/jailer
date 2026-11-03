@@ -312,7 +312,9 @@ impl Leases {
 }
 
 impl Locked<'_> {
-    /// The leases whose jails are still there.
+    /// The leases whose jails are still there. One whose jail is gone, as
+    /// when it was removed outside jailer, is dropped with its pf rules and
+    /// epair, which would otherwise still take its ports.
     fn live(&self, sys: &dyn Sys) -> Result<Vec<(Ipv4Addr, Lease)>, Error> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.leases.dir)? {
@@ -320,13 +322,17 @@ impl Locked<'_> {
             let Ok(ip) = entry.file_name().to_string_lossy().parse::<Ipv4Addr>() else {
                 continue;
             };
+            let Some(lease) = read(&entry.path()) else {
+                continue;
+            };
             // Only a jail known to be gone frees its address.
-            if let Some(lease) = read(&entry.path())
-                && !matches!(
-                    sys.jail_get(&lease.jail, &[]),
-                    Err(legion_sys::Error::NotFound(_))
-                )
-            {
+            if matches!(
+                sys.jail_get(&lease.jail, &[]),
+                Err(legion_sys::Error::NotFound(_))
+            ) {
+                detach(sys, &lease.jail);
+                let _ = std::fs::remove_file(entry.path());
+            } else {
                 out.push((ip, lease));
             }
         }
@@ -467,20 +473,20 @@ mod tests {
         assert!(clash.to_string().contains("8080/tcp"), "{clash}");
         drop(held);
 
-        // A lease whose jail is gone is free again; releasing it as
-        // another pod changes nothing.
+        // Releasing a lease as another pod changes nothing.
         leases.release(ip, "someone-else").unwrap();
         assert!(tmp.path().join("10.77.0.2").exists());
+
+        // A lease whose jail is gone is free again, and its ports and
+        // epair go with it.
         sys.remove_jail(pod);
         assert_eq!(leases.lock().unwrap().allocate(&sys, &[]).unwrap(), ip);
-        leases.release(ip, pod).unwrap();
         assert!(!tmp.path().join("10.77.0.2").exists());
-
-        detach(&sys, pod);
         assert!(sys.interface(&host_interface(pod)).is_none());
         assert_eq!(
             sys.anchor("jailer/89abcdef0123").as_deref().unwrap_or(""),
             ""
         );
+        leases.release(ip, pod).unwrap();
     }
 }

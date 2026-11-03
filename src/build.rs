@@ -125,7 +125,7 @@ pub async fn build(
     for w in &cf.warnings {
         eprintln!("warning: {w}");
     }
-    let mut report = check_containerfile(&cf);
+    let mut report = check_containerfile(&cf, opts.target.as_deref());
 
     if opts.backend == BuildBackend::Buildah {
         let image = build_with_buildah(store, &cf_path, opts).await?;
@@ -733,6 +733,7 @@ async fn execute_instruction(
                 spec,
                 is_add,
                 &extras.files,
+                tmp_dir,
                 sp.line,
             )?;
             drop(from_image);
@@ -809,6 +810,14 @@ async fn execute_instruction(
                     env.used.lock().unwrap().push((key.clone(), step));
                 }
                 _ => {
+                    // Said here, the jail call would fail less plainly.
+                    #[cfg(unix)]
+                    if unsafe { libc::geteuid() } != 0 {
+                        return Err(Error::Build(format!(
+                            "line {}: RUN needs root to create its jail; run `jailer build` with sudo or doas",
+                            sp.line
+                        )));
+                    }
                     let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
                     let mut id = [0u8; 6];
                     getrandom::fill(&mut id).expect("random bytes");
@@ -920,6 +929,14 @@ impl RunMounts {
                         set_owner_mode(&dir, *uid, *gid, *mode)?;
                     }
                     out.key.push_str(&format!("\0cache {id} {target}"));
+                    // Options at their defaults leave the key as it was.
+                    if *read_only {
+                        out.key.push_str(" ro");
+                    }
+                    if (*mode, *uid, *gid) != (0o755, 0, 0) {
+                        out.key
+                            .push_str(&format!(" mode={mode:o} uid={uid} gid={gid}"));
+                    }
                     out.mounts.push(StepMount::Nullfs {
                         source: dir,
                         target: target.clone(),
@@ -1422,6 +1439,7 @@ fn apply_copy(
     spec: &CopySpec,
     is_add: bool,
     extras: &[PathBuf],
+    tmp_dir: &Path,
     line_no: usize,
 ) -> Result<(), Error> {
     let (src_root, use_ignore) = match (&spec.from, from_image) {
@@ -1584,7 +1602,31 @@ fn apply_copy(
             // tar finds the compression itself; the archive has no diff_id
             // to check.
             std::fs::create_dir_all(&dst_base)?;
-            layer::extract(&archive, &dst_base)?;
+            if chown_ids.is_none() && spec.chmod.is_none() {
+                layer::extract(&archive, &dst_base)?;
+            } else {
+                // Unpacked aside, then copied in with the owner and mode
+                // asked for, and the archive's links and flags.
+                let aside = tempfile::Builder::new().prefix("add").tempdir_in(tmp_dir)?;
+                layer::extract(&archive, aside.path())?;
+                let unpacked = Copier::new(&stage.root, chown_ids, spec.chmod, true);
+                let copied = (|| {
+                    for entry in std::fs::read_dir(aside.path())? {
+                        let path = entry?.path();
+                        let name = path.file_name().unwrap_or_default();
+                        if std::fs::symlink_metadata(&path)?.is_dir() {
+                            let target = resolve_below(&stage.root, &dst_base.join(name), true)?;
+                            unpacked.dir(&path, &target, &|_| Keep::Yes)?;
+                        } else {
+                            unpacked.entry(&path, &dst_base.join(name))?;
+                        }
+                    }
+                    unpacked.finish()
+                })();
+                // Its files may carry flags that refuse a plain removal.
+                let _ = layer::remove_tree(aside.path());
+                copied?;
+            }
         } else if spec.parents {
             let parent = kept.parent().map_or(dst_base.clone(), |p| dst_base.join(p));
             let parent = resolve_below(&stage.root, &parent, true)?;
@@ -1776,8 +1818,9 @@ fn resolve_below(root: &Path, path: &Path, follow_last: bool) -> Result<PathBuf,
 }
 
 /// Copies files for one `COPY`: owners and modes as it asks, the names
-/// of a hard-linked file linked again, and (from a stage or an image) file
-/// flags, set at the end, since they may refuse what follows.
+/// of a hard-linked file linked again, and (from a stage or an image) the
+/// source's owners and its file flags, set at the end, since they may
+/// refuse what follows.
 struct Copier {
     /// The root filesystem copied into, which its links stay inside.
     root: PathBuf,
@@ -1813,15 +1856,15 @@ impl Copier {
         let made = std::fs::symlink_metadata(dst_dir).is_err();
         std::fs::create_dir_all(dst_dir)?;
         // A directory the copy makes has its source's mode, so that a 0700
-        // one stays closed; one already there keeps its own.
-        #[cfg(unix)]
-        if made && self.chmod.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(src_dir)?.permissions().mode() & 0o7777;
-            std::fs::set_permissions(dst_dir, std::fs::Permissions::from_mode(mode))?;
+        // one stays closed, and from a stage or an image its owner; one
+        // already there keeps its own.
+        let (mut owner, mut mode) = (self.chown, self.chmod);
+        if made {
+            let meta = std::fs::metadata(src_dir)?;
+            owner = owner.or(self.source_owner(&meta));
+            mode = mode.or(file_mode(&meta));
         }
-        let _ = made;
-        apply_perms(dst_dir, self.chown, self.chmod)?;
+        apply_perms(dst_dir, owner, mode)?;
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1918,17 +1961,24 @@ impl Copier {
                 self.linked.borrow_mut().insert(key, dst.to_path_buf());
             }
             std::fs::copy(src, dst)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = self
-                    .chmod
-                    .unwrap_or_else(|| meta.permissions().mode() & 0o7777);
-                std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))?;
-            }
         }
-        apply_perms(dst, self.chown, self.chmod)?;
+        // The source's mode is set again after its owner, which may clear
+        // setuid and setgid bits; a link has none.
+        let mode = self.chmod.or(file_mode(&meta));
+        apply_perms(dst, self.chown.or(self.source_owner(&meta)), mode)?;
         self.keep_flags_of(src, dst)
+    }
+
+    /// The owner of a file copied from a stage or an image; one from the
+    /// context is root's, as in Docker.
+    fn source_owner(&self, meta: &std::fs::Metadata) -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        if self.keep_flags {
+            use std::os::unix::fs::MetadataExt;
+            return Some((meta.uid(), meta.gid()));
+        }
+        let _ = meta;
+        None
     }
 
     fn keep_flags_of(&self, src: &Path, dst: &Path) -> Result<(), Error> {
@@ -1947,6 +1997,20 @@ impl Copier {
             layer::set_flags(path, *flags)?;
         }
         Ok(())
+    }
+}
+
+/// The permission bits of `meta`, on a system that has them.
+fn file_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
     }
 }
 

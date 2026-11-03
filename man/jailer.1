@@ -162,7 +162,7 @@ names it (default
 .Cm mode , uid , gid
 set it up when first made, and
 .Cm ro
-mounts it read-only.
+mounts it read-only; changing any of them runs the step again.
 .It Fl -mount Ns = Ns Cm type=bind , Ns Cm target Ns = Ns Ar path
 The build context, less what
 .Pa .containerignore
@@ -248,7 +248,9 @@ naming an image rather than a stage; it is pulled if missing.
 may use build arguments, as may
 .Cm RUN Fl -mount Ns = Ns Cm type=bind,from= .
 A copy keeps hard links among the files it copies, and a copy from a
-stage or an image keeps their file flags too.
+stage or an image keeps their owners and file flags too, unless
+.Fl -chown
+gives an owner; from the context, files are root's.
 Symbolic links on the way to a source or destination are followed as
 in a jail on that root: an absolute link starts from the image's (or
 the context's) root, and
@@ -277,6 +279,11 @@ Wildcards may appear in any part of a source path.
 .Cm ADD Ar url ,
 downloaded with mode 0600 and not unpacked, and checked with
 .Fl -checksum Ns = Ns Cm sha256: Ns Ar hex .
+A local tar archive is unpacked;
+.Fl -chown
+and
+.Fl -chmod
+apply to what it holds.
 .It
 .Cm ONBUILD ,
 whose instructions are kept in the image and run by builds that use it
@@ -300,7 +307,7 @@ jailer builds only for the host's platform, and refuses any other.
 .Fl -strict
 fails the build when the compatibility check reports an error.
 .Fl -target
-stops at the named stage.
+stops at the named stage, which is the one checked.
 .Fl -squash
 flattens the image, its base included, into one layer.
 Layers keep file flags

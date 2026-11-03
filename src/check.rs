@@ -65,10 +65,14 @@ impl CheckReport {
 }
 
 /// Checks a parsed `Containerfile` for settings Legion does not use or
-/// FreeBSD image anti-patterns.
-pub fn check_containerfile(cf: &Containerfile) -> CheckReport {
+/// FreeBSD image anti-patterns, in the stage built: `target`, or the last.
+pub fn check_containerfile(cf: &Containerfile, target: Option<&str>) -> CheckReport {
     let mut report = CheckReport::default();
-    let Some(final_stage) = cf.stages.last() else {
+    let built = match target {
+        Some(t) => cf.stages.iter().find(|s| s.name.as_deref() == Some(t)),
+        None => cf.stages.last(),
+    };
+    let Some(final_stage) = built else {
         return report;
     };
 
@@ -294,7 +298,7 @@ mod tests {
             "FROM docker.io/freebsd/freebsd-runtime:15.1\nHEALTHCHECK CMD /bin/true\nSTOPSIGNAL SIGBAD\n",
         )
         .unwrap();
-        let rep = check_containerfile(&cf);
+        let rep = check_containerfile(&cf, None);
         assert!(rep.has_errors());
         assert!(rep.findings.iter().any(|f| f.code == "LEGION001"));
         assert!(rep.findings.iter().any(|f| f.code == "LEGION003"));
@@ -302,9 +306,9 @@ mod tests {
         // A signal from a variable is the image's to check, and the image
         // does not repeat what the Containerfile reported.
         let cf = Containerfile::parse("FROM scratch\nARG SIG=SIGTERM\nSTOPSIGNAL $SIG\n").unwrap();
-        assert!(!check_containerfile(&cf).has_errors());
+        assert!(!check_containerfile(&cf, None).has_errors());
         let cf = Containerfile::parse("FROM scratch\nSTOPSIGNAL SIGNOPE\n").unwrap();
-        let mut both = check_containerfile(&cf);
+        let mut both = check_containerfile(&cf, None);
         let mut cfg = ImageConfig::default();
         cfg.config.stop_signal = "SIGNOPE".to_owned();
         both.merge(check_image(&cfg, None));
@@ -315,6 +319,14 @@ mod tests {
                 .count(),
             1
         );
+
+        // With `--target`, the stage built is checked, not the last.
+        let cf = Containerfile::parse(
+            "FROM scratch AS app\nSTOPSIGNAL TERM\nFROM scratch AS unused\nSTOPSIGNAL INVALID\n",
+        )
+        .unwrap();
+        assert!(check_containerfile(&cf, None).has_errors());
+        assert!(!check_containerfile(&cf, Some("app")).has_errors());
 
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("etc")).unwrap();
