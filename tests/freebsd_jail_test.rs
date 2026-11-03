@@ -22,7 +22,9 @@ fn real_freebsd_jail_build_run_export_workflow() {
     let project_dir = tmp.path().join("hello-service");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    let zfs_root = format!("zroot/jailer-test-{}", std::process::id());
+    // A pool of the host's own: JAILER_TEST_POOL, zroot if unset.
+    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let zfs_root = format!("{pool}/jailer-test-{}", std::process::id());
 
     // Ensure cleanup of test ZFS dataset on exit, and first of any container
     // a failed assertion left running, which would hold the dataset (and a
@@ -870,4 +872,77 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         .unwrap()
         .stdout;
     assert!(!String::from_utf8_lossy(&layers).contains("s3cr3t-value"));
+}
+
+#[test]
+fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
+    if !is_root() {
+        eprintln!(
+            "skipping cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid (requires root)"
+        );
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(ctx.join("tool"), "#!/bin/sh\n").unwrap();
+    // The first step makes /v empty, and from then on not; the second makes
+    // nothing while /v is empty.
+    std::fs::write(
+        ctx.join("Containerfile"),
+        r#"FROM docker.io/freebsd/freebsd-runtime:15.1
+RUN --mount=type=cache,target=/c sh -c 'cat /c/n > /v 2>/dev/null; echo x >> /c/n'
+RUN sh -c 'if test -s /v; then : > /nonempty; fi'
+COPY --chown=nobody:nobody --chmod=4755 tool /tool
+CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty && echo nonempty || echo empty"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nLABEL other=1\n",
+    )
+    .unwrap();
+    let jailer = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+
+    let ctx_arg = ctx.to_str().unwrap();
+    jailer(&["build", "-t", "c:1", ctx_arg]);
+    assert_eq!(jailer(&["run", "c:1"]), "-rwsr-xr-x nobody:nobody\nempty");
+    // Without the image, a trim drops the first step's layer from the
+    // cache; the second step, which made nothing, keeps its entry.
+    jailer(&["rmi", "c:1"]);
+    jailer(&[
+        "build",
+        "--cache-max",
+        "0",
+        "-t",
+        "o:1",
+        other.to_str().unwrap(),
+    ]);
+    // Run again, the first step makes another /v: the second must run too.
+    jailer(&["build", "-t", "c:2", ctx_arg]);
+    assert_eq!(jailer(&["run", "c:2"]), "-rwsr-xr-x nobody:nobody\nnonempty");
 }

@@ -1963,12 +1963,16 @@ fn apply_perms(
         if let Some((uid, gid)) = chown_ids {
             let c = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| Error::Build(format!("{}: NUL in path", path.display())))?;
+            // Only root can give a file away: a build run by another user
+            // keeps the files its own, as it did before.
             if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
-                return Err(Error::Build(format!(
-                    "chown {uid}:{gid} {}: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                )));
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EPERM) || unsafe { libc::geteuid() } == 0 {
+                    return Err(Error::Build(format!(
+                        "chown {uid}:{gid} {}: {e}",
+                        path.display()
+                    )));
+                }
             }
         }
         if let Some(mode) = chmod
