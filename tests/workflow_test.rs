@@ -513,6 +513,24 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert_eq!(squashed.config.rootfs.diff_ids.len(), 1);
     assert_eq!(files(&squashed), got);
 
+    // A later ARG default replaces an earlier one, an ENV's values see the
+    // variables as they were before it, and a global ARG reaches a stage
+    // only through an ARG of the stage's own.
+    write_cf(
+        "ARG G=global\nFROM scratch\nARG X=first\nARG X=second\nENV A=old\nENV A=new B=$A\nLABEL x=$X b=$B before=[$G]\nARG G\nLABEL after=$G\n"
+            .to_owned(),
+    );
+    let vars = build(&store, &runtime, &opts("vars:1"))
+        .await
+        .unwrap()
+        .image;
+    let labels = &vars.config.config.labels;
+    assert_eq!(labels["x"], "second");
+    assert_eq!(labels["b"], "old");
+    assert_eq!(labels["before"], "[]");
+    assert_eq!(labels["after"], "global");
+    assert!(vars.config.config.env.contains(&"B=old".to_owned()));
+
     // `COPY --from` an image, not a stage, named by an ARG.
     write_cf(
         "FROM scratch AS tools\nFROM scratch\nARG SRC=base:1\nCOPY --from=$SRC /etc/raw.txt /docs/ /copied/\nCOPY --from=tools / /empty/\n"

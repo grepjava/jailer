@@ -362,7 +362,12 @@ does a container.
 .Fl -backend Cm buildah
 delegates the build to
 .Xr buildah 1
-and imports the result.
+and imports the result; it refuses
+.Fl -param ,
+.Fl -sysv ,
+.Fl -cache-from ,
+.Fl -cache-to
+and the limits above, which only the native builder has.
 .It Xo
 .Nm run
 .Op Fl dit

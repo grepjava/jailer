@@ -126,6 +126,9 @@ pub async fn build(
 
     if opts.backend == BuildBackend::Buildah {
         let image = build_with_buildah(store, &cf_path, opts).await?;
+        if let Some(max) = opts.cache_max {
+            crate::store::trim_cache(store, max).await?;
+        }
         let tmp_check = tempfile::Builder::new()
             .prefix("check-root")
             .tempdir_in(store.dir().join("tmp"))?;
@@ -189,6 +192,7 @@ pub async fn build(
         runtime,
         ignore: &ignore,
         build_args: &build_args,
+        global_args: &global_vars,
         tmp_dir: build_tmp.path(),
         imported: &imported,
         used: &used,
@@ -224,7 +228,7 @@ pub async fn build(
     }
 
     for stage_def in &cf.stages {
-        let mut vars = global_vars.clone();
+        let mut vars = BTreeMap::new();
         let base_ref = expand_vars(&stage_def.base, &from_vars);
         if let Some(p) = &stage_def.platform {
             let p = expand_vars(p, &from_vars);
@@ -489,6 +493,9 @@ struct BuildEnv<'a> {
     ignore: &'a IgnoreMatcher,
     /// `--build-arg` values over Docker's automatic ones.
     build_args: &'a BTreeMap<String, String>,
+    /// The `ARG`s before the first `FROM`, as set: a stage sees one only
+    /// through an `ARG` of its own naming it.
+    global_args: &'a BTreeMap<String, String>,
     tmp_dir: &'a Path,
     /// Steps the `--cache-from` caches have.
     imported: &'a crate::cache::Imported,
@@ -562,6 +569,7 @@ async fn execute_instruction(
         runtime,
         ignore,
         build_args: cli_build_args,
+        global_args,
         tmp_dir,
         ..
     } = env;
@@ -572,13 +580,17 @@ async fn execute_instruction(
                 vars.insert(name.clone(), val.clone());
             } else if let Some(def) = default {
                 let expanded = expand_vars(def, vars);
-                vars.entry(name.clone()).or_insert(expanded);
+                vars.insert(name.clone(), expanded);
+            } else if let Some(val) = global_args.get(name) {
+                vars.entry(name.clone()).or_insert_with(|| val.clone());
             }
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Env(pairs) => {
+            // Each value sees the variables as they were before this `ENV`.
+            let before = vars.clone();
             for (k, v) in pairs {
-                let expanded = expand_vars(v, vars);
+                let expanded = expand_vars(v, &before);
                 vars.insert(k.clone(), expanded.clone());
                 set_env(&mut stage.config.config.env, k, &expanded);
             }
@@ -1866,7 +1878,24 @@ async fn build_with_buildah(
     cf_path: &Path,
     opts: &BuildOptions,
 ) -> Result<Image, Error> {
+    // Options that only mean something to the native builder: say so rather
+    // than build without them.
+    let unsupported = [
+        (!opts.jail_params.is_empty(), "--param and --sysv"),
+        (!opts.limits.is_empty(), "--memory, --cpus and --pids-limit"),
+        (opts.cpuset.is_some(), "--cpuset-cpus"),
+        (!opts.cache_from.is_empty(), "--cache-from"),
+        (opts.cache_to.is_some(), "--cache-to"),
+    ];
+    if let Some((_, flag)) = unsupported.iter().find(|(set, _)| *set) {
+        return Err(Error::Build(format!(
+            "{flag}: not supported with --backend buildah"
+        )));
+    }
     let tag_ref = Reference::parse_local_tag(&opts.tag)?.to_string();
+    let tmp = tempfile::Builder::new()
+        .prefix("buildah-export")
+        .tempdir_in(store.dir().join("tmp"))?;
     let mut cmd = tokio::process::Command::new("buildah");
     cmd.args(["bud", "--network", "host", "-f"])
         .arg(cf_path)
@@ -1878,6 +1907,44 @@ async fn build_with_buildah(
     if let Some(t) = &opts.target {
         cmd.arg("--target").arg(t);
     }
+    if opts.no_cache {
+        cmd.arg("--no-cache");
+    }
+    if opts.squash {
+        cmd.arg("--squash");
+    }
+    for (k, v) in &opts.labels {
+        cmd.arg("--label").arg(format!("{k}={v}"));
+    }
+    for (k, v) in &opts.annotations {
+        cmd.arg("--annotation").arg(format!("{k}={v}"));
+    }
+    if let Some(t) = opts.timestamp {
+        cmd.arg("--timestamp").arg(t.to_string());
+    }
+    if let Some(c) = &opts.creds.creds {
+        cmd.arg("--creds").arg(c);
+    }
+    if let Some(a) = &opts.creds.authfile {
+        cmd.arg("--authfile").arg(a);
+    }
+    // buildah takes secrets from files: they are written, readable only by
+    // their owner, below the export directory removed after the build.
+    let secrets_dir = tmp.path().join("secrets");
+    for (i, (id, data)) in opts.secrets.iter().enumerate() {
+        std::fs::create_dir_all(&secrets_dir)?;
+        let path = secrets_dir.join(i.to_string());
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        std::io::Write::write_all(&mut o.open(&path)?, data)?;
+        cmd.arg("--secret")
+            .arg(format!("id={id},src={}", path.display()));
+    }
+    for (id, sock) in &opts.ssh {
+        cmd.arg("--ssh").arg(format!("{id}={}", sock.display()));
+    }
     cmd.arg(&opts.context_dir);
     let status = cmd
         .status()
@@ -1887,13 +1954,14 @@ async fn build_with_buildah(
         return Err(Error::Build(format!("buildah bud failed ({status})")));
     }
 
-    let tmp = tempfile::Builder::new()
-        .prefix("buildah-export")
-        .tempdir_in(store.dir().join("tmp"))?;
     let archive = tmp.path().join("image.tar");
     let push_dest = format!("oci-archive:{}:{tag_ref}", archive.display());
+    let format = match opts.compression {
+        layer::Compression::Gzip => "gzip",
+        layer::Compression::Zstd => "zstd",
+    };
     let status = tokio::process::Command::new("buildah")
-        .args(["push", &tag_ref, &push_dest])
+        .args(["push", "--compression-format", format, &tag_ref, &push_dest])
         .status()
         .await
         .map_err(|e| Error::Build(format!("running buildah push: {e}")))?;
