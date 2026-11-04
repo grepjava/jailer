@@ -1307,14 +1307,21 @@ struct IgnoreRule {
 }
 
 impl IgnoreMatcher {
-    pub fn from_context_dir(dir: &Path) -> Self {
+    /// The context's `.containerignore`, else its `.dockerignore`. One that
+    /// is there but cannot be read fails the build: copied without it, the
+    /// context would give away what it leaves out.
+    pub fn from_context_dir(dir: &Path) -> Result<Self, Error> {
         for name in [".containerignore", ".dockerignore"] {
             let p = dir.join(name);
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                return Self::parse(&text);
+            match std::fs::read_to_string(&p) {
+                Ok(text) => return Ok(Self::parse(&text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::Build(format!("reading {}: {e}", p.display())));
+                }
             }
         }
-        Self::default()
+        Ok(Self::default())
     }
 
     pub fn parse(text: &str) -> Self {
@@ -1449,6 +1456,31 @@ fn glob_class(p: &[char], c: char) -> Option<(bool, &[char])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ignore_file_that_cannot_be_read_fails() {
+        let t = tempfile::tempdir().unwrap();
+        // None: nothing is left out.
+        assert!(
+            IgnoreMatcher::from_context_dir(t.path())
+                .unwrap()
+                .rules
+                .is_empty()
+        );
+        // Not UTF-8: refused, not passed over for the next or for none.
+        std::fs::write(t.path().join(".dockerignore"), "secrets\n").unwrap();
+        std::fs::write(t.path().join(".containerignore"), b"secrets\n\xff\n").unwrap();
+        let err = IgnoreMatcher::from_context_dir(t.path()).unwrap_err();
+        assert!(err.to_string().contains(".containerignore"), "{err}");
+        // A directory by that name is no file to read either.
+        std::fs::remove_file(t.path().join(".containerignore")).unwrap();
+        std::fs::create_dir(t.path().join(".containerignore")).unwrap();
+        assert!(IgnoreMatcher::from_context_dir(t.path()).is_err());
+        // The next is read when the first is not there.
+        std::fs::remove_dir(t.path().join(".containerignore")).unwrap();
+        let m = IgnoreMatcher::from_context_dir(t.path()).unwrap();
+        assert!(m.is_ignored("secrets"));
+    }
 
     #[test]
     fn parses_multistage_and_continuations() {

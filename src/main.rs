@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use jailer::auth::{check_credentials, resolve_credentials, save_credentials};
 use jailer::build::{BuildBackend, BuildOptions};
-use jailer::check::{CheckReport, Severity, check_containerfile, check_image};
+use jailer::check::{CheckReport, Severity, check_containerfile};
 use jailer::containerfile::Containerfile;
 use jailer::init::{InitOptions, Template, detect_app_name};
 use jailer::layer::Compression;
@@ -1178,19 +1178,7 @@ async fn run() -> Result<()> {
                 target.clone()
             };
             if let Some(img) = store.find(&img_lookup)? {
-                let tmp = tempfile::Builder::new()
-                    .prefix("check")
-                    .tempdir_in(store.dir().join("tmp"))?;
-                // An image whose files cannot be put together is not
-                // passed on its config alone: its files are what is checked.
-                if let Err(e) = store.prepare_rootfs(&img, tmp.path(), None) {
-                    let _ = store.cleanup_rootfs(tmp.path(), None);
-                    return Err(e).with_context(|| {
-                        format!("preparing the files of {img_lookup} to check them")
-                    });
-                }
-                report.merge(check_image(&img.config, Some(tmp.path())));
-                let _ = store.cleanup_rootfs(tmp.path(), None);
+                report.merge(jailer::build::check_stored(&store, &img)?);
                 checked_something = true;
             }
 

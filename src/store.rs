@@ -202,6 +202,10 @@ pub async fn trim_cache(store: &Store, max: u64) -> Result<usize, Error> {
     for e in listed {
         let e = e?;
         let path = e.path();
+        // A build's, being written: whole, it may read as an entry.
+        if e.file_name().to_string_lossy().starts_with(WRITING) {
+            continue;
+        }
         let Some(l) = read_step(&path).and_then(|c| c.layer) else {
             continue;
         };
@@ -300,5 +304,37 @@ mod tests {
         // And what is written ends up under its key.
         super::record_step(&store, "k", &super::CachedStep { layer: None }).unwrap();
         assert!(super::read_step(&cache.join("k")).is_some());
+    }
+
+    #[tokio::test]
+    async fn trimming_leaves_an_entry_being_written() {
+        let t = tempfile::tempdir().unwrap();
+        let store = super::open(
+            std::sync::Arc::new(legion_sys::FakeSys::new()),
+            None,
+            &t.path().join("store"),
+            crate::Client::new().unwrap(),
+        )
+        .unwrap();
+        let cache = super::cache_dir(&store);
+        std::fs::create_dir_all(&cache).unwrap();
+        // Written whole, not yet under its key: an entry by its contents,
+        // of a layer no image has, over any size.
+        let step = super::CachedStep {
+            layer: Some(super::CachedLayer {
+                chain: "ab".repeat(32),
+                diff_id: format!("sha256:{}", "cd".repeat(32)),
+                descriptor: serde_json::from_value(serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{}", "ef".repeat(32)),
+                    "size": 1000,
+                }))
+                .unwrap(),
+            }),
+        };
+        let writing = cache.join(format!("{}abc", super::WRITING));
+        std::fs::write(&writing, serde_json::to_vec(&step).unwrap()).unwrap();
+        assert_eq!(super::trim_cache(&store, 0).await.unwrap(), 0);
+        assert!(writing.exists());
     }
 }

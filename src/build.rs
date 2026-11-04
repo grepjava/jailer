@@ -100,6 +100,25 @@ struct BuiltStage {
     vars: BTreeMap<String, String>,
 }
 
+/// Checks the stored `image` with its files, put together for it in the
+/// store's temporary area and taken away again. An image whose files
+/// cannot be put together fails: it is not passed on its config alone.
+pub fn check_stored(store: &Store, image: &Image) -> Result<CheckReport, Error> {
+    let tmp = tempfile::Builder::new()
+        .prefix("check-root")
+        .tempdir_in(store.dir().join("tmp"))?;
+    if let Err(e) = store.prepare_rootfs(image, tmp.path(), None) {
+        let _ = store.cleanup_rootfs(tmp.path(), None);
+        return Err(Error::Build(format!(
+            "preparing the files of {} to check them: {e}",
+            image.references.first().unwrap_or(&image.id)
+        )));
+    }
+    let report = check_image(&image.config, Some(tmp.path()));
+    let _ = store.cleanup_rootfs(tmp.path(), None);
+    Ok(report)
+}
+
 pub async fn build(
     store: &Arc<Store>,
     runtime: &JailRuntime,
@@ -134,15 +153,7 @@ pub async fn build(
         if let Some(max) = opts.cache_max {
             crate::store::trim_cache(store, max).await?;
         }
-        let tmp_check = tempfile::Builder::new()
-            .prefix("check-root")
-            .tempdir_in(store.dir().join("tmp"))?;
-        if store.prepare_rootfs(&image, tmp_check.path(), None).is_ok() {
-            report.merge(check_image(&image.config, Some(tmp_check.path())));
-            let _ = store.cleanup_rootfs(tmp_check.path(), None);
-        } else {
-            report.merge(check_image(&image.config, None));
-        }
+        report.merge(check_stored(store, &image)?);
         if opts.strict_lint && report.has_errors() {
             return Err(Error::Build(
                 "Legion compatibility check reported errors".to_owned(),
@@ -151,7 +162,7 @@ pub async fn build(
         return Ok(BuildResult { image, report });
     }
 
-    let ignore = IgnoreMatcher::from_context_dir(&opts.context_dir);
+    let ignore = IgnoreMatcher::from_context_dir(&opts.context_dir)?;
     let build_tmp = tempfile::Builder::new()
         .prefix("build")
         .tempdir_in(store.dir().join("tmp"))?;
