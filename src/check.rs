@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::containerfile::{Containerfile, Instruction};
+use crate::containerfile::{Containerfile, Instruction, literal_word};
 use crate::oci::ImageConfig;
 use crate::{state, users};
 
@@ -121,7 +121,10 @@ pub fn check_containerfile(cf: &Containerfile, target: Option<&str>) -> CheckRep
                 }
             }
             // One from a variable is checked in the image.
-            Instruction::Stopsignal(sig) if !sig.contains('$') && state::signal(sig).is_none() => {
+            Instruction::Stopsignal(sig)
+                if !sig.contains('$') && state::signal(&literal_word(sig)).is_none() =>
+            {
+                let sig = literal_word(sig);
                 report.error(
                     "LEGION003",
                     format!(

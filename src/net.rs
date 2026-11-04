@@ -95,7 +95,12 @@ impl FromStr for Port {
         let parts: Vec<&str> = ports.split(':').collect();
         let (host_ip, host, container) = match parts[..] {
             [h, c] => (None, h, c),
-            [ip, h, c] => (Some(ip.parse().map_err(|_| bad())?), h, c),
+            // `0.0.0.0` is every address, as no address given is.
+            [ip, h, c] => (
+                Some(ip.parse::<Ipv4Addr>().map_err(|_| bad())?).filter(|a| !a.is_unspecified()),
+                h,
+                c,
+            ),
             _ => return Err(bad()),
         };
         let port = |p: &str| p.parse::<u16>().ok().filter(|&n| n > 0).ok_or_else(bad);
@@ -421,6 +426,10 @@ mod tests {
         );
         let p: Port = "127.0.0.1:53:5353/udp".parse().unwrap();
         assert_eq!(p.to_string(), "127.0.0.1:53:5353/udp");
+        // Every address, which pf calls `any`.
+        let p: Port = "0.0.0.0:8080:80".parse().unwrap();
+        assert_eq!(p.host_ip, None);
+        assert!(rdr_rules(Ipv4Addr::new(10, 77, 0, 2), &[p]).contains("to any port 8080"));
         for bad in ["80", "a:80", "0:80", "1:2:3:4", "8080:80/sctp", "x:1:2"] {
             assert!(bad.parse::<Port>().is_err(), "{bad}");
         }

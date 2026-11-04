@@ -1255,3 +1255,109 @@ async fn copy_follows_links_only_inside_the_root() {
     assert!(root.join("private/inner").is_dir());
     assert_eq!(mode("private"), 0o700);
 }
+
+/// `CMD`, `ENTRYPOINT`, `SHELL`, `WORKDIR` and `ENV` as Docker keeps them.
+#[cfg(unix)]
+#[tokio::test]
+async fn config_instructions_follow_docker() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let store = Arc::new(
+        jailer::store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        Config {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    let opts = |tag: &str| BuildOptions {
+        context_dir: ctx.clone(),
+        containerfile: None,
+        tag: tag.to_owned(),
+        build_args: BTreeMap::new(),
+        target: None,
+        backend: BuildBackend::Native,
+        creds: Default::default(),
+        strict_lint: false,
+        no_cache: false,
+        squash: false,
+        cache_max: None,
+        secrets: BTreeMap::new(),
+        ssh: BTreeMap::new(),
+        jail_params: Vec::new(),
+        labels: BTreeMap::new(),
+        timestamp: None,
+        limits: Default::default(),
+        compression: Default::default(),
+        cpuset: None,
+        annotations: BTreeMap::new(),
+        cache_from: Vec::new(),
+        cache_to: None,
+    };
+    let write_cf = |text: &str| std::fs::write(ctx.join("Containerfile"), text).unwrap();
+
+    write_cf(concat!(
+        "FROM scratch\n",
+        "SHELL [\"/bin/sh\", \"-e\", \"-c\"]\n",
+        // A CMD of this stage stays after its ENTRYPOINT.
+        "CMD [\"--serve\"]\n",
+        "ENTRYPOINT [\"/app\"]\n",
+        "USER 1001:1002\n",
+        "WORKDIR /app/src\n",
+        "WORKDIR ..\n",
+        "WORKDIR ../../../srv/./data\n",
+        "ENV K=na\n",
+        "ENV ${K}me=v\n",
+        "LABEL \"my.key\" a value\n",
+    ));
+    let image = build(&store, &runtime, &opts("parent:1"))
+        .await
+        .unwrap()
+        .image;
+    let c = &image.config.config;
+    assert_eq!(c.cmd, ["--serve"]);
+    assert_eq!(c.entrypoint, ["/app"]);
+    assert_eq!(c.working_dir, "/srv/data");
+    assert_eq!(c.extra["Shell"], serde_json::json!(["/bin/sh", "-e", "-c"]));
+    assert!(c.env.contains(&"name=v".to_owned()), "{:?}", c.env);
+    assert_eq!(c.labels["my.key"], "a value");
+    let root = tmp.path().join("root");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    // The directories WORKDIR made are the USER's.
+    if unsafe { libc::geteuid() } == 0 {
+        for d in ["app", "app/src", "srv", "srv/data"] {
+            let m = std::fs::metadata(root.join(d)).unwrap();
+            assert_eq!((m.uid(), m.gid()), (1001, 1002), "{d}");
+        }
+    }
+
+    // The SHELL carries over to an image built on it; an ENTRYPOINT
+    // there resets the CMD it inherits.
+    write_cf("FROM parent:1\nCMD echo hi\n");
+    let image = build(&store, &runtime, &opts("child:1"))
+        .await
+        .unwrap()
+        .image;
+    assert_eq!(image.config.config.cmd, ["/bin/sh", "-e", "-c", "echo hi"]);
+    write_cf("FROM parent:1\nENTRYPOINT [\"/x\"]\n");
+    let image = build(&store, &runtime, &opts("child:2"))
+        .await
+        .unwrap()
+        .image;
+    assert!(image.config.config.cmd.is_empty());
+}

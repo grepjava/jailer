@@ -87,7 +87,9 @@ struct BuiltStage {
     config: ImageConfig,
     layers: Vec<String>,
     descriptors: Vec<Descriptor>,
-    shell: Vec<String>,
+    /// Whether this stage gave a `CMD`, which a later `ENTRYPOINT` keeps;
+    /// one from the base it resets, as in Docker.
+    cmd_set: bool,
     /// Identifies the stage's filesystem so far, for the build cache.
     cache_key: String,
     /// The root's state after the last diff, so the next one hashes only
@@ -272,7 +274,7 @@ pub async fn build(
                 },
                 layers: Vec::new(),
                 descriptors: Vec::new(),
-                shell: Vec::new(),
+                cmd_set: false,
                 cache_key: root_key(opts, &["scratch"]),
                 tree: None,
                 vars: BTreeMap::new(),
@@ -297,7 +299,7 @@ pub async fn build(
                 config: prev.config.clone(),
                 layers: prev.layers.clone(),
                 descriptors: prev.descriptors.clone(),
-                shell: prev.shell.clone(),
+                cmd_set: false,
                 cache_key: prev.cache_key.clone(),
                 tree: None,
                 vars: prev.vars.clone(),
@@ -337,7 +339,7 @@ pub async fn build(
                 config: cfg,
                 layers: base_img.layers.clone(),
                 descriptors: base_img.layer_descriptors.clone(),
-                shell: Vec::new(),
+                cmd_set: false,
                 cache_key: root_key(opts, &["from", &base_img.id]),
                 tree: None,
                 vars: BTreeMap::new(),
@@ -615,39 +617,63 @@ async fn execute_instruction(
             // Each value sees the variables as they were before this `ENV`.
             let before = vars.clone();
             for (k, v) in pairs {
+                // As in Docker, the name is expanded too.
+                let k = expand_word(k, &before);
                 let expanded = expand_word(v, &before);
                 vars.insert(k.clone(), expanded.clone());
-                set_env(&mut stage.config.config.env, k, &expanded);
+                set_env(&mut stage.config.config.env, &k, &expanded);
             }
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Label(pairs) => {
             for (k, v) in pairs {
                 let expanded = expand_word(v, vars);
-                stage.config.config.labels.insert(k.clone(), expanded);
+                stage
+                    .config
+                    .config
+                    .labels
+                    .insert(expand_word(k, vars), expanded);
             }
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Workdir(wd) => {
-            let expanded = expand_word(wd, vars);
-            let new_wd = if expanded.starts_with('/') {
-                expanded
-            } else {
-                let base = if stage.config.config.working_dir.is_empty() {
-                    "/"
-                } else {
-                    &stage.config.config.working_dir
-                };
-                format!("{}/{}", base.trim_end_matches('/'), expanded)
-            };
-            // A directory it makes goes into a layer of its own, as in Docker.
+            let new_wd = workdir_path(&stage.config.config.working_dir, &expand_word(wd, vars));
+            // A directory it makes goes into a layer of its own, as in Docker,
+            // owned by the `USER` in force.
             let dir = resolve_in_root(&stage.root, &new_wd, true)?;
             stage.config.config.working_dir = new_wd;
             if dir.is_dir() {
                 record_history(&mut stage.config, &sp.raw, true);
             } else {
+                let owner = match stage.config.config.user.as_str() {
+                    "" => None,
+                    user => {
+                        let read = |f: &str| {
+                            std::fs::read_to_string(stage.root.join(f)).unwrap_or_default()
+                        };
+                        let acc = users::resolve(user, &read("etc/passwd"), &read("etc/group"))
+                            .map_err(|e| {
+                                Error::Build(format!(
+                                    "line {}: WORKDIR as USER {user}: {e}",
+                                    sp.line
+                                ))
+                            })?;
+                        Some((acc.uid, acc.gid))
+                    }
+                };
                 let before = TreeState::capture_from(&stage.root, stage.tree.as_ref())?;
+                let mut made = Vec::new();
+                let mut d = dir.as_path();
+                while !d.exists() {
+                    made.push(d.to_path_buf());
+                    d = d.parent().unwrap_or(&stage.root);
+                }
                 std::fs::create_dir_all(&dir)?;
+                if let Some((uid, gid)) = owner {
+                    for d in &made {
+                        set_owner_mode(d, uid, gid, 0o755)?;
+                    }
+                }
                 commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
                 stage.cache_key = copy_key(stage, &sp.raw);
             }
@@ -688,7 +714,12 @@ async fn execute_instruction(
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Shell(sh) => {
-            stage.shell = sh.clone();
+            // Kept in the image, as Docker does, for the images built on it.
+            stage
+                .config
+                .config
+                .extra
+                .insert("Shell".to_owned(), serde_json::json!(sh));
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Healthcheck(_) => {
@@ -699,12 +730,15 @@ async fn execute_instruction(
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Entrypoint(form) => {
-            stage.config.config.entrypoint = form.to_argv(&stage.shell);
-            stage.config.config.cmd.clear();
+            stage.config.config.entrypoint = form.to_argv(&shell_of(&stage.config));
+            if !stage.cmd_set {
+                stage.config.config.cmd.clear();
+            }
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Cmd(form) => {
-            stage.config.config.cmd = form.to_argv(&stage.shell);
+            stage.config.config.cmd = form.to_argv(&shell_of(&stage.config));
+            stage.cmd_set = true;
             record_history(&mut stage.config, &sp.raw, true);
         }
         Instruction::Copy(spec) | Instruction::Add(spec) => {
@@ -744,7 +778,7 @@ async fn execute_instruction(
         Instruction::Run(form, run_opts) => {
             // As in Docker, `$VAR` in RUN, CMD and ENTRYPOINT is left to the
             // shell: build args and ENV reach it through the environment.
-            let argv = form.to_argv(&stage.shell);
+            let argv = form.to_argv(&shell_of(&stage.config));
             let mut run_env = stage.config.config.env.clone();
             for (k, v) in vars.iter() {
                 if !run_env
@@ -1871,9 +1905,52 @@ fn rel_path(p: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Where a `WORKDIR` of `path` goes from `current`: as in Docker, a path
+/// relative to `current`, with `.` and `..` resolved by name (`..` of `/`
+/// is `/`).
+fn workdir_path(current: &str, path: &str) -> String {
+    let joined = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("{current}/{path}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in joined.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// The shell of a `SHELL`, in this image or one it is built on: empty for
+/// `/bin/sh -c`.
+fn shell_of(cfg: &ImageConfig) -> Vec<String> {
+    cfg.config
+        .extra
+        .get("Shell")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// A name `ADD` unpacks: a tar, compressed or not, in any of the ways
+/// bsdtar reads.
 fn is_archive_name(p: &Path) -> bool {
-    let s = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    s.ends_with(".tar") || s.ends_with(".tar.gz") || s.ends_with(".tgz") || s.ends_with(".tar.zst")
+    let s = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [
+        ".tar", ".tar.gz", ".tgz", ".tar.zst", ".tzst", ".tar.xz", ".txz", ".tar.bz2", ".tbz",
+        ".tbz2", ".tar.lz4",
+    ]
+    .iter()
+    .any(|ext| s.ends_with(ext))
 }
 
 /// The paths a source names, with wildcards allowed in any component.

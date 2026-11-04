@@ -88,6 +88,11 @@ or
 and is detected from the project files when omitted.
 .Ar release
 is the FreeBSD base image tag, by default the host's release.
+A project with a
+.Pa .dockerignore
+gets no
+.Pa .containerignore ,
+which would take the place of its rules.
 .Fl f
 overwrites an existing
 .Pa Containerfile .
@@ -294,7 +299,15 @@ Wildcards may appear in any part of a source path.
 .Cm ADD Ar url ,
 downloaded with mode 0600 and not unpacked, and checked with
 .Fl -checksum Ns = Ns Cm sha256: Ns Ar hex .
-A local tar archive is unpacked;
+A local tar archive is unpacked: a name ending in
+.Pa .tar ,
+.Pa .tar.gz , .tgz ,
+.Pa .tar.zst , .tzst ,
+.Pa .tar.xz , .txz ,
+.Pa .tar.bz2 , .tbz , .tbz2
+or
+.Pa .tar.lz4 ,
+in any case;
 .Fl -chown
 and
 .Fl -chmod
@@ -309,6 +322,46 @@ The
 parser directive;
 .Ql # syntax=
 is ignored with a warning.
+.It
+Variables:
+.Ql $VAR ,
+.Ql ${VAR} ,
+.Ql ${VAR:-word} ,
+.Ql ${VAR-word} ,
+.Ql ${VAR:+word}
+and
+.Ql ${VAR+word} ,
+with variables in
+.Ar word
+expanded too.
+In double quotes a backslash escapes only
+.Ql \(dq ,
+.Ql $
+and itself, and is kept before anything else.
+.Cm ENV
+and
+.Cm LABEL
+names are expanded as their values are.
+.It
+.Cm SHELL ,
+kept in the image for the builds that use it as a base, and used for
+the shell forms of
+.Cm RUN , CMD
+and
+.Cm ENTRYPOINT .
+.Cm ENTRYPOINT
+resets a
+.Cm CMD
+the base image gave, not one given before it in the same stage.
+.It
+.Cm WORKDIR ,
+relative to the one before, with
+.Ql ..
+going up (never above
+.Pa / ) .
+Directories it makes belong to the
+.Cm USER
+in force.
 .It
 .Cm FROM Fl -platform
 and the
@@ -470,6 +523,9 @@ read-only with
 Working directory inside the container.
 .It Fl -rm
 Remove the container when it exits.
+With
+.Fl d ,
+a process of its own waits for that and removes it.
 .It Fl -vnet
 Run it as a node runs a pod: a VNET jail running nothing, named
 .Ar name Ns Li -pod ,
@@ -506,7 +562,9 @@ Publish the container's port
 on the host's port
 .Ar host ,
 on every address or only
-.Ar ip ;
+.Ar ip
+.Pf ( Li 0.0.0.0
+is every address);
 implies
 .Fl -vnet .
 Other machines reach it; the host itself reaches the container at its

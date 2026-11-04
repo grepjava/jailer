@@ -468,6 +468,11 @@ pub enum Commands {
         containers: Vec<String>,
     },
 
+    /// Internal: waits for a container started by `run -d --rm` to exit,
+    /// then removes it
+    #[command(name = "rm-on-exit", hide = true)]
+    RmOnExit { id: String },
+
     /// Internal supervisor shim for jails
     #[command(name = "jail-shim", hide = true)]
     JailShim {
@@ -688,6 +693,32 @@ impl LimitArgs {
     }
 }
 
+/// Leaves a process of its own, in a group of its own so that the
+/// terminal's signals miss it, to remove the container `id` once it exits.
+#[cfg(unix)]
+fn remove_on_exit(cli: &Cli, id: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    // As this run found its store, so the helper does.
+    cmd.arg("--state-dir")
+        .arg(cli.state_dir.clone().unwrap_or_else(default_state_dir));
+    match resolve_zfs_root(cli, &Shell::new()) {
+        Some(root) => cmd.arg("--zfs-root").arg(root),
+        None => cmd.arg("--no-zfs"),
+    };
+    cmd.args(["rm-on-exit", id])
+        .env_remove("JAILER_NO_ZFS")
+        .env_remove("JAILER_ZFS_ROOT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("starting the process that removes the container on exit")?;
+    Ok(())
+}
+
 fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
     let sys: Arc<dyn Sys> = Arc::new(Shell::new());
     let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
@@ -819,6 +850,8 @@ async fn run() -> Result<()> {
             );
             if let Some(ig) = outcome.containerignore {
                 println!("Created {}", ig.display());
+            } else if dir.join(".dockerignore").exists() {
+                println!("Kept .dockerignore: a .containerignore would go over it");
             }
             Ok(())
         }
@@ -1291,7 +1324,8 @@ async fn run() -> Result<()> {
         | Commands::Logs { .. }
         | Commands::Exec { .. }
         | Commands::Stop { .. }
-        | Commands::Rm { .. } => containers(&cli).await,
+        | Commands::Rm { .. }
+        | Commands::RmOnExit { .. } => containers(&cli).await,
     }
 }
 
@@ -1443,6 +1477,9 @@ async fn containers(cli: &Cli) -> Result<()> {
                     }
                     return Err(e.into());
                 }
+                if *rm {
+                    remove_on_exit(cli, &id)?;
+                }
                 println!("{id}");
                 return Ok(());
             }
@@ -1565,6 +1602,20 @@ async fn containers(cli: &Cli) -> Result<()> {
             let wait = Duration::from_secs(time.unwrap_or(10));
             jailer::runtime::stop(&runtime, &*sys, &leases, &id, wait).await?;
             println!("{container}");
+            Ok(())
+        }
+
+        Commands::RmOnExit { id } => {
+            let (sys, _, runtime) = open_context(cli, true)?;
+            let leases = jailer::net::Leases::new(jailer::net::LEASES);
+            // Gone before it exits, as by `jailer rm -f`: nothing to do.
+            match runtime.wait(id).await {
+                Ok(_) => {
+                    jailer::runtime::remove(&runtime, &*sys, &leases, id).await?;
+                }
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
             Ok(())
         }
 

@@ -135,7 +135,7 @@ impl RunMount {
     /// The mount with build arguments and `ENV` expanded in its names and
     /// paths.
     pub fn expanded(&self, vars: &BTreeMap<String, String>) -> RunMount {
-        let x = |s: &String| expand_vars(s, vars);
+        let x = |s: &String| expand_word(s, vars);
         let mut m = self.clone();
         match &mut m {
             RunMount::Cache { id, target, .. }
@@ -425,6 +425,16 @@ fn join_logical_lines(input: &str, escape: char) -> Result<Vec<Logical>, Error> 
         });
     }
     if !current.is_empty() {
+        // Continued at the end of the file: a here-document it opens has
+        // no body at all.
+        let verb = current.split_whitespace().next().unwrap_or("");
+        if ["RUN", "COPY", "ADD"].contains(&verb.to_ascii_uppercase().as_str())
+            && let Some((name, ..)) = heredoc_markers(&current).into_iter().next()
+        {
+            return Err(Error::Build(format!(
+                "line {start_line}: here-document `{name}` is not closed"
+            )));
+        }
         out.push(Logical {
             line: start_line,
             text: current,
@@ -548,7 +558,8 @@ fn parse_from(
             platform = Some(p.to_owned());
         } else {
             return Err(Error::Build(format!(
-                "line {line_no}: unknown FROM flag `{flag}`"
+                "line {line_no}: unknown FROM flag `{}`",
+                literal_word(flag)
             )));
         }
         idx += 1;
@@ -565,7 +576,7 @@ fn parse_from(
                 "line {line_no}: expected `AS <name>` in `FROM`"
             )));
         }
-        Some(tokens[idx + 1].clone())
+        Some(literal_word(&tokens[idx + 1]))
     } else {
         None
     };
@@ -585,8 +596,8 @@ fn parse_arg(
     Ok(tokens
         .into_iter()
         .map(|t| match t.split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (t, None),
+            Some((k, v)) => (literal_word(k), Some(v.to_owned())),
+            None => (literal_word(&t), None),
         })
         .collect())
 }
@@ -620,7 +631,7 @@ fn parse_instruction(
             rest, line_no, false, escape, heredocs,
         )?)),
         "RUN" => {
-            let (opts, command) = parse_run_flags(rest, line_no)?;
+            let (opts, command) = parse_run_flags(rest, line_no, escape)?;
             let form = run_heredocs(parse_command_form(command), heredocs, line_no)?;
             Ok(Instruction::Run(form, opts))
         }
@@ -703,13 +714,41 @@ fn run_heredocs(
     Ok(CommandForm::Shell(text))
 }
 
+/// Splits the first word, a flag, off `rest` at a space outside quotes:
+/// the flag with its quotes and escapes taken away, and the rest.
+fn split_flag(rest: &str, escape: char) -> (String, &str) {
+    let mut quote = None;
+    let mut chars = rest.char_indices();
+    let mut end = rest.len();
+    while let Some((i, c)) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == escape => {
+                chars.next();
+            }
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == escape => {
+                chars.next();
+            }
+            None if c.is_whitespace() => {
+                end = i;
+                break;
+            }
+            None => {}
+        }
+    }
+    (unquote_word(&rest[..end], escape), rest[end..].trim_start())
+}
+
 /// Splits `--mount=...` and `--network=...` off the front of a `RUN`.
-fn parse_run_flags(rest: &str, line_no: usize) -> Result<(RunOptions, &str), Error> {
+fn parse_run_flags(rest: &str, line_no: usize, escape: char) -> Result<(RunOptions, &str), Error> {
     let mut opts = RunOptions::default();
     let mut rest = rest.trim_start();
     while rest.starts_with("--") {
-        let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        rest = tail.trim_start();
+        let (flag, tail) = split_flag(rest, escape);
+        rest = tail;
+        let flag = flag.as_str();
         if let Some(spec) = flag.strip_prefix("--mount=") {
             opts.mounts.push(parse_mount(spec, line_no)?);
         } else if let Some(net) = flag.strip_prefix("--network=") {
@@ -724,7 +763,8 @@ fn parse_run_flags(rest: &str, line_no: usize) -> Result<(RunOptions, &str), Err
             };
         } else {
             return Err(Error::Build(format!(
-                "line {line_no}: unsupported RUN flag `{flag}`"
+                "line {line_no}: unsupported RUN flag `{}`",
+                literal_word(flag)
             )));
         }
     }
@@ -737,7 +777,12 @@ fn parse_run_flags(rest: &str, line_no: usize) -> Result<(RunOptions, &str), Err
 }
 
 fn parse_mount(spec: &str, line_no: usize) -> Result<RunMount, Error> {
-    let bad = |msg: String| Error::Build(format!("line {line_no}: --mount={spec}: {msg}"));
+    let bad = |msg: String| {
+        Error::Build(format!(
+            "line {line_no}: --mount={}: {msg}",
+            literal_word(spec)
+        ))
+    };
     let mut kv: BTreeMap<&str, &str> = BTreeMap::new();
     for part in spec.split(',').filter(|p| !p.is_empty()) {
         let (k, v) = part.split_once('=').unwrap_or((part, "true"));
@@ -915,10 +960,11 @@ fn parse_copy(
     };
     let mut rest = rest.trim_start();
     while rest.starts_with("--") {
-        let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        rest = tail.trim_start();
+        let (flag, tail) = split_flag(rest, escape);
+        rest = tail;
+        let flag = flag.as_str();
         let (name, value) = match flag[2..].split_once('=') {
-            Some((n, v)) => (n, Some(unquote_word(v, escape))),
+            Some((n, v)) => (n, Some(v.to_owned())),
             None => (&flag[2..], None),
         };
         let need = || {
@@ -950,7 +996,7 @@ fn parse_copy(
                 spec.checksum = Some(if v.contains('$') {
                     v.to_owned()
                 } else {
-                    checksum(&v).map_err(bad)?
+                    checksum(&literal_word(&v)).map_err(bad)?
                 });
             }
             _ => return Err(bad(format!("does not support `{flag}`"))),
@@ -958,8 +1004,21 @@ fn parse_copy(
     }
 
     let mut words = try_parse_json_array(rest).unwrap_or_else(|| tokenize_words(rest, escape));
-    // Words naming here-documents stand for the files `spec.heredocs` holds.
-    words.retain(|w| !(w.starts_with("<<") && w.len() > 2));
+    // Words naming here-documents stand for the files `spec.heredocs` holds;
+    // another word may begin with `<<`, as a quoted `"<<name"`.
+    let mut docs: Vec<&str> = spec.heredocs.iter().map(|h| h.name.as_str()).collect();
+    words.retain(|w| {
+        let name = w
+            .strip_prefix("<<")
+            .map(|n| n.strip_prefix('-').unwrap_or(n));
+        match name.and_then(|n| docs.iter().position(|d| *d == n)) {
+            Some(i) => {
+                docs.remove(i);
+                false
+            }
+            None => true,
+        }
+    });
     if words.is_empty() || words.len() + spec.heredocs.len() < 2 {
         return Err(bad(
             "requires at least one source and a destination".to_owned()
@@ -997,7 +1056,7 @@ fn parse_key_values(
                 "line {line_no}: `{what}` needs a key and value"
             )));
         };
-        return Ok(vec![(k.to_owned(), unquote_word(v, escape))]);
+        return Ok(vec![(unquote_word(k, escape), unquote_word(v, escape))]);
     }
     let mut out = Vec::new();
     for tok in tokens {
@@ -1046,8 +1105,14 @@ fn scan_words(s: &str, escape: char, split: bool) -> Vec<String> {
                 if c == q {
                     quote = None;
                 } else if c == escape && q == '"' {
-                    if let Some(next) = chars.next() {
-                        literal(&mut cur, next);
+                    // As in Docker, only `"`, `$` and the escape itself
+                    // are escaped in double quotes: `"\d"` keeps its `\`.
+                    match chars.clone().next() {
+                        Some(next) if next == '"' || next == '$' || next == escape => {
+                            chars.next();
+                            literal(&mut cur, next);
+                        }
+                        _ => cur.push(c),
                     }
                 } else if q == '\'' {
                     literal(&mut cur, c);
@@ -1084,63 +1149,104 @@ pub fn expand_word(word: &str, vars: &BTreeMap<String, String>) -> String {
     expand(word, vars, false).replace(LITERAL_DOLLAR, "$")
 }
 
+/// A word the parser kept, as it reads with no variables expanded: for
+/// messages, and for words, like stage names, that are not expanded.
+pub fn literal_word(word: &str) -> String {
+    word.replace(LITERAL_DOLLAR, "$")
+}
+
 /// Expands text as written, such as a here-document's: there `\$` is a
 /// `$` that does not expand.
 pub fn expand_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
     expand(input, vars, true)
 }
 
-/// Expands `$VAR`, `${VAR}`, `${VAR:-default}`, and `${VAR:+alt}` using
-/// `vars`; with `escapes`, `\$` stands for `$`.
+/// Expands `$VAR`, `${VAR}`, `${VAR:-word}`, `${VAR-word}`, `${VAR:+word}`
+/// and `${VAR+word}` using `vars`; with `escapes`, `\$` stands for `$` and
+/// `\}` for `}`.
 fn expand(input: &str, vars: &BTreeMap<String, String>, escapes: bool) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if escapes && c == '\\' && chars.peek() == Some(&'$') {
-            out.push(chars.next().unwrap());
+    let chars: Vec<char> = input.chars().collect();
+    let mut at = 0;
+    expand_to(&chars, &mut at, vars, escapes, false)
+}
+
+/// Expands `chars` from `at` to their end or, `in_braces`, to the `}`
+/// closing a `${`, which is left at `at`. The word of a `${VAR:-word}` is
+/// expanded in turn, so it may hold variables, `${...}` among them.
+fn expand_to(
+    chars: &[char],
+    at: &mut usize,
+    vars: &BTreeMap<String, String>,
+    escapes: bool,
+    in_braces: bool,
+) -> String {
+    let mut out = String::new();
+    while let Some(&c) = chars.get(*at) {
+        if c == '}' && in_braces {
+            return out;
+        }
+        *at += 1;
+        if escapes && c == '\\' && matches!(chars.get(*at), Some('$' | '}')) {
+            out.push(chars[*at]);
+            *at += 1;
             continue;
         }
         if c != '$' {
             out.push(c);
             continue;
         }
-        if chars.peek() == Some(&'{') {
-            chars.next();
-            let mut expr = String::new();
-            while let Some(&nc) = chars.peek() {
-                chars.next();
-                if nc == '}' {
-                    break;
-                }
-                expr.push(nc);
-            }
-            if let Some((name, def)) = expr.split_once(":-") {
-                let val = vars.get(name).map(String::as_str).unwrap_or("");
-                out.push_str(if val.is_empty() { def } else { val });
-            } else if let Some((name, alt)) = expr.split_once(":+") {
-                let val = vars.get(name).map(String::as_str).unwrap_or("");
-                if !val.is_empty() {
-                    out.push_str(alt);
-                }
-            } else if let Some(val) = vars.get(&expr) {
-                out.push_str(val);
-            }
-        } else {
-            let mut name = String::new();
-            while let Some(&nc) = chars.peek() {
-                if nc.is_ascii_alphanumeric() || nc == '_' {
-                    name.push(nc);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if name.is_empty() {
+        let name_len = |from: usize| {
+            chars[from..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                .count()
+        };
+        if chars.get(*at) != Some(&'{') {
+            let n = name_len(*at);
+            if n == 0 {
                 out.push('$');
-            } else if let Some(val) = vars.get(&name) {
-                out.push_str(val);
+            } else {
+                let name: String = chars[*at..*at + n].iter().collect();
+                *at += n;
+                if let Some(val) = vars.get(&name) {
+                    out.push_str(val);
+                }
             }
+            continue;
         }
+        *at += 1;
+        let n = name_len(*at);
+        let name: String = chars[*at..*at + n].iter().collect();
+        *at += n;
+        let val = vars.get(&name).map(String::as_str);
+        let op: String = chars[*at..]
+            .iter()
+            .take(2)
+            .take_while(|c| **c == ':' || **c == '-' || **c == '+')
+            .collect();
+        let op = match op.as_str() {
+            ":-" | ":+" => op,
+            o if o.starts_with('-') || o.starts_with('+') => o[..1].to_owned(),
+            _ => String::new(),
+        };
+        *at += op.len();
+        let at_close = chars.get(*at) == Some(&'}');
+        let word = expand_to(chars, at, vars, escapes, true);
+        if chars.get(*at) == Some(&'}') {
+            *at += 1;
+        }
+        let set = val.is_some_and(|v| !v.is_empty());
+        let pick = match op.as_str() {
+            ":-" if set => val.unwrap_or(""),
+            ":-" => word.as_str(),
+            "-" => val.unwrap_or(word.as_str()),
+            ":+" if set => word.as_str(),
+            "+" if val.is_some() => word.as_str(),
+            "" if at_close => val.unwrap_or(""),
+            // `${A:+...}` unset, or a form not known, as `${A:?msg}`.
+            _ => "",
+        };
+        out.push_str(pick);
     }
     out
 }
@@ -1703,5 +1809,97 @@ COPY a\\b `
         assert!(!glob_match("v[^0-9]", "v1"));
         assert!(glob_match("[]]", "]"));
         assert!(glob_match("a[", "a["));
+    }
+
+    #[test]
+    fn docker_quoting_and_nested_defaults() {
+        let vars = BTreeMap::from([
+            ("INNER".to_owned(), "value".to_owned()),
+            ("EMPTY".to_owned(), String::new()),
+        ]);
+        let env = |text: &str| {
+            let Instruction::Env(pairs) = parse_instruction("ENV", text, 1, '\\', vec![]).unwrap()
+            else {
+                panic!("not ENV")
+            };
+            pairs
+                .iter()
+                .map(|(k, v)| (expand_word(k, &vars), expand_word(v, &vars)))
+                .collect::<Vec<_>>()
+        };
+        // In double quotes only `"`, `$` and `\` are escaped.
+        assert_eq!(env(r#"R="\d+\s" Q="a\"b\\c\$x""#)[0].1, r"\d+\s");
+        assert_eq!(env(r#"R="\d+\s" Q="a\"b\\c\$x""#)[1].1, r#"a"b\c$x"#);
+        // The word of a default is expanded, `${...}` in it too.
+        for (text, want) in [
+            ("O=${MISSING:-${INNER}}", "value"),
+            ("O=${MISSING:-a${INNER}b}", "avalueb"),
+            ("O=${MISSING:-$INNER/x}", "value/x"),
+            ("O=${INNER:+[${INNER}]}", "[value]"),
+            ("O=${EMPTY:-d}", "d"),
+            ("O=${EMPTY-d}", ""),
+            ("O=${MISSING-d}", "d"),
+            ("O=${EMPTY+set}", "set"),
+            ("O=${EMPTY:+set}", ""),
+            ("O=${MISSING:-'$INNER'}", "$INNER"),
+            ("O=${INNER}}", "value}"),
+        ] {
+            assert_eq!(env(text)[0].1, want, "{text}");
+        }
+        assert_eq!(expand_vars(r"${MISSING:-a\$b\}}", &vars), "a$b}");
+        // A key is expanded as well; a legacy one has its quotes taken away.
+        assert_eq!(env("${INNER}=1")[0].0, "value");
+        assert_eq!(
+            env("\"my.key\" a b")[0],
+            ("my.key".to_owned(), "a b".to_owned())
+        );
+
+        // Words nothing expands read with their `$`.
+        let cf = Containerfile::parse("FROM scratch AS a\\$b\nSTOPSIGNAL \\$SIGTERM\n").unwrap();
+        assert_eq!(cf.stages[0].name.as_deref(), Some("a$b"));
+        let report = crate::check::check_containerfile(&cf, None);
+        assert!(
+            report.findings.iter().any(|f| f
+                .message
+                .contains("STOPSIGNAL \"$SIGTERM\" is not supported")),
+            "{report:?}"
+        );
+        let err = Containerfile::parse("FROM scratch\nADD --checksum=\\$x http://h/f /f\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--checksum=$x:"), "{err}");
+    }
+
+    #[test]
+    fn quoted_flags_and_heredoc_words() {
+        let parse = |verb: &str, s: &str| parse_instruction(verb, s, 1, '\\', Vec::new());
+        let Instruction::Run(_, opts) = parse(
+            "RUN",
+            r#"--mount=type=cache,target="/var/cache/pkg",id='$x' --mount="type=tmpfs,target=/a b" true"#,
+        )
+        .unwrap() else {
+            panic!("not RUN")
+        };
+        let vars = BTreeMap::new();
+        let m = opts.mounts[0].expanded(&vars);
+        assert_eq!(m.target(), "/var/cache/pkg");
+        let RunMount::Cache { id, .. } = m else {
+            panic!("not a cache")
+        };
+        assert_eq!(id, "$x");
+        assert_eq!(opts.mounts[1].target(), "/a b");
+        let Instruction::Copy(spec) = parse("COPY", r#"--chown="1:2" "<<file" /dst"#).unwrap()
+        else {
+            panic!("not COPY")
+        };
+        assert_eq!(spec.chown.as_deref(), Some("1:2"));
+        assert_eq!(spec.sources, ["<<file"]);
+
+        // A here-document opened on a line continued at the file's end is
+        // not closed.
+        let err = Containerfile::parse("FROM scratch\nRUN cat <<EOF \\")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`EOF` is not closed"), "{err}");
     }
 }

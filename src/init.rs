@@ -158,8 +158,12 @@ pub fn scaffold(opts: &InitOptions) -> Result<InitOutcome, Error> {
     let content = render_containerfile(template, &release, &app_name);
     std::fs::write(&cf_path, content)?;
 
+    // A `.containerignore` goes over a `.dockerignore`, whose rules are the
+    // project's: one is not written over them, even with --force.
     let ignore_path = opts.dir.join(".containerignore");
-    let wrote_ignore = if !ignore_path.exists() || opts.force {
+    let wrote_ignore = if opts.dir.join(".dockerignore").exists() {
+        None
+    } else if !ignore_path.exists() || opts.force {
         std::fs::write(&ignore_path, render_containerignore(template))?;
         Some(ignore_path)
     } else {
@@ -321,5 +325,20 @@ mod tests {
         assert!(cf.contains("FROM docker.io/freebsd/freebsd-runtime:15.1"));
         assert!(cf.contains("/usr/local/bin/demo-svc"));
         assert!(cf.contains("USER nobody"));
+        assert!(out.containerignore.is_some());
+
+        // A project's .dockerignore stays the rules: none goes over it.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".dockerignore"), ".env\n").unwrap();
+        let out = scaffold(&InitOptions {
+            dir: d.path().to_path_buf(),
+            template: None,
+            release: Some("15.1".to_owned()),
+            name: None,
+            force: true,
+        })
+        .unwrap();
+        assert!(out.containerignore.is_none());
+        assert!(!d.path().join(".containerignore").exists());
     }
 }

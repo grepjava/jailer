@@ -312,6 +312,23 @@ CMD ["default-arg"]
     cmd(&["rm", "bg"]);
     assert!(!cmd(&["ps", "-a"]).contains(" bg "));
 
+    // `-d --rm`: removed once it exits, after this command has returned.
+    cmd(&[
+        &["run", "-d", "--rm", "--name", "gone"][..],
+        &shell,
+        &["sleep 2"],
+    ]
+    .concat());
+    assert!(cmd(&["ps"]).contains(" gone "));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while cmd(&["ps", "-a"]).contains(" gone ") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run -d --rm left its container"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     let over = cmd(&[
         &["run", "--param", "securelevel=-1"][..],
         &shell,
