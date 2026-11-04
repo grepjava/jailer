@@ -648,11 +648,9 @@ async fn execute_instruction(
                 let owner = match stage.config.config.user.as_str() {
                     "" => None,
                     user => {
-                        let read = |f: &str| {
-                            std::fs::read_to_string(stage.root.join(f)).unwrap_or_default()
-                        };
-                        let acc = users::resolve(user, &read("etc/passwd"), &read("etc/group"))
-                            .map_err(|e| {
+                        let read = |f: &str| account_file(&stage.root, f);
+                        let acc =
+                            users::resolve(user, &read("passwd"), &read("group")).map_err(|e| {
                                 Error::Build(format!(
                                     "line {}: WORKDIR as USER {user}: {e}",
                                     sp.line
@@ -1051,37 +1049,36 @@ impl RunMounts {
                             Keep::No
                         }
                     };
-                    let src =
-                        if left_out {
-                            let copier = Copier::new(&scratch, None, None, false);
-                            copier.below(&src, &scratch, &filter)?;
-                            copier.finish()?;
-                            // None of the files put back is there.
-                            if std::fs::symlink_metadata(&scratch).is_err() {
-                                return Err(not_found());
-                            }
-                            out.temp.push(scratch.clone());
-                            scratch
-                        } else if from.is_none()
-                            && src.is_dir()
-                            && any_ignored(context_dir, &src, ignore)
-                        {
-                            let copier = Copier::new(&scratch, None, None, false);
-                            copier.dir(&src, &scratch, &filter)?;
-                            copier.finish()?;
-                            out.temp.push(scratch.clone());
-                            scratch
-                        } else if *rw {
-                            if src.is_dir() {
-                                layer::copy_tree(&src, &scratch)?;
-                            } else {
-                                std::fs::copy(&src, &scratch)?;
-                            }
-                            out.temp.push(scratch.clone());
-                            scratch
+                    let src = if left_out {
+                        let copier = Copier::new(&scratch, None, None, false);
+                        copier.below(&src, &scratch, &filter)?;
+                        copier.finish()?;
+                        // None of the files put back is there.
+                        if std::fs::symlink_metadata(&scratch).is_err() {
+                            return Err(not_found());
+                        }
+                        out.temp.push(scratch.clone());
+                        scratch
+                    } else if from.is_none()
+                        && src.is_dir()
+                        && any_ignored(context_dir, &src, ignore)
+                    {
+                        let copier = Copier::new(&scratch, None, None, false);
+                        copier.dir(&src, &scratch, &filter)?;
+                        copier.finish()?;
+                        out.temp.push(scratch.clone());
+                        scratch
+                    } else if *rw {
+                        if src.is_dir() {
+                            layer::copy_tree(&src, &scratch)?;
                         } else {
-                            src
-                        };
+                            std::fs::copy(&src, &scratch)?;
+                        }
+                        out.temp.push(scratch.clone());
+                        scratch
+                    } else {
+                        src
+                    };
                     // A stage or image is named by its id; context files by
                     // their contents.
                     let contents = if from.is_some() {
@@ -1787,8 +1784,8 @@ fn apply_copy(
     let chown_ids = match &spec.chown {
         Some(ch) => {
             let expanded = expand_word(ch, vars);
-            let passwd = std::fs::read_to_string(stage.root.join("etc/passwd")).unwrap_or_default();
-            let group = std::fs::read_to_string(stage.root.join("etc/group")).unwrap_or_default();
+            let passwd = account_file(&stage.root, "passwd");
+            let group = account_file(&stage.root, "group");
             let acc = users::resolve(&expanded, &passwd, &group)
                 .map_err(|e| Error::Build(format!("line {line_no}: --chown={expanded}: {e}")))?;
             Some((acc.uid, acc.gid))
@@ -2108,6 +2105,16 @@ fn safe_join_in_root(root: &Path, rel: &str) -> Result<PathBuf, Error> {
 pub(crate) fn resolve_in_root(root: &Path, rel: &str, follow_last: bool) -> Result<PathBuf, Error> {
     safe_join_in_root(root, rel)?;
     resolve_in_jail(root, rel, follow_last)
+}
+
+/// The image's `/etc/{name}` (`passwd`, `group`), read as a jail on `root`
+/// reads it: a link to it is followed within `root`, never to the host's.
+/// One that is not there reads as empty.
+pub(crate) fn account_file(root: &Path, name: &str) -> String {
+    resolve_in_jail(root, &format!("/etc/{name}"), true)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
 }
 
 /// [`resolve_in_root`], with `..` in `path` allowed, as a jail on `root`
@@ -2774,5 +2781,31 @@ mod tests {
             "/usr/home/app"
         );
         assert_eq!(super::without_links(&root, "").unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_files_are_the_images_through_its_links() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::create_dir_all(root.join("usr/local/etc")).unwrap();
+        // As the host has its own /etc/passwd, a link to it by an absolute
+        // path must find the image's, not the host's.
+        std::fs::write(
+            root.join("usr/local/etc/passwd"),
+            "app:*:1234:1234::/:/bin/sh\n",
+        )
+        .unwrap();
+        symlink("/usr/local/etc/passwd", root.join("etc/passwd")).unwrap();
+        // Out of the root by `..`, it stops there.
+        symlink("../../../../../../etc/group", root.join("etc/group")).unwrap();
+        assert_eq!(
+            super::account_file(&root, "passwd"),
+            "app:*:1234:1234::/:/bin/sh\n"
+        );
+        assert_eq!(super::account_file(&root, "group"), "");
+        assert_eq!(super::account_file(&tmp.path().join("none"), "passwd"), "");
     }
 }

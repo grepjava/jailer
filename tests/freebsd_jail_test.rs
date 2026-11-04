@@ -957,7 +957,13 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         let out = jailer(&["run", "k:1"]);
         let lines: Vec<&str> = out.lines().collect();
         let mode = lines[1].split_whitespace().next().unwrap().to_owned();
-        let blocks = lines.last().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+        let blocks = lines
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
         (lines[0].to_owned(), mode, blocks)
     };
     use std::os::unix::fs::PermissionsExt;
@@ -965,11 +971,20 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     // One change at a time, each to a step after which nothing else would
     // run again anyway.
     mounts_cf("1m");
-    assert_eq!(seen(), ("keep.txt".into(), "drwxr-xr-x".into(), "1024".into()));
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwxr-xr-x".into(), "1024".into())
+    );
     mounts_cf("2m");
-    assert_eq!(seen(), ("keep.txt".into(), "drwxr-xr-x".into(), "2048".into()));
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwxr-xr-x".into(), "2048".into())
+    );
     std::fs::set_permissions(ctx2.join("m"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(seen(), ("keep.txt".into(), "drwx------".into(), "2048".into()));
+    assert_eq!(
+        seen(),
+        ("keep.txt".into(), "drwx------".into(), "2048".into())
+    );
 }
 
 #[test]

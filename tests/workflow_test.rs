@@ -1254,6 +1254,46 @@ async fn copy_follows_links_only_inside_the_root() {
     };
     assert!(root.join("private/inner").is_dir());
     assert_eq!(mode("private"), 0o700);
+
+    // An image's /etc/passwd and /etc/group may be links, by absolute
+    // paths: its users are found through them, not in the host's files.
+    {
+        let mut b = tar::Builder::new(std::fs::File::create(ctx.join("accounts.tar")).unwrap());
+        let mut add = |path: &str, body: &str| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, path, body.as_bytes()).unwrap();
+        };
+        add("usr/local/etc/passwd", "jlrtest:*:4242:4243::/:/bin/sh\n");
+        add("usr/local/etc/group", "jlrgroup:*:4243:\n");
+        for f in ["passwd", "group"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            b.append_link(&mut h, format!("etc/{f}"), format!("/usr/local/etc/{f}"))
+                .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    write_cf(
+        "FROM scratch\nADD accounts.tar /\nCOPY --chown=jlrtest:jlrgroup f /owned\n\
+         USER jlrtest\nWORKDIR /made\n",
+    );
+    let image = build(&store, &runtime, &opts("accounts:1"))
+        .await
+        .unwrap()
+        .image;
+    let root = tmp.path().join("accounts");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    let report = jailer::check::check_image(&image.config, Some(&root));
+    assert!(
+        !report.findings.iter().any(|f| f.code == "LEGION008"),
+        "the image's USER is in its linked /etc/passwd: {:?}",
+        report.findings
+    );
 }
 
 /// `CMD`, `ENTRYPOINT`, `SHELL`, `WORKDIR` and `ENV` as Docker keeps them.
@@ -1411,13 +1451,19 @@ async fn config_instructions_follow_docker() {
         .to_string();
     assert!(err.contains("source \"docs\" not found"), "{err}");
     write_cf("FROM scratch\nCOPY deep /deep\n");
-    let image = build(&store, &runtime, &opts("ign:2"))
-        .await
-        .unwrap()
-        .image;
+    let image = build(&store, &runtime, &opts("ign:2")).await.unwrap().image;
     let root = tmp.path().join("root-ign");
     store.prepare_rootfs(&image, &root, None).unwrap();
-    let mode = |p: &str| std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777;
+    let mode = |p: &str| {
+        std::fs::metadata(root.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
     assert_eq!((mode("deep"), mode("deep/b")), (0o750, 0o700));
-    assert_eq!(std::fs::read_to_string(root.join("deep/b/c.txt")).unwrap(), "c");
+    assert_eq!(
+        std::fs::read_to_string(root.join("deep/b/c.txt")).unwrap(),
+        "c"
+    );
 }

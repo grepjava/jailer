@@ -148,9 +148,22 @@ pub fn limit(sys: &dyn Sys, jail: &str, limits: &Limits) -> Result<(), Error> {
         ));
     }
     unlimit(sys, jail);
-    for rule in limits.rules(jail) {
-        sys.rctl_add(&rule)
-            .map_err(|e| Error::Runtime(format!("setting the limit {rule}: {e}")))?;
+    add_rules(sys, jail, &limits.rules(jail), |r| sys.rctl_add(r))
+}
+
+/// Adds `rules` to `jail` with `add`; one that fails takes those added
+/// before it away, as nothing would remove them without a container.
+fn add_rules(
+    sys: &dyn Sys,
+    jail: &str,
+    rules: &[RctlRule],
+    add: impl Fn(&RctlRule) -> legion_sys::Result<()>,
+) -> Result<(), Error> {
+    for rule in rules {
+        if let Err(e) = add(rule) {
+            unlimit(sys, jail);
+            return Err(Error::Runtime(format!("setting the limit {rule}: {e}")));
+        }
     }
     Ok(())
 }
@@ -307,9 +320,13 @@ mod containers {
             if let Err(e) = started.await {
                 if let Some((held, ip)) = lease {
                     // What attach did, if anything: its pf rules and epair.
-                    net::detach(sys, &id);
+                    // Left there, they keep the address, for a later
+                    // allocation to take them away.
+                    let torn = net::detach(sys, &id);
                     drop(held);
-                    let _ = leases.release(ip, &id);
+                    if torn.is_ok() {
+                        let _ = leases.release(ip, &id);
+                    }
                 }
                 let _ = rt.remove(&id).await;
                 return Err(e);
@@ -334,7 +351,7 @@ mod containers {
                 if let Some(p) = pod {
                     // Its published ports must not reach whoever takes its
                     // address next.
-                    unplug(rt, sys, leases, &p).await;
+                    let _ = unplug(rt, sys, leases, &p).await;
                     let _ = rt.remove(&p).await;
                 }
                 Err(e)
@@ -356,17 +373,26 @@ mod containers {
     }
 
     /// Takes a stopped pod off the bridge and frees its address: a stopped
-    /// pod does not start again.
-    async fn unplug(rt: &JailRuntime, sys: &dyn Sys, leases: &Leases, pod: &str) {
+    /// pod does not start again. If its pf rules or epair cannot be taken
+    /// away, the address stays taken (its redirects would reach whoever
+    /// had it next), and a later allocation tries again once the pod's
+    /// jail is gone.
+    async fn unplug(
+        rt: &JailRuntime,
+        sys: &dyn Sys,
+        leases: &Leases,
+        pod: &str,
+    ) -> Result<(), Error> {
         let Ok(status) = rt.inspect(pod).await else {
-            return;
+            return Ok(());
         };
         if let Some(ip) = status.config.labels.get(LABEL_IP) {
-            net::detach(sys, pod);
+            net::detach(sys, pod)?;
             if let Ok(ip) = ip.parse() {
-                let _ = leases.release(ip, pod);
+                leases.release(ip, pod)?;
             }
         }
+        Ok(())
     }
 
     /// Stops a container, then its pod.
@@ -394,7 +420,7 @@ mod containers {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
                 _ => {}
             }
-            unplug(rt, sys, leases, &p).await;
+            unplug(rt, sys, leases, &p).await?;
         }
         Ok(())
     }
@@ -410,11 +436,13 @@ mod containers {
         rt.remove(id).await?;
         unlimit(sys, &jail_of(id, pod.as_deref()));
         if let Some(p) = pod {
-            unplug(rt, sys, leases, &p).await;
+            // The pod goes even so: its lease, kept, outlives it.
+            let unplugged = unplug(rt, sys, leases, &p).await;
             match rt.remove(&p).await {
                 Err(e) if !e.is_not_found() => return Err(e.into()),
                 _ => {}
             }
+            unplugged?;
         }
         Ok(())
     }
@@ -492,6 +520,31 @@ mod elsewhere {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_that_fails_takes_the_others_away() {
+        let sys = legion_sys::FakeSys::new();
+        let limits = Limits {
+            memory: Some(64 << 20),
+            pcpu: Some(50),
+            pids: Some(10),
+        };
+        let rules = limits.rules("j");
+        // The third fails: the two before it are gone again.
+        let err = add_rules(&sys, "j", &rules, |r| {
+            if r.resource == Resource::MaxProc {
+                Err(legion_sys::Error::NotFound("no".to_owned()))
+            } else {
+                sys.rctl_add(r)
+            }
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("setting the limit"), "{err}");
+        assert!(sys.rctl_rules().is_empty(), "{:?}", sys.rctl_rules());
+        // All added, all are kept.
+        add_rules(&sys, "j", &rules, |r| sys.rctl_add(r)).unwrap();
+        assert_eq!(sys.rctl_rules().len(), 3);
+    }
 
     #[test]
     fn members_get_legions_defaults_with_params_over_them() {

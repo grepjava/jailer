@@ -267,10 +267,17 @@ pub fn attach(sys: &dyn Sys, pod: &str, ip: Ipv4Addr, ports: &[Port]) -> Result<
     Ok(())
 }
 
-/// Takes the pod's ports and epair away, wherever its jail end is.
-pub fn detach(sys: &dyn Sys, pod: &str) {
-    let _ = sys.pf_flush_anchor(&anchor(pod));
-    let _ = network().detach(sys, pod);
+/// Takes the pod's ports and epair away, wherever its jail end is. Both
+/// are tried; failing, the pod's address must stay taken, as its
+/// redirects may still be there for whoever had it next.
+pub fn detach(sys: &dyn Sys, pod: &str) -> Result<(), Error> {
+    let ports = sys
+        .pf_flush_anchor(&anchor(pod))
+        .map_err(|e| Error::Runtime(format!("removing the ports of pod {pod}: {e}")));
+    let epair = network()
+        .detach(sys, pod)
+        .map_err(|e| Error::Runtime(format!("removing the epair of pod {pod}: {e}")));
+    ports.and(epair)
 }
 
 /// The addresses taken on the bridge, one file each, naming the pod's jail
@@ -324,6 +331,17 @@ impl Locked<'_> {
     /// when it was removed outside jailer, is dropped with its pf rules and
     /// epair, which would otherwise still take its ports.
     fn live(&self, sys: &dyn Sys) -> Result<Vec<(Ipv4Addr, Lease)>, Error> {
+        self.live_with(sys, |jail| detach(sys, jail))
+    }
+
+    /// [`Self::live`], taking a gone jail's pf rules and epair away with
+    /// `teardown`. One that fails keeps the lease, and the address with it,
+    /// to try again next time.
+    fn live_with(
+        &self,
+        sys: &dyn Sys,
+        teardown: impl Fn(&str) -> Result<(), Error>,
+    ) -> Result<Vec<(Ipv4Addr, Lease)>, Error> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.leases.dir)? {
             let entry = entry?;
@@ -337,8 +355,8 @@ impl Locked<'_> {
             if matches!(
                 sys.jail_get(&lease.jail, &[]),
                 Err(legion_sys::Error::NotFound(_))
-            ) {
-                detach(sys, &lease.jail);
+            ) && teardown(&lease.jail).is_ok()
+            {
                 let _ = std::fs::remove_file(entry.path());
             } else {
                 out.push((ip, lease));
@@ -505,9 +523,21 @@ mod tests {
         leases.release(ip, "someone-else").unwrap();
         assert!(tmp.path().join("10.77.0.2").exists());
 
-        // A lease whose jail is gone is free again, and its ports and
-        // epair go with it.
+        // A lease whose jail is gone, but whose pf rules or epair cannot be
+        // taken away, keeps its address and ports: its redirects would
+        // reach the next pod given it.
         sys.remove_jail(pod);
+        {
+            let held = leases.lock().unwrap();
+            let live = held
+                .live_with(&sys, |_| Err(Error::Runtime("pfctl: busy".to_owned())))
+                .unwrap();
+            assert!(live.iter().any(|(i, l)| *i == ip && l.jail == pod));
+            assert!(tmp.path().join("10.77.0.2").exists());
+            assert!(sys.anchor("jailer/89abcdef0123").is_some());
+        }
+
+        // Once they go, it is free again, its ports and epair with it.
         assert_eq!(leases.lock().unwrap().allocate(&sys, &[]).unwrap(), ip);
         assert!(!tmp.path().join("10.77.0.2").exists());
         assert!(sys.interface(&host_interface(pod)).is_none());

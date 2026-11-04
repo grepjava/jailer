@@ -1029,10 +1029,7 @@ fn parse_copy(
                 });
             }
             _ => {
-                return Err(bad(format!(
-                    "does not support `{}`",
-                    literal_word(flag)
-                )));
+                return Err(bad(format!("does not support `{}`", literal_word(flag))));
             }
         }
     }
@@ -1957,8 +1954,8 @@ COPY a\\b `
         assert_eq!(tokenize_words(r#""" /dst"#, '\\'), ["", "/dst"]);
         assert_eq!(tokenize_words(r#"a '' "" b"#, '\\'), ["a", "", "", "b"]);
         assert_eq!(tokenize_words("a  b ", '\\'), ["a", "b"]);
-        let Instruction::Copy(spec) = parse_instruction("COPY", r#""" /dst"#, 1, '\\', vec![])
-            .unwrap()
+        let Instruction::Copy(spec) =
+            parse_instruction("COPY", r#""" /dst"#, 1, '\\', vec![]).unwrap()
         else {
             panic!("not COPY")
         };
@@ -1975,7 +1972,10 @@ COPY a\\b `
         }
         // An escaped `$` reads as one in messages.
         for (text, want) in [
-            ("FROM scratch\nCOPY --chmod=\\$x a /b\n", "--chmod mode `$x`"),
+            (
+                "FROM scratch\nCOPY --chmod=\\$x a /b\n",
+                "--chmod mode `$x`",
+            ),
             ("FROM scratch\nCOPY --nope=\\$x a /b\n", "`--nope=$x`"),
             ("FROM scratch\nLABEL a=1 \\$b\n", "got `$b`"),
         ] {

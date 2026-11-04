@@ -200,8 +200,8 @@ pub fn check_image(config: &ImageConfig, rootfs: Option<&Path>) -> CheckReport {
 
     // 4. Rootfs checks (if rootfs is available)
     if let Some(root) = rootfs {
-        let passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap_or_default();
-        let group = std::fs::read_to_string(root.join("etc/group")).unwrap_or_default();
+        let passwd = crate::build::account_file(root, "passwd");
+        let group = crate::build::account_file(root, "group");
 
         if let Err(e) = users::resolve(&config.config.user, &passwd, &group) {
             report.error(
@@ -245,9 +245,9 @@ pub fn check_image(config: &ImageConfig, rootfs: Option<&Path>) -> CheckReport {
         }
 
         // Check for leftover FreeBSD pkg cache
-        let cache_dir = root.join("var/cache/pkg");
-        let repos_dir = root.join("var/db/pkg/repos");
-        let has_cache = dir_non_empty(&cache_dir) || dir_non_empty(&repos_dir);
+        let in_image =
+            |p: &str| crate::build::resolve_in_jail(root, p, true).is_ok_and(|d| dir_non_empty(&d));
+        let has_cache = in_image("/var/cache/pkg") || in_image("/var/db/pkg/repos");
         if has_cache {
             report.warn(
                 "LEGION002",
