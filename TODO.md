@@ -19,9 +19,9 @@ people building images for Legion.
   amd64 and aarch64), with Legion's git crates fetched by the ports
   framework (`scripts/port-crates.sh` lists them) and libzstd from
   `archivers/zstd`; `poudriere testport` passes on 15.1 amd64, and its
-  `git format-patch` against freebsd-ports main is ready. Still to do:
-  file it on Bugzilla (with Legion's sysutils/legion), then link jailer
-  from Legion's `docs/IMAGES.md`. At each release: set `DISTVERSION`, run
+  `git format-patch` against freebsd-ports main is filed on Bugzilla as
+  PR 300442 (2026-11-02). Still to do: see it through review, then link
+  jailer from Legion's `docs/IMAGES.md`. At each release: set `DISTVERSION`, run
   `scripts/port-crates.sh`, then `make makesum package` and `portlint
   -AC` on a FreeBSD host, and build the tarballs on both architectures'
   hosts at once (`release.sh` writes one `SHA256SUMS` for all of them).
