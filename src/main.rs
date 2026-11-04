@@ -1446,7 +1446,8 @@ async fn containers(cli: &Cli) -> Result<()> {
                 jailer::net::check_subnet()?;
             }
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
-            let has_pod = network == Network::Bridge;
+            // Only the host's network has no pod: `none` is a VNET of its own.
+            let has_pod = network != Network::Host;
 
             // When running in foreground without `-d`, default to removing the
             // ephemeral test container afterwards unless `--name` was given to keep it.
@@ -1488,8 +1489,8 @@ async fn containers(cli: &Cli) -> Result<()> {
                     }
                     return Err(e.into());
                 }
-                // Once it exits, its pod would hold on to its address and
-                // ports until a `stop` or `rm`.
+                // Once it exits, its pod would run on, holding its address
+                // and ports, until a `stop` or `rm`.
                 if *rm || has_pod {
                     on_exit(cli, &id, *rm)?;
                 }

@@ -168,7 +168,7 @@ pub struct TreeState {
 
 impl TreeState {
     /// Where `rel` links to, if it is a second name of a file.
-    fn link_of(&self, rel: &str) -> Option<&str> {
+    pub(crate) fn link_of(&self, rel: &str) -> Option<&str> {
         self.links
             .get(rel)
             .map(String::as_str)

@@ -540,8 +540,12 @@ fn split_verb(line: &str) -> Option<(&str, &str)> {
     if line.is_empty() {
         return None;
     }
-    let idx = line.find(char::is_whitespace)?;
-    Some((&line[..idx], line[idx..].trim()))
+    // A word alone is an instruction too, with no arguments: one the parser
+    // turns down, as BuildKit does, rather than a line it skips.
+    match line.find(char::is_whitespace) {
+        Some(idx) => Some((&line[..idx], line[idx..].trim())),
+        None => Some((line, "")),
+    }
 }
 
 fn parse_from(
@@ -612,6 +616,31 @@ fn parse_instruction(
     if !heredocs.is_empty() && !matches!(verb, "RUN" | "COPY" | "ADD") {
         return Err(Error::Build(format!(
             "line {line_no}: here-documents are for RUN, COPY and ADD"
+        )));
+    }
+    if rest.is_empty()
+        && matches!(
+            verb,
+            "ARG"
+                | "ENV"
+                | "LABEL"
+                | "WORKDIR"
+                | "USER"
+                | "COPY"
+                | "ADD"
+                | "RUN"
+                | "CMD"
+                | "ENTRYPOINT"
+                | "EXPOSE"
+                | "VOLUME"
+                | "STOPSIGNAL"
+                | "HEALTHCHECK"
+                | "SHELL"
+                | "ONBUILD"
+        )
+    {
+        return Err(Error::Build(format!(
+            "line {line_no}: {verb} needs arguments"
         )));
     }
     match verb {
@@ -1934,6 +1963,16 @@ COPY a\\b `
             panic!("not COPY")
         };
         assert_eq!(spec.sources, [""]);
+        // A word alone on a line is an instruction with no arguments.
+        for (text, want) in [
+            ("FROM scratch\nx\n", "unknown Containerfile instruction"),
+            ("FROM scratch\nRUN\n", "RUN needs arguments"),
+            ("FROM scratch\nRUN \\\n\n", "RUN needs arguments"),
+            ("FROM\n", "line 1"),
+        ] {
+            let err = Containerfile::parse(text).unwrap_err().to_string();
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
         // An escaped `$` reads as one in messages.
         for (text, want) in [
             ("FROM scratch\nCOPY --chmod=\\$x a /b\n", "--chmod mode `$x`"),

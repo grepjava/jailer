@@ -1375,4 +1375,49 @@ async fn config_instructions_follow_docker() {
         err.contains("cannot copy to non-directory: /app/config"),
         "{err}"
     );
+    // Nor a file over a directory, which would take what is in it.
+    std::fs::create_dir_all(ctx.join("d1/a")).unwrap();
+    std::fs::write(ctx.join("d1/a/keep"), "k").unwrap();
+    std::fs::create_dir_all(ctx.join("d2")).unwrap();
+    std::fs::write(ctx.join("d2/a"), "file").unwrap();
+    write_cf("FROM scratch\nCOPY d1 /x/\nCOPY d2 /x/\n");
+    let err = build(&store, &runtime, &opts("over:2"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot replace directory /x/a with a file"),
+        "{err}"
+    );
+
+    // A directory .containerignore leaves out is there only with a file put
+    // back in it; the directories made for one have their own modes.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(ctx.join("docs")).unwrap();
+    std::fs::write(ctx.join("docs/drop.txt"), "d").unwrap();
+    std::fs::create_dir_all(ctx.join("deep/b")).unwrap();
+    std::fs::write(ctx.join("deep/b/c.txt"), "c").unwrap();
+    std::fs::set_permissions(ctx.join("deep"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    std::fs::set_permissions(ctx.join("deep/b"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        ctx.join(".containerignore"),
+        "docs\n!docs/keep.txt\ndeep\n!deep/b/c.txt\n",
+    )
+    .unwrap();
+    write_cf("FROM scratch\nCOPY docs /docs\n");
+    let err = build(&store, &runtime, &opts("ign:1"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("source \"docs\" not found"), "{err}");
+    write_cf("FROM scratch\nCOPY deep /deep\n");
+    let image = build(&store, &runtime, &opts("ign:2"))
+        .await
+        .unwrap()
+        .image;
+    let root = tmp.path().join("root-ign");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    let mode = |p: &str| std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o7777;
+    assert_eq!((mode("deep"), mode("deep/b")), (0o750, 0o700));
+    assert_eq!(std::fs::read_to_string(root.join("deep/b/c.txt")).unwrap(), "c");
 }

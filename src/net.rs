@@ -224,7 +224,10 @@ pub fn nat_rules(egress: &str) -> String {
 }
 
 /// The pf rules publishing `ports` of the pod at `ip`. They leave the
-/// bridge out: a pod reaches another by its address.
+/// bridge out: a pod reaches another by its address. With no address
+/// given, a port is published on the host's own addresses, as Docker
+/// does: `(self)` follows them as they change. A host that routes
+/// does not hand a pod what is on its way to another machine.
 pub fn rdr_rules(ip: Ipv4Addr, ports: &[Port]) -> String {
     ports
         .iter()
@@ -232,7 +235,7 @@ pub fn rdr_rules(ip: Ipv4Addr, ports: &[Port]) -> String {
             format!(
                 "rdr pass on ! {BRIDGE} inet proto {} from any to {} port {} -> {ip} port {}\n",
                 p.proto.as_str(),
-                p.host_ip.map_or("any".to_owned(), |a| a.to_string()),
+                p.host_ip.map_or("(self)".to_owned(), |a| a.to_string()),
                 p.host,
                 p.container
             )
@@ -426,10 +429,10 @@ mod tests {
         );
         let p: Port = "127.0.0.1:53:5353/udp".parse().unwrap();
         assert_eq!(p.to_string(), "127.0.0.1:53:5353/udp");
-        // Every address, which pf calls `any`.
+        // Every address of the host, which pf calls `(self)`.
         let p: Port = "0.0.0.0:8080:80".parse().unwrap();
         assert_eq!(p.host_ip, None);
-        assert!(rdr_rules(Ipv4Addr::new(10, 77, 0, 2), &[p]).contains("to any port 8080"));
+        assert!(rdr_rules(Ipv4Addr::new(10, 77, 0, 2), &[p]).contains("to (self) port 8080"));
         for bad in ["80", "a:80", "0:80", "1:2:3:4", "8080:80/sctp", "x:1:2"] {
             assert!(bad.parse::<Port>().is_err(), "{bad}");
         }
@@ -479,7 +482,7 @@ mod tests {
         );
         assert_eq!(
             sys.anchor("jailer/89abcdef0123").unwrap(),
-            "rdr pass on ! jailer0 inet proto tcp from any to any port 8080 -> 10.77.0.2 port 80\n"
+            "rdr pass on ! jailer0 inet proto tcp from any to (self) port 8080 -> 10.77.0.2 port 80\n"
         );
 
         // The next pod gets the next address, and not the same port.

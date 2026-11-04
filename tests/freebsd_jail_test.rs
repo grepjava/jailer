@@ -329,6 +329,33 @@ CMD ["default-arg"]
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // `-d --network none`: the container is kept once it exits, and its
+    // pod, a VNET jail with the container's name as hostname, stops.
+    let pods = || {
+        let out = Command::new("jls").arg("host.hostname").output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| *l == "quiet")
+            .count()
+    };
+    cmd(&[
+        &["run", "-d", "--network", "none", "--name", "quiet"][..],
+        &shell,
+        &["sleep 2"],
+    ]
+    .concat());
+    assert!(pods() > 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while pods() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an exited -d --network none container kept its pod"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(cmd(&["ps", "-a"]).contains(" quiet "));
+    cmd(&["rm", "quiet"]);
+
     let over = cmd(&[
         &["run", "--param", "securelevel=-1"][..],
         &shell,
@@ -804,6 +831,7 @@ RUN --mount=type=tmpfs,target=/scratch sh -c 'df -t tmpfs /scratch >/dev/null &&
 RUN --network=none sh -c 'ifconfig -l > /ifs'
 RUN --mount=type=ssh sh -c 'test -S "$SSH_AUTH_SOCK" && echo "$SSH_AUTH_SOCK" > /ssh'
 RUN --mount=type=ssh,target=/etc/agent.sock sh -c 'test -S /etc/agent.sock && test -s /etc/passwd && echo kept > /etcssh'
+RUN --mount=type=ssh,target=/run/buildkit/a.sock --mount=type=ssh,target=/run/buildkit/b.sock sh -c 'test -S /run/buildkit/a.sock && test -S /run/buildkit/b.sock'
 RUN --mount=type=bind,target=/ctx ls /ctx/data > /ctxls
 RUN --mount=type=bind,from=docker.io/freebsd/freebsd-runtime:15.1,source=/bin,target=/img test -x /img/sh && echo yes > /fromimg
 RUN <<EOF

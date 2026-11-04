@@ -1293,13 +1293,16 @@ impl Drop for RunMounts {
         for r in &self.relays {
             r.abort();
         }
-        for p in &self.placed {
-            // A directory the step put something in stays, in its layer.
-            if p.is_dir() {
-                let _ = std::fs::remove_dir(p);
-            } else {
-                let _ = std::fs::remove_file(p);
-            }
+        // The sockets first, then the directories made for them, deepest
+        // first: two mounts may share one. A directory the step put
+        // something in stays, in its layer.
+        let (mut dirs, files): (Vec<_>, Vec<_>) = self.placed.iter().partition(|p| p.is_dir());
+        for p in files {
+            let _ = std::fs::remove_file(p);
+        }
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for p in dirs {
+            let _ = std::fs::remove_dir(p);
         }
         for p in &self.temp {
             let _ = layer::remove_tree(p);
@@ -1402,6 +1405,24 @@ fn relay_ssh_agent(
     )))
 }
 
+/// Whether `filter` keeps anything below `dir`, a directory it leaves out
+/// itself.
+fn holds_kept(dir: &Path, filter: &dyn Fn(&Path) -> Keep) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let p = e.path();
+        match filter(&p) {
+            Keep::Yes => true,
+            Keep::Below => {
+                std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) && holds_kept(&p, filter)
+            }
+            Keep::No => false,
+        }
+    })
+}
+
 /// Whether `ignore` leaves out anything below `dir`, a context directory.
 fn any_ignored(context_dir: &Path, dir: &Path, ignore: &IgnoreMatcher) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1434,9 +1455,14 @@ fn content_digest(path: &Path) -> Result<String, Error> {
     let state = TreeState::capture_tree(path)?;
     for (p, e) in &state.entries {
         text.push_str(&format!(
-            "{p}\0{:?}\0{:o}\0{}:{}\0{:x}\0{}\n",
+            "{p}\0{:?}\0{:o}\0{}:{}\0{:x}\0{}",
             e.kind, e.mode, e.uid, e.gid, e.flags, e.digest_or_link
         ));
+        // Which files are one, by hard links.
+        if let Some(first) = state.link_of(p) {
+            text.push_str(&format!("\0= {first}"));
+        }
+        text.push('\n');
     }
     Ok(sha256(text.as_bytes()))
 }
@@ -1817,9 +1843,24 @@ fn apply_copy(
             .map_err(|e| Error::Build(format!("line {line_no}: {e}")))?;
         // A source .containerignore leaves out is not in the context, but
         // for what a `!` pattern takes back from a directory.
+        // As in Docker, such a directory is there only with something in
+        // it.
+        let in_context = |p: &Path| {
+            if !ignored(p) {
+                Keep::Yes
+            } else if ignore.may_reinclude(&rel_path(p, src_root)) {
+                Keep::Below
+            } else {
+                Keep::No
+            }
+        };
         let matches: Vec<PathBuf> = resolve_source_paths(src_root, &pattern, line_no)?
             .into_iter()
-            .filter(|m| !ignored(m) || (m.is_dir() && ignore.may_reinclude(&rel_path(m, src_root))))
+            .filter(|m| match in_context(m) {
+                Keep::Yes => true,
+                Keep::Below => m.is_dir() && holds_kept(m, &in_context),
+                Keep::No => false,
+            })
             .collect();
         if matches.is_empty() {
             return Err(Error::Build(format!(
@@ -1891,7 +1932,8 @@ fn apply_copy(
                 // asked for, and the archive's links and flags.
                 let aside = tempfile::Builder::new().prefix("add").tempdir_in(tmp_dir)?;
                 unpack_archive(&archive, aside.path())?;
-                let unpacked = Copier::new(&stage.root, chown_ids, spec.chmod, true);
+                let mut unpacked = Copier::new(&stage.root, chown_ids, spec.chmod, true);
+                unpacked.over_dirs = true;
                 let copied = (|| {
                     for entry in std::fs::read_dir(aside.path())? {
                         let path = entry?.path();
@@ -2172,6 +2214,9 @@ struct Copier {
     chown: Option<(u32, u32)>,
     chmod: Option<u32>,
     keep_flags: bool,
+    /// Whether a file may take the place of a directory, as unpacking an
+    /// archive lets it; a copy may not, as in BuildKit.
+    over_dirs: bool,
     /// The first copy of each hard-linked source file, by device and inode.
     linked: std::cell::RefCell<HashMap<(u64, u64), PathBuf>>,
     /// Flags to set when all is copied, in the order to set them.
@@ -2185,25 +2230,46 @@ impl Copier {
             chown,
             chmod,
             keep_flags,
+            over_dirs: false,
             linked: Default::default(),
             flags: Default::default(),
         }
     }
 
-    /// Makes the directory `dst` if it is not there, saying whether it
-    /// did. As in BuildKit, a directory is not copied over a file.
-    fn make_dir(&self, dst: &Path) -> Result<bool, Error> {
+    /// Makes the directory `dst` if it is not there, and returns the
+    /// directories made, `dst` first, then its parents. As in BuildKit, a
+    /// directory is not copied over a file.
+    fn make_dir(&self, dst: &Path) -> Result<Vec<PathBuf>, Error> {
         match std::fs::symlink_metadata(dst) {
-            Ok(m) if m.is_dir() => Ok(false),
+            Ok(m) if m.is_dir() => Ok(Vec::new()),
             Ok(_) => Err(Error::Build(format!(
                 "cannot copy to non-directory: /{}",
                 rel_path(dst, &self.root)
             ))),
             Err(_) => {
+                let mut made = Vec::new();
+                let mut d = dst;
+                while std::fs::symlink_metadata(d).is_err() {
+                    made.push(d.to_path_buf());
+                    let Some(parent) = d.parent() else { break };
+                    d = parent;
+                }
                 std::fs::create_dir_all(dst)?;
-                Ok(true)
+                Ok(made)
             }
         }
+    }
+
+    /// Gives `dst`, a directory the copy made for `src`, `src`'s mode, so
+    /// that a 0700 one stays closed, and from a stage or an image its
+    /// owner, unless `--chown` and `--chmod` say otherwise.
+    fn made_from(&self, src: &Path, dst: &Path) -> Result<(), Error> {
+        let meta = std::fs::metadata(src)?;
+        apply_perms(
+            dst,
+            self.chown.or(self.source_owner(&meta)),
+            self.chmod.or(file_mode(&meta)),
+        )
     }
 
     /// Copies the tree `src_dir` to `dst_dir`, leaving out what `skip`
@@ -2214,17 +2280,12 @@ impl Copier {
         dst_dir: &Path,
         filter: &dyn Fn(&Path) -> Keep,
     ) -> Result<(), Error> {
-        let made = self.make_dir(dst_dir)?;
-        // A directory the copy makes has its source's mode, so that a 0700
-        // one stays closed, and from a stage or an image its owner; one
-        // already there keeps its own.
-        let (mut owner, mut mode) = (self.chown, self.chmod);
-        if made {
-            let meta = std::fs::metadata(src_dir)?;
-            owner = owner.or(self.source_owner(&meta));
-            mode = mode.or(file_mode(&meta));
+        // One already there keeps its own mode and owner.
+        if self.make_dir(dst_dir)?.is_empty() {
+            apply_perms(dst_dir, self.chown, self.chmod)?;
+        } else {
+            self.made_from(src_dir, dst_dir)?;
         }
-        apply_perms(dst_dir, owner, mode)?;
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -2256,6 +2317,19 @@ impl Copier {
         dst_dir: &Path,
         filter: &dyn Fn(&Path) -> Keep,
     ) -> Result<(), Error> {
+        self.below_at(src_dir, dst_dir, filter, 0)
+    }
+
+    /// [`Self::below`], `depth` directories down from where it began: so
+    /// many of `dst_dir`'s parents, if it makes them, are made for the
+    /// source directories above `src_dir`.
+    fn below_at(
+        &self,
+        src_dir: &Path,
+        dst_dir: &Path,
+        filter: &dyn Fn(&Path) -> Keep,
+        depth: usize,
+    ) -> Result<(), Error> {
         for entry in std::fs::read_dir(src_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -2266,10 +2340,11 @@ impl Copier {
             }
             let target = resolve_below(&self.root, &dst_dir.join(entry.file_name()), true)?;
             match keep {
-                Keep::Below => self.below(&path, &target, filter)?,
+                Keep::Below => self.below_at(&path, &target, filter, depth + 1)?,
                 _ => {
-                    if self.make_dir(dst_dir)? {
-                        apply_perms(dst_dir, self.chown, self.chmod)?;
+                    let made = self.make_dir(dst_dir)?;
+                    for (d, src) in made.iter().zip(src_dir.ancestors()).take(depth + 1) {
+                        self.made_from(src, d)?;
                     }
                     if is_dir {
                         self.dir(&path, &target, filter)?;
@@ -2296,7 +2371,13 @@ impl Copier {
             // Copied there already, by another name for the same file.
             return Ok(());
         }
-        if std::fs::symlink_metadata(dst).is_ok() {
+        if let Ok(there) = std::fs::symlink_metadata(dst) {
+            if there.is_dir() && !self.over_dirs {
+                return Err(Error::Build(format!(
+                    "cannot replace directory /{} with a file",
+                    rel_path(dst, &self.root)
+                )));
+            }
             layer::remove_tree(dst)?;
             // What was there is no longer a copy to link to.
             self.linked.borrow_mut().retain(|_, p| !p.starts_with(dst));
@@ -2641,6 +2722,26 @@ mod tests {
             super::content_digest(tmp.path()).unwrap()
         };
         assert_ne!(at("one"), at("two"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_and_the_roots_mode_are_in_a_trees_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::write(&a, "same").unwrap();
+        std::fs::write(&b, "same").unwrap();
+        let apart = super::content_digest(tmp.path()).unwrap();
+        // The same names, contents and modes, but one file.
+        std::fs::remove_file(&b).unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let linked = super::content_digest(tmp.path()).unwrap();
+        assert_ne!(apart, linked);
+        let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_ne!(linked, super::content_digest(tmp.path()).unwrap());
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[cfg(unix)]

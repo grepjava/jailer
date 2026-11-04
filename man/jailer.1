@@ -513,7 +513,7 @@ Needs root.
 .It Fl d
 Run in the background and print the container ID.
 When a container with a pod
-.Pq Fl -vnet , Fl p
+.Pq any network but Cm host
 exits, a process of its own stops the pod, freeing its address and
 ports; the container is kept, stopped, as
 .Cm stop
@@ -577,11 +577,12 @@ Publish the container's port
 .Ar container
 on the host's port
 .Ar host ,
-on every address or only
+on every address of the host or only
 .Ar ip
 .Pf ( Li 0.0.0.0
-is every address);
-implies
+is every address of the host);
+traffic a routing host passes on to other machines is left alone.
+It implies
 .Fl -vnet .
 Other machines reach it; the host itself reaches the container at its
 own address, which
