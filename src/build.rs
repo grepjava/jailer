@@ -2003,15 +2003,12 @@ fn apply_copy(
             } else {
                 copier.dir(&src_path, &dst, &filter)?;
             }
-        } else if is_add && is_archive_name(&src_path) {
+        } else if let Some(archive) = is_add
             // Read, not copied: a link to it is followed inside the root.
-            let archive = resolve_below(src_root, &src_path, true)?;
-            if !std::fs::symlink_metadata(&archive).is_ok_and(|m| m.is_file()) {
-                return Err(Error::Build(format!(
-                    "line {line_no}: archive {} not found",
-                    src_path.display()
-                )));
-            }
+            .then(|| resolve_below(src_root, &src_path, true).ok())
+            .flatten()
+            .filter(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_file()) && is_archive(a))
+        {
             // tar finds the compression itself; the archive has no diff_id
             // to check.
             std::fs::create_dir_all(&dst_base)?;
@@ -2108,20 +2105,58 @@ fn shell_of(cfg: &ImageConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A name `ADD` unpacks: a tar, compressed or not, in any of the ways
-/// bsdtar reads.
-fn is_archive_name(p: &Path) -> bool {
-    let s = p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    [
-        ".tar", ".tar.gz", ".tgz", ".tar.zst", ".tzst", ".tar.xz", ".txz", ".tar.bz2", ".tbz",
-        ".tbz2", ".tar.lz4",
-    ]
-    .iter()
-    .any(|ext| s.ends_with(ext))
+/// Whether `ADD` unpacks the local file `p`: by its contents, whatever its
+/// name, as BuildKit does. A tar, as it is or compressed with gzip, bzip2,
+/// xz or zstd, whose first header is one.
+fn is_archive(p: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(p) else {
+        return false;
+    };
+    let mut file = std::io::BufReader::new(file);
+    let Ok(magic) = std::io::BufRead::fill_buf(&mut file).map(<[u8]>::to_vec) else {
+        return false;
+    };
+    let mut header = [0u8; 512];
+    let read = |r: &mut dyn Read, h: &mut [u8; 512]| r.read_exact(h).is_ok();
+    if magic.starts_with(&[0x1f, 0x8b]) {
+        read(&mut flate2::read::MultiGzDecoder::new(file), &mut header) && is_tar_header(&header)
+    } else if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::stream::read::Decoder::new(file)
+            .is_ok_and(|mut d| read(&mut d, &mut header) && is_tar_header(&header))
+    } else if magic.starts_with(b"BZh") || magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+        // Left to bsdtar, which unpacks it: an archive it lists, but a tar.
+        std::process::Command::new("tar")
+            .arg("-tvf")
+            .arg(p)
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+    } else {
+        read(&mut file, &mut header) && is_tar_header(&header)
+    }
+}
+
+/// Whether `h` is a tar header: not the zeros that end an archive, with
+/// its checksum, as Go's archive/tar takes it (bytes summed unsigned or
+/// signed, the checksum's own as spaces).
+fn is_tar_header(h: &[u8; 512]) -> bool {
+    if h.iter().all(|&b| b == 0) {
+        return false;
+    }
+    let field = std::str::from_utf8(&h[148..156])
+        .ok()
+        .map(|s| s.trim_matches(|c: char| c == ' ' || c == '\0'))
+        .and_then(|s| u64::from_str_radix(s, 8).ok());
+    let Some(sum) = field else {
+        return false;
+    };
+    let (mut unsigned, mut signed) = (0u64, 0i64);
+    for (i, &b) in h.iter().enumerate() {
+        let b = if (148..156).contains(&i) { b' ' } else { b };
+        unsigned += u64::from(b);
+        signed += i64::from(b as i8);
+    }
+    sum == unsigned || i64::try_from(sum).is_ok_and(|s| s == signed)
 }
 
 /// The paths a source names, with wildcards allowed in any component.

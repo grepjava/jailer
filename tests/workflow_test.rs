@@ -452,7 +452,8 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
                         .unwrap()
                         .to_string_lossy()
                         .replace('\\', "/");
-                    out.insert(rel, std::fs::read_to_string(&p).unwrap());
+                    let body = std::fs::read(&p).unwrap();
+                    out.insert(rel, String::from_utf8_lossy(&body).into_owned());
                 }
             }
         }
@@ -688,6 +689,39 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let got = files(&unpacked);
     assert_eq!(got["plain/inner/packed.txt"], "packed");
     assert_eq!(got["zipped/inner/packed.txt"], "packed");
+
+    // What is an archive is found by its contents, not its name.
+    std::fs::copy(ctx.join("plain.tar"), ctx.join("rootfs")).unwrap();
+    std::fs::write(
+        ctx.join("layer"),
+        zstd::encode_all(&std::fs::read(ctx.join("plain.tar")).unwrap()[..], 3).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(ctx.join("notes.tar"), "not an archive\n").unwrap();
+    {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(ctx.join("data.tgz")).unwrap(),
+            flate2::Compression::default(),
+        );
+        gz.write_all(b"gzipped, but no tar\n").unwrap();
+        gz.finish().unwrap();
+    }
+    write_cf(
+        "FROM scratch\nADD rootfs /r/\nADD layer /l/\nADD notes.tar /n/\nADD data.tgz /d/\n"
+            .to_owned(),
+    );
+    let got = files(
+        &build(&store, &runtime, &opts("named:1"))
+            .await
+            .unwrap()
+            .image,
+    );
+    assert_eq!(got["r/inner/packed.txt"], "packed");
+    assert_eq!(got["l/inner/packed.txt"], "packed");
+    assert_eq!(got["n/notes.tar"], "not an archive\n");
+    assert!(got.contains_key("d/data.tgz"), "{:?}", got.keys());
+    assert!(!got.contains_key("r/rootfs"));
 
     // A `.wh.` name in an archive is unpacked, then refused: a layer would
     // hold it as a whiteout.
@@ -1227,9 +1261,19 @@ async fn copy_follows_links_only_inside_the_root() {
         b.finish().unwrap();
     }
     symlink(outside.join("x.tar"), ctx.join("backup.tar")).unwrap();
+    // Followed inside the context, it is no archive there: the link is
+    // copied as COPY copies one, and nothing of the host's is unpacked.
     write_cf("FROM scratch\nADD backup.tar /x/\n");
-    let err = build(&store, &runtime, &opts("out:3")).await.unwrap_err();
-    assert!(err.to_string().contains("not found"), "{err}");
+    let image = build(&store, &runtime, &opts("out:3")).await.unwrap().image;
+    let root = tmp.path().join("out3");
+    store.prepare_rootfs(&image, &root, None).unwrap();
+    assert!(
+        std::fs::symlink_metadata(root.join("x/backup.tar"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(std::fs::symlink_metadata(root.join("x/secret")).is_err());
 
     // A directory the build makes is in a layer: `WORKDIR`'s, and a
     // copied one, with its source's mode.
@@ -1465,5 +1509,70 @@ async fn config_instructions_follow_docker() {
     assert_eq!(
         std::fs::read_to_string(root.join("deep/b/c.txt")).unwrap(),
         "c"
+    );
+}
+
+/// `jailer check` checks an image's files: one whose files cannot be put
+/// together fails, not passes on its config alone.
+#[cfg(unix)]
+#[test]
+fn check_fails_on_an_image_whose_files_cannot_be_prepared() {
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("f"), "f\n").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM scratch\nCOPY f /f\nCMD [\"/missing\"]\n",
+    )
+    .unwrap();
+    let jailer = |args: &[&str]| {
+        std::process::Command::new(bin)
+            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let built = jailer(&["build", "-t", "localhost/chk:1", ctx.to_str().unwrap()]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let check = || jailer(&["check", "localhost/chk:1"]);
+    let first = check();
+    assert!(!first.status.success());
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("LEGION009"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Its layers gone, the store cannot put its files together.
+    let mut stack = vec![state.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.file_name().is_some_and(|n| n == "layers") {
+                for l in std::fs::read_dir(&p).unwrap() {
+                    jailer::layer::remove_tree(&l.unwrap().path()).unwrap();
+                }
+            } else if p.is_dir() && !p.is_symlink() {
+                stack.push(p);
+            }
+        }
+    }
+    let second = check();
+    assert!(
+        !second.status.success(),
+        "passed without its files:\n{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("preparing the files"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
     );
 }

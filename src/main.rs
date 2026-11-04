@@ -1181,12 +1181,16 @@ async fn run() -> Result<()> {
                 let tmp = tempfile::Builder::new()
                     .prefix("check")
                     .tempdir_in(store.dir().join("tmp"))?;
-                if store.prepare_rootfs(&img, tmp.path(), None).is_ok() {
-                    report.merge(check_image(&img.config, Some(tmp.path())));
+                // An image whose files cannot be put together is not
+                // passed on its config alone: its files are what is checked.
+                if let Err(e) = store.prepare_rootfs(&img, tmp.path(), None) {
                     let _ = store.cleanup_rootfs(tmp.path(), None);
-                } else {
-                    report.merge(check_image(&img.config, None));
+                    return Err(e).with_context(|| {
+                        format!("preparing the files of {img_lookup} to check them")
+                    });
                 }
+                report.merge(check_image(&img.config, Some(tmp.path())));
+                let _ = store.cleanup_rootfs(tmp.path(), None);
                 checked_something = true;
             }
 

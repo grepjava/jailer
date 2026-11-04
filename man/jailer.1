@@ -309,15 +309,9 @@ Wildcards may appear in any part of a source path.
 .Cm ADD Ar url ,
 downloaded with mode 0600 and not unpacked, and checked with
 .Fl -checksum Ns = Ns Cm sha256: Ns Ar hex .
-A local tar archive is unpacked: a name ending in
-.Pa .tar ,
-.Pa .tar.gz , .tgz ,
-.Pa .tar.zst , .tzst ,
-.Pa .tar.xz , .txz ,
-.Pa .tar.bz2 , .tbz , .tbz2
-or
-.Pa .tar.lz4 ,
-in any case;
+A local file that is a tar archive, as it is or compressed with gzip,
+bzip2, xz or zstd, is unpacked, whatever its name (as BuildKit finds
+one: by its contents); another file is copied, whatever its name;
 .Fl -chown
 and
 .Fl -chmod
