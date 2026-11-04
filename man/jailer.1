@@ -260,7 +260,17 @@ line names;
 gives them to the shell, and
 .Ql COPY <<name dest
 writes them to a file
-.Ar name .
+.Ar name ,
+with variables expanded unless the word is quoted, as in
+.Ql <<'name' .
+There, as in BuildKit, a backslash takes the character after it as it
+is:
+.Ql \e$A
+is a
+.Ql $
+and
+.Ql \e\e
+a backslash.
 .It
 .Cm COPY Fl -from Ns = Ns Ar image ,
 naming an image rather than a stage; it is pulled if missing.
@@ -502,6 +512,12 @@ Needs root.
 .Bl -tag -width Ds
 .It Fl d
 Run in the background and print the container ID.
+When a container with a pod
+.Pq Fl -vnet , Fl p
+exits, a process of its own stops the pod, freeing its address and
+ports; the container is kept, stopped, as
+.Cm stop
+leaves it.
 .It Fl i , Fl t
 Keep standard input open; allocate a pseudo-terminal.
 .It Fl e

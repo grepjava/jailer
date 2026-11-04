@@ -468,10 +468,15 @@ pub enum Commands {
         containers: Vec<String>,
     },
 
-    /// Internal: waits for a container started by `run -d --rm` to exit,
-    /// then removes it
-    #[command(name = "rm-on-exit", hide = true)]
-    RmOnExit { id: String },
+    /// Internal: waits for a container started by `run -d` to exit, then
+    /// stops its pod, freeing its address and ports, or with `--rm`
+    /// removes it
+    #[command(name = "on-exit", hide = true)]
+    OnExit {
+        #[arg(long)]
+        rm: bool,
+        id: String,
+    },
 
     /// Internal supervisor shim for jails
     #[command(name = "jail-shim", hide = true)]
@@ -694,9 +699,10 @@ impl LimitArgs {
 }
 
 /// Leaves a process of its own, in a group of its own so that the
-/// terminal's signals miss it, to remove the container `id` once it exits.
+/// terminal's signals miss it, to stop the pod of the container `id` once
+/// it exits, or with `rm` to remove the container.
 #[cfg(unix)]
-fn remove_on_exit(cli: &Cli, id: &str) -> Result<()> {
+fn on_exit(cli: &Cli, id: &str, rm: bool) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -707,7 +713,11 @@ fn remove_on_exit(cli: &Cli, id: &str) -> Result<()> {
         Some(root) => cmd.arg("--zfs-root").arg(root),
         None => cmd.arg("--no-zfs"),
     };
-    cmd.args(["rm-on-exit", id])
+    cmd.arg("on-exit");
+    if rm {
+        cmd.arg("--rm");
+    }
+    cmd.arg(id)
         .env_remove("JAILER_NO_ZFS")
         .env_remove("JAILER_ZFS_ROOT")
         .stdin(std::process::Stdio::null())
@@ -715,7 +725,7 @@ fn remove_on_exit(cli: &Cli, id: &str) -> Result<()> {
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .context("starting the process that removes the container on exit")?;
+        .context("starting the process that cleans up after the container")?;
     Ok(())
 }
 
@@ -1325,7 +1335,7 @@ async fn run() -> Result<()> {
         | Commands::Exec { .. }
         | Commands::Stop { .. }
         | Commands::Rm { .. }
-        | Commands::RmOnExit { .. } => containers(&cli).await,
+        | Commands::OnExit { .. } => containers(&cli).await,
     }
 }
 
@@ -1436,6 +1446,7 @@ async fn containers(cli: &Cli) -> Result<()> {
                 jailer::net::check_subnet()?;
             }
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
+            let has_pod = network == Network::Bridge;
 
             // When running in foreground without `-d`, default to removing the
             // ephemeral test container afterwards unless `--name` was given to keep it.
@@ -1477,8 +1488,10 @@ async fn containers(cli: &Cli) -> Result<()> {
                     }
                     return Err(e.into());
                 }
-                if *rm {
-                    remove_on_exit(cli, &id)?;
+                // Once it exits, its pod would hold on to its address and
+                // ports until a `stop` or `rm`.
+                if *rm || has_pod {
+                    on_exit(cli, &id, *rm)?;
                 }
                 println!("{id}");
                 return Ok(());
@@ -1605,18 +1618,20 @@ async fn containers(cli: &Cli) -> Result<()> {
             Ok(())
         }
 
-        Commands::RmOnExit { id } => {
+        Commands::OnExit { rm, id } => {
             let (sys, _, runtime) = open_context(cli, true)?;
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
-            // Gone before it exits, as by `jailer rm -f`: nothing to do.
-            match runtime.wait(id).await {
-                Ok(_) => {
-                    jailer::runtime::remove(&runtime, &*sys, &leases, id).await?;
-                }
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
+            let done = match runtime.wait(id).await {
+                Ok(_) if *rm => jailer::runtime::remove(&runtime, &*sys, &leases, id).await,
+                // The container is kept, stopped, as `stop` leaves it.
+                Ok(_) => jailer::runtime::stop_pod(&runtime, &*sys, &leases, id).await,
+                Err(e) => Err(e.into()),
+            };
+            match done {
+                // Gone before it exits, as by `jailer rm -f`: nothing to do.
+                Err(jailer::Error::NotFound(_)) => Ok(()),
+                r => Ok(r?),
             }
-            Ok(())
         }
 
         Commands::Rm { force, containers } => {

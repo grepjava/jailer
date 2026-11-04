@@ -81,8 +81,8 @@ fail with a clear message.
   single quotes) is handed on with a mark. That mark was a `\`, which a
   word can also hold for real; it is now a character no Containerfile
   holds, and the parser's words expand with `expand_word`, where a `\`
-  is plain text. Text as written (a here-document's body, mount options)
-  still takes `\$` for `$`. `WORKDIR`, `USER`, `STOPSIGNAL` and the
+  is plain text. Text as written (a `COPY` here-document's body) takes a
+  `\` as BuildKit does: it escapes the character after it, whatever it is. `WORKDIR`, `USER`, `STOPSIGNAL` and the
   one-value `ENV` now have quotes and escapes taken away throughout, not
   only around the whole value.
 

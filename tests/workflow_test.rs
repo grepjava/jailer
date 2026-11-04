@@ -1360,4 +1360,19 @@ async fn config_instructions_follow_docker() {
         .unwrap()
         .image;
     assert!(image.config.config.cmd.is_empty());
+
+    // As in BuildKit, a directory is not copied over a file: the build
+    // says where.
+    std::fs::write(ctx.join("config"), "file").unwrap();
+    std::fs::create_dir_all(ctx.join("tree/config")).unwrap();
+    std::fs::write(ctx.join("tree/config/a"), "a").unwrap();
+    write_cf("FROM scratch\nCOPY config /app/config\nCOPY tree /app/\n");
+    let err = build(&store, &runtime, &opts("over:1"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot copy to non-directory: /app/config"),
+        "{err}"
+    );
 }

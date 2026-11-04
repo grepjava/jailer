@@ -670,8 +670,10 @@ async fn execute_instruction(
                 }
                 std::fs::create_dir_all(&dir)?;
                 if let Some((uid, gid)) = owner {
+                    // As `COPY --chown` does: a build not run by root keeps
+                    // them its own.
                     for d in &made {
-                        set_owner_mode(d, uid, gid, 0o755)?;
+                        apply_perms(d, Some((uid, gid)), Some(0o755))?;
                     }
                 }
                 commit_step_diff(env, stage, &before, step_no, &sp.raw).await?;
@@ -1025,29 +1027,45 @@ impl RunMounts {
                         .unwrap_or(&src)
                         .to_string_lossy()
                         .replace('\\', "/");
+                    let not_found = || {
+                        Error::Build(format!("line {line}: --mount source {source:?} not found"))
+                    };
+                    // A directory left out may have files put back, by `!`
+                    // lines: the context has it, with only those.
+                    let left_out = from.is_none() && ignore.is_ignored(&rel);
                     if std::fs::symlink_metadata(&src).is_err()
-                        || (from.is_none() && ignore.is_ignored(&rel))
+                        || (left_out && !(src.is_dir() && ignore.may_reinclude(&rel)))
                     {
-                        return Err(Error::Build(format!(
-                            "line {line}: --mount source {source:?} not found"
-                        )));
+                        return Err(not_found());
                     }
                     // As in Docker, the step does not see what .containerignore
                     // leaves out of the context, and `rw` writes are discarded:
                     // both mount a copy.
+                    let filter = |p: &Path| {
+                        let rel = rel_path(p, context_dir);
+                        if !ignore.is_ignored(&rel) {
+                            Keep::Yes
+                        } else if ignore.may_reinclude(&rel) {
+                            Keep::Below
+                        } else {
+                            Keep::No
+                        }
+                    };
                     let src =
-                        if from.is_none() && src.is_dir() && any_ignored(context_dir, &src, ignore)
+                        if left_out {
+                            let copier = Copier::new(&scratch, None, None, false);
+                            copier.below(&src, &scratch, &filter)?;
+                            copier.finish()?;
+                            // None of the files put back is there.
+                            if std::fs::symlink_metadata(&scratch).is_err() {
+                                return Err(not_found());
+                            }
+                            out.temp.push(scratch.clone());
+                            scratch
+                        } else if from.is_none()
+                            && src.is_dir()
+                            && any_ignored(context_dir, &src, ignore)
                         {
-                            let filter = |p: &Path| {
-                                let rel = rel_path(p, context_dir);
-                                if !ignore.is_ignored(&rel) {
-                                    Keep::Yes
-                                } else if ignore.may_reinclude(&rel) {
-                                    Keep::Below
-                                } else {
-                                    Keep::No
-                                }
-                            };
                             let copier = Copier::new(&scratch, None, None, false);
                             copier.dir(&src, &scratch, &filter)?;
                             copier.finish()?;
@@ -1112,6 +1130,10 @@ impl RunMounts {
                 }
                 RunMount::Tmpfs { target, size } => {
                     out.key.push_str(&format!("\0tmpfs {target}"));
+                    // The step may look at how much room it has.
+                    if let Some(size) = size {
+                        out.key.push_str(&format!(" size={size}"));
+                    }
                     out.mounts.push(StepMount::Tmpfs {
                         target: target.clone(),
                         size: *size,
@@ -1397,29 +1419,40 @@ fn any_ignored(context_dir: &Path, dir: &Path, ignore: &IgnoreMatcher) -> bool {
     })
 }
 
-/// A digest of a file's or directory tree's contents and modes.
+/// A digest of what a step sees of a mounted file or directory tree: the
+/// contents, and the mode and owner of each file, the mounted one too.
 fn content_digest(path: &Path) -> Result<String, Error> {
-    if !path.is_dir() {
-        let bytes = std::fs::read(path)?;
-        #[cfg(unix)]
-        let bytes = {
-            use std::os::unix::fs::PermissionsExt;
-            let mut bytes = bytes;
-            let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
-            bytes.extend_from_slice(format!("\0{mode:o}").as_bytes());
-            bytes
-        };
+    let meta = std::fs::metadata(path)?;
+    // The mounted file or directory itself.
+    let mut text = owner_mode(&meta);
+    if !meta.is_dir() {
+        let mut bytes = std::fs::read(path)?;
+        bytes.extend_from_slice(format!("\0{text}").as_bytes());
         return Ok(sha256(&bytes));
     }
+    text.push('\n');
     let state = TreeState::capture_tree(path)?;
-    let mut text = String::new();
     for (p, e) in &state.entries {
         text.push_str(&format!(
-            "{p}\0{:?}\0{:o}\0{}\n",
-            e.kind, e.mode, e.digest_or_link
+            "{p}\0{:?}\0{:o}\0{}:{}\0{:x}\0{}\n",
+            e.kind, e.mode, e.uid, e.gid, e.flags, e.digest_or_link
         ));
     }
     Ok(sha256(text.as_bytes()))
+}
+
+/// A file's mode and owner, as `content_digest` keys them.
+fn owner_mode(meta: &std::fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!("{:o} {}:{}", meta.mode() & 0o7777, meta.uid(), meta.gid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        String::new()
+    }
 }
 
 #[cfg(unix)]
@@ -1639,7 +1672,13 @@ async fn download(
     use sha2::{Digest, Sha256};
     use std::io::Write;
     let fail = |e: String| Error::Build(format!("line {line}: ADD {url}: {e}"));
-    let mut resp = reqwest::get(url).await.map_err(|e| fail(e.to_string()))?;
+    let mut resp = crate::http_client()
+        .build()
+        .map_err(|e| fail(e.to_string()))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| fail(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(fail(format!("HTTP {}", resp.status())));
     }
@@ -2151,6 +2190,22 @@ impl Copier {
         }
     }
 
+    /// Makes the directory `dst` if it is not there, saying whether it
+    /// did. As in BuildKit, a directory is not copied over a file.
+    fn make_dir(&self, dst: &Path) -> Result<bool, Error> {
+        match std::fs::symlink_metadata(dst) {
+            Ok(m) if m.is_dir() => Ok(false),
+            Ok(_) => Err(Error::Build(format!(
+                "cannot copy to non-directory: /{}",
+                rel_path(dst, &self.root)
+            ))),
+            Err(_) => {
+                std::fs::create_dir_all(dst)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Copies the tree `src_dir` to `dst_dir`, leaving out what `skip`
     /// names (by path below `root`).
     fn dir(
@@ -2159,8 +2214,7 @@ impl Copier {
         dst_dir: &Path,
         filter: &dyn Fn(&Path) -> Keep,
     ) -> Result<(), Error> {
-        let made = std::fs::symlink_metadata(dst_dir).is_err();
-        std::fs::create_dir_all(dst_dir)?;
+        let made = self.make_dir(dst_dir)?;
         // A directory the copy makes has its source's mode, so that a 0700
         // one stays closed, and from a stage or an image its owner; one
         // already there keeps its own.
@@ -2214,8 +2268,7 @@ impl Copier {
             match keep {
                 Keep::Below => self.below(&path, &target, filter)?,
                 _ => {
-                    if std::fs::symlink_metadata(dst_dir).is_err() {
-                        std::fs::create_dir_all(dst_dir)?;
+                    if self.make_dir(dst_dir)? {
                         apply_perms(dst_dir, self.chown, self.chmod)?;
                     }
                     if is_dir {

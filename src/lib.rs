@@ -27,6 +27,13 @@ pub mod registry {
     pub use legion_image::{Client, Credentials, sha256};
 }
 
+/// An HTTP client builder for jailer's own requests. TLS uses ring, as
+/// Legion's registry client does: the one reqwest and rustls build.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder().user_agent(concat!("jailer/", env!("CARGO_PKG_VERSION")))
+}
+
 pub mod sys {
     pub use legion_sys::*;
 

@@ -450,6 +450,17 @@ CMD ["default-arg"]
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         assert_eq!(got, "hello\n", "published port 18080, from outside");
+        // Its command done, the container is kept and its pod lets go of
+        // its address and port.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Path::new("/var/run/jailer/net").join(&ip).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an exited -d container kept its address"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(cmd(&["ps", "-a"]).contains(" web "));
         // And a pod reaches out, through the bridge and the host.
         let mut listener = Command::new("jexec")
             .args(["jailer_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
@@ -890,6 +901,47 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         .unwrap()
         .stdout;
     assert!(!String::from_utf8_lossy(&layers).contains("s3cr3t-value"));
+
+    // A directory .containerignore leaves out, with a file put back, mounts
+    // with that file; the mode of a mounted directory and the size of a
+    // tmpfs are in the steps' keys.
+    let ctx2 = tmp.path().join("ctx2");
+    std::fs::create_dir_all(ctx2.join("docs")).unwrap();
+    std::fs::create_dir_all(ctx2.join("m")).unwrap();
+    std::fs::write(ctx2.join("docs/keep.txt"), "k").unwrap();
+    std::fs::write(ctx2.join("docs/drop.txt"), "d").unwrap();
+    std::fs::write(ctx2.join(".containerignore"), "docs\n!docs/keep.txt\n").unwrap();
+    let mounts_cf = |size: &str| {
+        std::fs::write(
+            ctx2.join("Containerfile"),
+            format!(
+                "FROM docker.io/freebsd/freebsd-runtime:15.1\n\
+                 RUN --mount=type=bind,source=docs,target=/d ls /d > /docs\n\
+                 RUN --mount=type=tmpfs,target=/t,size={size} df -k /t > /size\n\
+                 RUN --mount=type=bind,source=m,target=/m ls -ld /m > /mode\n\
+                 CMD [\"/bin/cat\", \"/docs\", \"/mode\", \"/size\"]\n"
+            ),
+        )
+        .unwrap();
+    };
+    let seen = || {
+        jailer(&["build", "-t", "k:1", ctx2.to_str().unwrap()]);
+        let out = jailer(&["run", "k:1"]);
+        let lines: Vec<&str> = out.lines().collect();
+        let mode = lines[1].split_whitespace().next().unwrap().to_owned();
+        let blocks = lines.last().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+        (lines[0].to_owned(), mode, blocks)
+    };
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ctx2.join("m"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // One change at a time, each to a step after which nothing else would
+    // run again anyway.
+    mounts_cf("1m");
+    assert_eq!(seen(), ("keep.txt".into(), "drwxr-xr-x".into(), "1024".into()));
+    mounts_cf("2m");
+    assert_eq!(seen(), ("keep.txt".into(), "drwxr-xr-x".into(), "2048".into()));
+    std::fs::set_permissions(ctx2.join("m"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(seen(), ("keep.txt".into(), "drwx------".into(), "2048".into()));
 }
 
 #[test]

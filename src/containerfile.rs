@@ -980,7 +980,7 @@ fn parse_copy(
                 let mode = u32::from_str_radix(&v, 8)
                     .ok()
                     .filter(|m| *m <= 0o7777)
-                    .ok_or_else(|| bad(format!("invalid --chmod mode `{v}`")))?;
+                    .ok_or_else(|| bad(format!("invalid --chmod mode `{}`", literal_word(&v))))?;
                 spec.chmod = Some(mode);
             }
             "exclude" => spec.exclude.push(need()?),
@@ -999,7 +999,12 @@ fn parse_copy(
                     checksum(&literal_word(&v)).map_err(bad)?
                 });
             }
-            _ => return Err(bad(format!("does not support `{flag}`"))),
+            _ => {
+                return Err(bad(format!(
+                    "does not support `{}`",
+                    literal_word(flag)
+                )));
+            }
         }
     }
 
@@ -1062,7 +1067,8 @@ fn parse_key_values(
     for tok in tokens {
         let Some((k, v)) = tok.split_once('=') else {
             return Err(Error::Build(format!(
-                "line {line_no}: expected KEY=VALUE in `{what}`, got `{tok}`"
+                "line {line_no}: expected KEY=VALUE in `{what}`, got `{}`",
+                literal_word(&tok)
             )));
         };
         // The tokens' quotes are already gone: `A="\"x\""` keeps `"x"`.
@@ -1095,6 +1101,8 @@ fn scan_words(s: &str, escape: char, split: bool) -> Vec<String> {
     let mut cur = String::new();
     let mut chars = s.chars();
     let mut quote: Option<char> = None;
+    // A word of quotes alone, as `""`, is a word: an empty one.
+    let mut quoted = false;
     let literal = |cur: &mut String, c: char| {
         cur.push(if c == '$' { LITERAL_DOLLAR } else { c });
     };
@@ -1123,10 +1131,12 @@ fn scan_words(s: &str, escape: char, split: bool) -> Vec<String> {
             None => {
                 if c == '"' || c == '\'' {
                     quote = Some(c);
+                    quoted = true;
                 } else if split && c.is_whitespace() {
-                    if !cur.is_empty() {
+                    if !cur.is_empty() || quoted {
                         out.push(std::mem::take(&mut cur));
                     }
+                    quoted = false;
                 } else if c == escape {
                     if let Some(next) = chars.next() {
                         literal(&mut cur, next);
@@ -1137,7 +1147,7 @@ fn scan_words(s: &str, escape: char, split: bool) -> Vec<String> {
             }
         }
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() || quoted {
         out.push(cur);
     }
     out
@@ -1155,15 +1165,16 @@ pub fn literal_word(word: &str) -> String {
     word.replace(LITERAL_DOLLAR, "$")
 }
 
-/// Expands text as written, such as a here-document's: there `\$` is a
-/// `$` that does not expand.
+/// Expands text as written, such as a here-document's: there, as in
+/// BuildKit, a `\` escapes the character after it, so `\$` is a `$` that
+/// does not expand and `\\` is a `\`.
 pub fn expand_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
     expand(input, vars, true)
 }
 
 /// Expands `$VAR`, `${VAR}`, `${VAR:-word}`, `${VAR-word}`, `${VAR:+word}`
-/// and `${VAR+word}` using `vars`; with `escapes`, `\$` stands for `$` and
-/// `\}` for `}`.
+/// and `${VAR+word}` using `vars`; with `escapes`, a `\` takes the next
+/// character as it is.
 fn expand(input: &str, vars: &BTreeMap<String, String>, escapes: bool) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut at = 0;
@@ -1186,9 +1197,13 @@ fn expand_to(
             return out;
         }
         *at += 1;
-        if escapes && c == '\\' && matches!(chars.get(*at), Some('$' | '}')) {
-            out.push(chars[*at]);
-            *at += 1;
+        // As in BuildKit's lexer, an escape takes the next character as it
+        // is, whatever it is: `\\$A` is a `\` and A's value.
+        if escapes && c == '\\' {
+            if let Some(&next) = chars.get(*at) {
+                out.push(next);
+                *at += 1;
+            }
             continue;
         }
         if c != '$' {
@@ -1901,5 +1916,32 @@ COPY a\\b `
             .unwrap_err()
             .to_string();
         assert!(err.contains("`EOF` is not closed"), "{err}");
+    }
+
+    #[test]
+    fn heredoc_escapes_empty_words_and_messages() {
+        let vars = BTreeMap::from([("A".to_owned(), "x".to_owned())]);
+        // As BuildKit expands an unquoted COPY here-document: `\` takes the
+        // next character, whatever it is.
+        assert_eq!(expand_vars(r"\\$A \$A \q ${A}\", &vars), r"\x $A q x");
+        // A word of quotes alone is an empty word.
+        assert_eq!(tokenize_words(r#""" /dst"#, '\\'), ["", "/dst"]);
+        assert_eq!(tokenize_words(r#"a '' "" b"#, '\\'), ["a", "", "", "b"]);
+        assert_eq!(tokenize_words("a  b ", '\\'), ["a", "b"]);
+        let Instruction::Copy(spec) = parse_instruction("COPY", r#""" /dst"#, 1, '\\', vec![])
+            .unwrap()
+        else {
+            panic!("not COPY")
+        };
+        assert_eq!(spec.sources, [""]);
+        // An escaped `$` reads as one in messages.
+        for (text, want) in [
+            ("FROM scratch\nCOPY --chmod=\\$x a /b\n", "--chmod mode `$x`"),
+            ("FROM scratch\nCOPY --nope=\\$x a /b\n", "`--nope=$x`"),
+            ("FROM scratch\nLABEL a=1 \\$b\n", "got `$b`"),
+        ] {
+            let err = Containerfile::parse(text).unwrap_err().to_string();
+            assert!(err.contains(want) && !err.contains(LITERAL_DOLLAR), "{err}");
+        }
     }
 }

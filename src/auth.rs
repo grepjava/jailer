@@ -186,8 +186,7 @@ pub async fn check_credentials(
             creds.username
         ))
     };
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("jailer/", env!("CARGO_PKG_VERSION")))
+    let http = crate::http_client()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| fail(e.to_string()))?;
