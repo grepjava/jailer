@@ -151,6 +151,36 @@ pub fn limit(sys: &dyn Sys, jail: &str, limits: &Limits) -> Result<(), Error> {
     add_rules(sys, jail, &limits.rules(jail), |r| sys.rctl_add(r))
 }
 
+/// Limits set on a jail, taken away when this is dropped: however what
+/// runs under them ends, by an error or cancelled.
+pub(crate) struct Limited<'a> {
+    sys: &'a dyn Sys,
+    jail: String,
+}
+
+impl Drop for Limited<'_> {
+    fn drop(&mut self) {
+        unlimit(self.sys, &self.jail);
+    }
+}
+
+/// [`limit`], for as long as the [`Limited`] returned lives; with no
+/// limits, nothing is set or taken away.
+pub(crate) fn limited<'a>(
+    sys: &'a dyn Sys,
+    jail: &str,
+    limits: &Limits,
+) -> Result<Option<Limited<'a>>, Error> {
+    if limits.is_empty() {
+        return Ok(None);
+    }
+    limit(sys, jail, limits)?;
+    Ok(Some(Limited {
+        sys,
+        jail: jail.to_owned(),
+    }))
+}
+
 /// Adds `rules` to `jail` with `add`; one that fails takes those added
 /// before it away, as nothing would remove them without a container.
 fn add_rules(
@@ -544,6 +574,21 @@ mod tests {
         // All added, all are kept.
         add_rules(&sys, "j", &rules, |r| sys.rctl_add(r)).unwrap();
         assert_eq!(sys.rctl_rules().len(), 3);
+    }
+
+    #[test]
+    fn limits_go_with_their_guard() {
+        let sys = legion_sys::FakeSys::new();
+        sys.sysctl_set("kern.racct.enable", "1").unwrap();
+        let limits = Limits {
+            pids: Some(10),
+            ..Default::default()
+        };
+        let held = limited(&sys, "step", &limits).unwrap();
+        assert_eq!(sys.rctl_rules().len(), 1);
+        drop(held);
+        assert!(sys.rctl_rules().is_empty());
+        assert!(limited(&sys, "step", &Limits::default()).unwrap().is_none());
     }
 
     #[test]

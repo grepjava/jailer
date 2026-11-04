@@ -589,6 +589,35 @@ CMD ["default-arg"]
             !rules().contains("jailer_build_"),
             "no step's rules are left"
         );
+
+        // Nor by a step that cannot start: a step before made its working
+        // directory a loop of links.
+        let loop_dir = tmp.path().join("looped");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::write(
+            loop_dir.join("Containerfile"),
+            "FROM localhost/hello-service:latest\nUSER root\nWORKDIR /w\n\
+             RUN cd / && rm -rf /w && ln -s w /w\nRUN true\n",
+        )
+        .unwrap();
+        let failed = try_cmd(&[
+            "build",
+            "--pids-limit",
+            "3",
+            "-t",
+            "looped:1",
+            loop_dir.to_str().unwrap(),
+        ]);
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("too many links"),
+            "a looped WORKDIR fails the step: {}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(
+            !rules().contains("jailer_build_"),
+            "no rules are left by the step that failed:\n{}",
+            rules()
+        );
     }
 
     // COPY --from an image; file flags and hard links kept in layers;
@@ -929,6 +958,36 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
         .unwrap()
         .stdout;
     assert!(!String::from_utf8_lossy(&layers).contains("s3cr3t-value"));
+
+    // A step that puts a link in place of the directory made for its agent
+    // does not take what is removed after it out to the host's files.
+    let host = tmp.path().join("host");
+    std::fs::create_dir_all(host.join("z")).unwrap();
+    let _host_sock = std::os::unix::net::UnixListener::bind(host.join("z/c.sock")).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile.links"),
+        format!(
+            "FROM docker.io/freebsd/freebsd-runtime:15.1\n\
+             RUN --mount=type=ssh,target=/run/y/z/c.sock sh -c 'rm -rf /run/y && ln -s {} /run/y'\n",
+            host.display()
+        ),
+    )
+    .unwrap();
+    jailer(&[
+        "build",
+        "--no-cache",
+        "--ssh",
+        &ssh_arg,
+        "-f",
+        "Containerfile.links",
+        "-t",
+        "links:1",
+        ".",
+    ]);
+    assert!(
+        std::fs::symlink_metadata(host.join("z/c.sock")).is_ok(),
+        "the host's socket is still there"
+    );
 
     // A directory .containerignore leaves out, with a file put back, mounts
     // with that file; the mode of a mounted directory and the size of a

@@ -71,6 +71,9 @@ pub struct CachedLayer {
     pub descriptor: Descriptor,
 }
 
+/// How the name of a cache entry being written begins.
+const WRITING: &str = ".tmp-";
+
 fn cache_dir(store: &Store) -> PathBuf {
     store.dir().join("cache")
 }
@@ -109,7 +112,9 @@ pub async fn cached_step(store: &Store, pin: &Pin, key: &str) -> Result<Option<C
 pub fn record_step(store: &Store, key: &str, step: &CachedStep) -> Result<(), Error> {
     let dir = cache_dir(store);
     std::fs::create_dir_all(&dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    // Not under the store's lock: `prune` leaves a file named so alone,
+    // as one a build is writing.
+    let mut tmp = tempfile::Builder::new().prefix(WRITING).tempfile_in(&dir)?;
     std::io::Write::write_all(&mut tmp, &serde_json::to_vec(step)?)?;
     tmp.persist(dir.join(key)).map_err(|e| e.error)?;
     Ok(())
@@ -122,7 +127,21 @@ pub async fn prune(store: &Store, all_cache: bool) -> Result<usize, Error> {
     let held = store.lock().await?;
     if let Ok(listed) = std::fs::read_dir(cache_dir(store)) {
         for e in listed {
-            let path = e?.path();
+            let e = e?;
+            let path = e.path();
+            if e.file_name().to_string_lossy().starts_with(WRITING) {
+                // A build's, being written; one a day old, a build's that
+                // ended before it was done.
+                let age = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok());
+                if age.is_some_and(|a| a > std::time::Duration::from_secs(24 * 60 * 60)) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
             let keep = !all_cache
                 && read_step(&path).is_some_and(|c| match &c.layer {
                     Some(l) => store.has_layer(&l.chain).unwrap_or(false),
@@ -249,5 +268,37 @@ mod tests {
         assert!(!t.path().join("idle").exists());
         assert!(t.path().join("idle.lock").exists());
         assert!(t.path().join("busy/f").exists());
+    }
+
+    #[tokio::test]
+    async fn prune_leaves_an_entry_being_written() {
+        let t = tempfile::tempdir().unwrap();
+        let store = super::open(
+            std::sync::Arc::new(legion_sys::FakeSys::new()),
+            None,
+            &t.path().join("store"),
+            crate::Client::new().unwrap(),
+        )
+        .unwrap();
+        let cache = super::cache_dir(&store);
+        std::fs::create_dir_all(&cache).unwrap();
+        // Half written, as a build writes it: not yet JSON.
+        let writing = cache.join(format!("{}abc", super::WRITING));
+        std::fs::write(&writing, "{\"lay").unwrap();
+        // A crashed build's, from two days ago.
+        let stale = cache.join(format!("{}old", super::WRITING));
+        File::create(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400))
+            .unwrap();
+        // An entry that does not read is dropped, as before.
+        std::fs::write(cache.join("0123"), "{").unwrap();
+        super::prune(&store, false).await.unwrap();
+        assert!(writing.exists());
+        assert!(!stale.exists());
+        assert!(!cache.join("0123").exists());
+        // And what is written ends up under its key.
+        super::record_step(&store, "k", &super::CachedStep { layer: None }).unwrap();
+        assert!(super::read_step(&cache.join("k")).is_some());
     }
 }

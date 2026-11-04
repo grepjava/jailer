@@ -860,10 +860,11 @@ async fn execute_instruction(
                         .chain(id.iter().map(|b| format!("{b:02x}")))
                         .collect();
                     let sys = &**store.sys();
-                    crate::runtime::limit(sys, &name, &opts.limits)?;
                     // Legion's steps take no links in their working
                     // directory, as `/home` (`usr/home`) is in FreeBSD's.
                     let work_dir = without_links(&stage.root, &stage.config.config.working_dir)?;
+                    // Taken away again however the step ends.
+                    let limited = crate::runtime::limited(sys, &name, &opts.limits)?;
                     let code = runtime
                         .run_step(&Step {
                             name: &name,
@@ -882,9 +883,7 @@ async fn execute_instruction(
                             cpuset: opts.cpuset.as_deref(),
                         })
                         .await;
-                    if !opts.limits.is_empty() {
-                        crate::runtime::unlimit(sys, &name);
-                    }
+                    drop(limited);
                     let code = code?;
                     if code != 0 {
                         return Err(Error::Build(format!(
@@ -923,8 +922,16 @@ struct RunMounts {
     /// Locks held on cache mounts shared `locked` or `private`.
     locks: Vec<std::fs::File>,
     /// What placing the agents made in the root: sockets, and the
-    /// directories made for them, deepest first. Removed on drop.
-    placed: Vec<PathBuf>,
+    /// directories made for them. Removed on drop.
+    placed: Vec<Placed>,
+}
+
+/// A socket or a directory [`RunMounts::place_ssh`] made, at `rel` in
+/// `root`.
+struct Placed {
+    root: PathBuf,
+    rel: PathBuf,
+    dir: bool,
 }
 
 struct SshMount {
@@ -1268,14 +1275,20 @@ impl RunMounts {
             } else {
                 relay_ssh_agent(&dir, name, &m.agent, line)
             };
+            let placed = |p: &Path, dir: bool| Placed {
+                root: root.to_path_buf(),
+                rel: p.strip_prefix(root).unwrap_or(p).to_path_buf(),
+                dir,
+            };
+            let made: Vec<Placed> = missing.iter().map(|d| placed(d, true)).collect();
             match relay {
                 Ok(r) => {
                     self.relays.push(r);
-                    self.placed.push(sock.clone());
-                    self.placed.extend(missing);
+                    self.placed.push(placed(&sock, false));
+                    self.placed.extend(made);
                 }
                 Err(e) => {
-                    self.placed.extend(missing);
+                    self.placed.extend(made);
                     return Err(e);
                 }
             }
@@ -1292,18 +1305,98 @@ impl Drop for RunMounts {
         }
         // The sockets first, then the directories made for them, deepest
         // first: two mounts may share one. A directory the step put
-        // something in stays, in its layer.
-        let (mut dirs, files): (Vec<_>, Vec<_>) = self.placed.iter().partition(|p| p.is_dir());
-        for p in files {
-            let _ = std::fs::remove_file(p);
+        // something in stays, in its layer. The step ran as root in the
+        // tree: whatever links it left there are not followed.
+        let (mut dirs, socks): (Vec<_>, Vec<_>) = self.placed.iter().partition(|p| p.dir);
+        for p in socks {
+            let _ = remove_beneath(&p.root, &p.rel, false);
         }
-        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.rel.components().count()));
         for p in dirs {
-            let _ = std::fs::remove_dir(p);
+            let _ = remove_beneath(&p.root, &p.rel, true);
         }
         for p in &self.temp {
             let _ = layer::remove_tree(p);
         }
+    }
+}
+
+/// Removes the socket (or with `dir`, the empty directory) at `rel` in
+/// `root`, going down from `root` one directory at a time and through no
+/// link: one a step put in its path does not take the removal out of the
+/// tree. Whatever is there but a socket, or a directory, stays.
+#[cfg(unix)]
+fn remove_beneath(root: &Path, rel: &Path, dir: bool) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let Some((last, parents)) = parts.split_last() else {
+        return Ok(());
+    };
+    let c = |s: &[u8]| {
+        CString::new(s).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let open = |at: libc::c_int, name: &CString, flags: libc::c_int| {
+        // SAFETY: a valid C string; the descriptor is owned from here.
+        let fd = unsafe {
+            libc::openat(
+                at,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | flags,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let mut at = open(libc::AT_FDCWD, &c(root.as_os_str().as_bytes())?, 0)?;
+    for p in parents {
+        at = open(at.as_raw_fd(), &c(p.as_bytes())?, libc::O_NOFOLLOW)?;
+    }
+    let name = c(last.as_bytes())?;
+    if !dir {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `st` is written by fstatat before it is read.
+        let found = unsafe {
+            libc::fstatat(
+                at.as_raw_fd(),
+                name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if found != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded.
+        if unsafe { st.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Ok(());
+        }
+    }
+    let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: a valid descriptor and C string.
+    if unsafe { libc::unlinkat(at.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_beneath(root: &Path, rel: &Path, dir: bool) -> std::io::Result<()> {
+    let p = root.join(rel);
+    if dir {
+        std::fs::remove_dir(p)
+    } else {
+        std::fs::remove_file(p)
     }
 }
 
@@ -2781,6 +2874,37 @@ mod tests {
             "/usr/home/app"
         );
         assert_eq!(super::without_links(&root, "").unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_step_placed_is_removed_through_no_link() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, host) = (tmp.path().join("root"), tmp.path().join("host"));
+        std::fs::create_dir_all(root.join("run/a")).unwrap();
+        std::fs::create_dir_all(host.join("z")).unwrap();
+        let _in = UnixListener::bind(root.join("run/a/s.sock")).unwrap();
+        let _out = UnixListener::bind(host.join("z/s.sock")).unwrap();
+        std::fs::write(root.join("run/a/file"), "").unwrap();
+        let rm = |rel: &str, dir| super::remove_beneath(&root, std::path::Path::new(rel), dir);
+        // A socket goes; anything else in its stead stays.
+        rm("run/a/s.sock", false).unwrap();
+        assert!(std::fs::symlink_metadata(root.join("run/a/s.sock")).is_err());
+        rm("run/a/file", false).unwrap();
+        assert!(root.join("run/a/file").exists());
+        // A link on the way, absolute, stops it.
+        symlink(&host, root.join("run/y")).unwrap();
+        assert!(rm("run/y/z/s.sock", false).is_err());
+        assert!(rm("run/y/z", true).is_err());
+        assert!(std::fs::symlink_metadata(host.join("z/s.sock")).is_ok());
+        // A link where a directory was is not one: it stays too.
+        assert!(rm("run/y", true).is_err());
+        assert!(std::fs::symlink_metadata(root.join("run/y")).is_ok());
+        std::fs::remove_file(root.join("run/a/file")).unwrap();
+        rm("run/a", true).unwrap();
+        assert!(!root.join("run/a").exists());
     }
 
     #[cfg(unix)]
