@@ -1593,3 +1593,32 @@ fn interrupted_builds_and_runs_leave_nothing() {
     assert_eq!(jails(tmp.path()), Vec::<String>::new());
     assert_eq!(mounts(tmp.path()), Vec::<String>::new());
 }
+
+#[test]
+fn another_users_state_directory_is_refused_by_name() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    if !is_root() {
+        eprintln!("skipping another_users_state_directory_is_refused_by_name (requires root)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state = tmp.path().join("state");
+    let jailer = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args);
+        c
+    };
+    assert!(jailer(&["images"]).status().unwrap().success());
+    for command in [&["images"][..], &["ps", "-a"][..], &["logs", "any"][..]] {
+        let out = jailer(command).uid(65534).gid(65534).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{command:?}");
+        assert!(
+            err.contains("another user's state directory"),
+            "{command:?}: {err}"
+        );
+    }
+}

@@ -729,7 +729,27 @@ fn on_exit(cli: &Cli, id: &str, rm: bool) -> Result<()> {
     Ok(())
 }
 
+/// The state directory's store and runtime. Both need to write there, even
+/// to read: a user's own directory is fine, another's is not.
 fn open_context(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
+    open_state(cli, linux).map_err(|e| {
+        let io = match e.downcast_ref::<jailer::Error>() {
+            Some(jailer::Error::Io(io)) => Some(io),
+            _ => e.downcast_ref::<std::io::Error>(),
+        };
+        if io.is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) {
+            let dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+            anyhow::anyhow!(
+                "{}: another user's state directory: run as that user, or give --state-dir",
+                dir.display()
+            )
+        } else {
+            e
+        }
+    })
+}
+
+fn open_state(cli: &Cli, linux: bool) -> Result<(Arc<dyn Sys>, Arc<Store>, JailRuntime)> {
     let sys: Arc<dyn Sys> = Arc::new(Shell::new());
     let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
     let zfs_root = resolve_zfs_root(cli, &*sys);
@@ -966,13 +986,24 @@ async fn run() -> Result<()> {
             // Dropped, the build takes a running step's jail, mounts and
             // limits with it.
             let build = jailer::build::build(&store, &runtime, &options);
-            let signalled = signalled(false)?;
+            let mut signalled = std::pin::pin!(signalled(false)?);
             let res = tokio::select! {
-                res = build => Ok(res?),
-                code = signalled => Err(code),
+                res = build => Ok(res),
+                code = signalled.as_mut() => Err(code),
             };
             let res = match res {
-                Ok(res) => res,
+                Ok(Ok(res)) => res,
+                // From a terminal, the signal may be why it failed: it
+                // reaches the step too, and this process just after.
+                Ok(Err(e)) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    signalled.as_mut(),
+                )
+                .await
+                {
+                    Ok(code) => std::process::exit(code),
+                    Err(_) => return Err(e.into()),
+                },
                 Err(code) => std::process::exit(code),
             };
 
