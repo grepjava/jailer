@@ -423,7 +423,8 @@ CMD ["default-arg"]
             "--name",
             "web",
             "-p",
-            "18080:8080",
+            // On the client's address alone: not every test host is private.
+            "10.99.0.1:18080:8080",
             "--entrypoint",
             "/bin/sh",
             "nc:1",
