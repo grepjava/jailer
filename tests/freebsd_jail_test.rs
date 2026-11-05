@@ -1393,4 +1393,31 @@ fn a_signal_to_exec_ends_its_command() {
         wait_for("left running in the jail", &mut || !running(seconds));
         assert_eq!(status.code(), Some(128 + signal), "{status:?}");
     }
+
+    // On a terminal, Ctrl-C is the command's: this one catches it and goes
+    // on, with its terminal, to its own exit. script(1) makes the terminal,
+    // and a byte written to it the keypress.
+    let out = tmp.path().join("out");
+    let mut terminal = Command::new("script")
+        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_jailer")])
+        .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+        .args(["exec", "-t", "held", "/bin/sh", "-c"])
+        .arg("trap 'echo caught' INT; /bin/sleep 7703; echo done; exit 5")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::fs::File::create(&out).unwrap())
+        .spawn()
+        .unwrap();
+    wait_for("never started", &mut || running("7703"));
+    let mut keys = terminal.stdin.take().unwrap();
+    std::io::Write::write_all(&mut keys, b"").unwrap();
+    let status = terminal.wait().unwrap();
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(said.contains("caught") && said.contains("done"), "{said}");
+    assert_eq!(
+        status.code(),
+        Some(5),
+        "{status:?}
+{said}"
+    );
+    drop(keys);
 }

@@ -1332,18 +1332,28 @@ async fn run() -> Result<()> {
 }
 
 /// Resolves, to the exit code of a process it killed, on the first signal
-/// that would end this process.
+/// that should end this process. With a command `on_terminal`, Ctrl-C and
+/// Ctrl-\ are the command's to act on, or not: it gets them too, and this
+/// process lives to report its exit and to keep the terminal open for it.
+/// Being handled rather than ignored, they stay default in the command.
 #[cfg(unix)]
-fn signalled() -> std::io::Result<impl Future<Output = i32>> {
+fn signalled(on_terminal: bool) -> std::io::Result<impl Future<Output = i32>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut quit = signal(SignalKind::quit())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     Ok(async move {
-        128 + tokio::select! {
-            _ = interrupt.recv() => libc::SIGINT,
-            _ = terminate.recv() => libc::SIGTERM,
-            _ = hangup.recv() => libc::SIGHUP,
+        loop {
+            let got = tokio::select! {
+                _ = interrupt.recv() => libc::SIGINT,
+                _ = quit.recv() => libc::SIGQUIT,
+                _ = terminate.recv() => libc::SIGTERM,
+                _ = hangup.recv() => libc::SIGHUP,
+            };
+            if !on_terminal || (got != libc::SIGINT && got != libc::SIGQUIT) {
+                return 128 + got;
+            }
         }
     })
 }
@@ -1609,18 +1619,11 @@ async fn containers(cli: &Cli) -> Result<()> {
             let (_, _, runtime) = open_context(cli, true)?;
             let id = runtime.find(container)?;
             let exec = runtime.exec_inherit(&id, command, *interactive, *tty);
-            let code = if *interactive || *tty {
-                // On the terminal, the command takes its own signals: Ctrl-C
-                // at a shell's prompt does not end the shell.
-                exec.await?
-            } else {
-                // In a group of its own no signal reaches it. Dropped, the
-                // exec kills that group.
-                let signalled = signalled()?;
-                tokio::select! {
-                    code = exec => code?,
-                    code = signalled => code,
-                }
+            // Dropped, the exec kills the command and what it started.
+            let signalled = signalled(*interactive || *tty)?;
+            let code = tokio::select! {
+                code = exec => code?,
+                code = signalled => code,
             };
             if code != 0 {
                 std::process::exit(code);
