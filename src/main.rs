@@ -1511,7 +1511,20 @@ async fn containers(cli: &Cli) -> Result<()> {
                 cpuset: limits.cpuset_cpus.clone(),
             };
 
-            let id = jailer::runtime::create(&runtime, &*sys, &leases, &spec).await?;
+            // A signal now waits for the container, half made until then,
+            // to be removed whole, pod and address too. Nothing has run.
+            let mut setup = std::pin::pin!(signalled(false)?);
+            let created = jailer::runtime::create(&runtime, &*sys, &leases, &spec).await;
+            // From a terminal, the signal may be why it failed: it reaches
+            // the tools extracting the image too, and this process just after.
+            let wait = Duration::from_millis(if created.is_err() { 200 } else { 0 });
+            if let Ok(code) = tokio::time::timeout(wait, setup.as_mut()).await {
+                if let Ok(id) = &created {
+                    let _ = jailer::runtime::remove(&runtime, &*sys, &leases, id).await;
+                }
+                std::process::exit(code);
+            }
+            let id = created?;
             if *detach {
                 if let Err(e) = runtime.start(&id).await {
                     if *rm {

@@ -1563,4 +1563,33 @@ fn interrupted_builds_and_runs_leave_nothing() {
         assert_eq!(jails(tmp.path()), Vec::<String>::new(), "{script}");
         assert_eq!(mounts(tmp.path()), Vec::<String>::new(), "{script}");
     }
+
+    // While `run` still copies the image, half a container is on disk.
+    std::fs::write(
+        step.join("Containerfile"),
+        "FROM localhost/i:1\nRUN /bin/dd if=/dev/zero of=/big bs=1m count=100\n",
+    )
+    .unwrap();
+    ok(&["build", "-t", "big:1", step.to_str().unwrap()]);
+    let containers = || {
+        std::fs::read_dir(state.join("containers"))
+            .unwrap()
+            .filter(|e| {
+                let entry = e.as_ref().unwrap();
+                !entry.file_name().to_string_lossy().starts_with('.')
+            })
+            .count()
+    };
+    let mut run = jailer()
+        .args(["run", "--rm", "--entrypoint", "/bin/sleep", "big:1", "7725"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for("the container never appeared", &mut || containers() > 0);
+    unsafe { libc::kill(-(run.id() as i32), libc::SIGINT) };
+    let status = run.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(containers(), 0);
+    assert_eq!(jails(tmp.path()), Vec::<String>::new());
+    assert_eq!(mounts(tmp.path()), Vec::<String>::new());
 }

@@ -848,6 +848,8 @@ stops the running step and takes its jail, mounts and limits with it.
 .Nm run
 leaves SIGINT and SIGQUIT to the command, in its process group, and cleans up
 once the command ends; SIGTERM or SIGHUP ends the command too.
+Before the command has started, any of them removes the container once it is
+made, and nothing runs.
 .Sh ENVIRONMENT
 .Bl -tag -width JAILER_STATE_DIR
 .It Ev JAILER_STATE_DIR
