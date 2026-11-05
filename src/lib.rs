@@ -103,7 +103,7 @@ impl From<legion_image::Error> for Error {
                 expected,
                 got,
             },
-            E::Unsupported(s) => Error::Unsupported(s),
+            E::Unsupported(s) | E::Platform(s) => Error::Unsupported(s),
             E::Extract(s) => Error::Extract(s),
             E::Io(e) => Error::Io(e),
             E::Json(e) => Error::Json(e),

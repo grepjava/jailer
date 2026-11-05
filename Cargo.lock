@@ -1006,8 +1006,8 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "legion-api"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1019,8 +1019,8 @@ dependencies = [
 
 [[package]]
 name = "legion-image"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -1042,8 +1042,8 @@ dependencies = [
 
 [[package]]
 name = "legion-jail"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "bytes",
  "futures",
@@ -1060,8 +1060,8 @@ dependencies = [
 
 [[package]]
 name = "legion-net"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "hickory-proto",
  "legion-sys",
@@ -1072,8 +1072,8 @@ dependencies = [
 
 [[package]]
 name = "legion-runtime"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "bytes",
  "futures",
@@ -1083,8 +1083,8 @@ dependencies = [
 
 [[package]]
 name = "legion-sys"
-version = "0.1.7"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.7#1afaa13c72c5adb1743c10527f9ca8981259ad39"
+version = "0.1.10"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.10#b050f07aeca75365922fa7c86643085f149ad798"
 dependencies = [
  "libc",
  "serde",

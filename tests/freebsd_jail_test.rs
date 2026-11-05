@@ -1217,3 +1217,180 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
     jailer(&["build", "-t", "o:2", ctx_arg]);
     assert_eq!(jailer(&["run", "o:2"]), format!("{owners}\npipe\nro"));
 }
+
+#[test]
+fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
+    if !is_root() {
+        eprintln!(
+            "skipping the_pods_hostname_wins_and_a_stop_ends_an_attached_run (requires root)"
+        );
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_jailer");
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\nENV HOSTNAME=from-image\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(bin);
+        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    // Ends a run a failed assertion left attached, then its files.
+    struct Cleanup(std::path::PathBuf, Option<std::process::Child>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(mut run) = self.1.take() {
+                let _ = run.kill();
+                let _ = run.wait();
+            }
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(["--no-zfs", "rm", "-f", "attached"])
+                .output();
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let mut cleanup = Cleanup(tmp.path().to_path_buf(), None);
+
+    ok(&["build", "-t", "h:1", ctx.to_str().unwrap()]);
+
+    // Run without a shell, which would hide a duplicate.
+    let env = ok(&[
+        "run",
+        "--hostname",
+        "the-pod",
+        "--entrypoint",
+        "/usr/bin/env",
+        "h:1",
+    ]);
+    let names: Vec<_> = env.lines().filter(|l| l.starts_with("HOSTNAME=")).collect();
+    assert_eq!(names, ["HOSTNAME=the-pod"], "{env}");
+
+    let run = jailer()
+        .args([
+            "run",
+            "--rm",
+            "--name",
+            "attached",
+            "--entrypoint",
+            "/bin/sleep",
+            "h:1",
+            "300",
+        ])
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    cleanup.1 = Some(run);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ok(&["ps"]).contains("attached") {
+        assert!(std::time::Instant::now() < deadline, "never started");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // The container goes at once: no waiting out the stop's 10 seconds.
+    let asked = std::time::Instant::now();
+    ok(&["stop", "attached"]);
+    assert!(asked.elapsed().as_secs() < 9, "{:?}", asked.elapsed());
+
+    // `run` lives to report the exit and remove the container.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = cleanup.1.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "run never returned");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    cleanup.1 = None;
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let all = ok(&["ps", "-a"]);
+    assert!(!all.contains("attached"), "{all}");
+}
+
+#[test]
+fn a_signal_to_exec_ends_its_command() {
+    if !is_root() {
+        eprintln!("skipping a_signal_to_exec_ends_its_command (requires root)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(["--no-zfs", "rm", "-f", "held"])
+                .output();
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+    ok(&["build", "-t", "e:1", ctx.to_str().unwrap()]);
+    let entry = ["--entrypoint", "/bin/sleep", "e:1"];
+    ok(&[&["run", "-d", "--name", "held"][..], &entry, &["300"]].concat());
+
+    // The command itself, not the jailer or shim naming it.
+    let running = |seconds: &str| {
+        Command::new("pgrep")
+            .args(["-f", &format!("^/bin/sleep {seconds}$")])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    for (signal, seconds) in [(libc::SIGINT, "7701"), (libc::SIGTERM, "7702")] {
+        let mut exec = jailer()
+            .args(["exec", "held", "/bin/sleep", seconds])
+            .spawn()
+            .unwrap();
+        wait_for("never started", &mut || running(seconds));
+        unsafe { libc::kill(exec.id() as i32, signal) };
+        let status = exec.wait().unwrap();
+        wait_for("left running in the jail", &mut || !running(seconds));
+        assert_eq!(status.code(), Some(128 + signal), "{status:?}");
+    }
+}

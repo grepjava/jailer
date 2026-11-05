@@ -106,6 +106,7 @@ impl Imported {
                 .blob(
                     &remote.reference,
                     &descriptor.digest,
+                    descriptor.size,
                     &blob,
                     remote.creds.as_ref(),
                 )
@@ -160,6 +161,7 @@ async fn read_one(
         .blob(
             r,
             &manifest.config.digest,
+            manifest.config.size,
             tmp.path(),
             remote.creds.as_ref(),
         )

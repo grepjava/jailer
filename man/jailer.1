@@ -823,6 +823,13 @@ Print a container's output, or its last
 .Ar lines .
 .It Nm exec Oo Fl it Oc Ar container Ar command ...
 Run a command in a running container.
+Without
+.Fl i
+or
+.Fl t ,
+a signal ending
+.Nm
+ends the command too.
 Needs root.
 .It Nm stop Oo Fl t Ar seconds Oc Ar container
 Stop a container, killing it after

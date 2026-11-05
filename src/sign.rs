@@ -185,7 +185,9 @@ pub async fn verify(
             continue;
         };
         let path = tmp.path().join(i.to_string());
-        client.blob(&sig_ref, &layer.digest, &path, creds).await?;
+        client
+            .blob(&sig_ref, &layer.digest, layer.size, &path, creds)
+            .await?;
         let payload = std::fs::read(&path)?;
         if key.verify(&payload, &signature).is_err() {
             continue;

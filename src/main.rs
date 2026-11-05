@@ -1331,6 +1331,23 @@ async fn run() -> Result<()> {
     }
 }
 
+/// Resolves, to the exit code of a process it killed, on the first signal
+/// that would end this process.
+#[cfg(unix)]
+fn signalled() -> std::io::Result<impl Future<Output = i32>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        128 + tokio::select! {
+            _ = interrupt.recv() => libc::SIGINT,
+            _ = terminate.recv() => libc::SIGTERM,
+            _ = hangup.recv() => libc::SIGHUP,
+        }
+    })
+}
+
 /// `run`, `ps`, `logs`, `exec`, `stop` and `rm`: containers, which need
 /// jails.
 #[cfg(unix)]
@@ -1591,9 +1608,20 @@ async fn containers(cli: &Cli) -> Result<()> {
             require_root("exec")?;
             let (_, _, runtime) = open_context(cli, true)?;
             let id = runtime.find(container)?;
-            let code = runtime
-                .exec_inherit(&id, command, *interactive, *tty)
-                .await?;
+            let exec = runtime.exec_inherit(&id, command, *interactive, *tty);
+            let code = if *interactive || *tty {
+                // On the terminal, the command takes its own signals: Ctrl-C
+                // at a shell's prompt does not end the shell.
+                exec.await?
+            } else {
+                // In a group of its own no signal reaches it. Dropped, the
+                // exec kills that group.
+                let signalled = signalled()?;
+                tokio::select! {
+                    code = exec => code?,
+                    code = signalled => code,
+                }
+            };
             if code != 0 {
                 std::process::exit(code);
             }
