@@ -1422,3 +1422,145 @@ fn a_signal_to_exec_ends_its_command() {
     );
     drop(keys);
 }
+
+#[test]
+fn interrupted_builds_and_runs_leave_nothing() {
+    use std::os::unix::process::CommandExt;
+    if !is_root() {
+        eprintln!("skipping interrupted_builds_and_runs_leave_nothing (requires root)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let base = tmp.path().join("base");
+    let step = tmp.path().join("step");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::create_dir_all(&step).unwrap();
+    std::fs::write(
+        base.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        step.join("Containerfile"),
+        "FROM localhost/i:1\nRUN /bin/sleep 7721\n",
+    )
+    .unwrap();
+    let jailer = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    fn jails(under: &Path) -> Vec<String> {
+        let out = Command::new("jls").args(["name", "path"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(_, path)| path.starts_with(under.to_str().unwrap()))
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+    fn mounts(under: &Path) -> Vec<String> {
+        let out = Command::new("mount").arg("-p").output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .filter(|at| at.starts_with(under.to_str().unwrap()))
+            .map(str::to_owned)
+            .collect()
+    }
+    // After a failed assertion: jails first, then what they held.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for jail in jails(&self.0) {
+                let _ = Command::new("rctl")
+                    .arg("-r")
+                    .arg(format!("jail:{jail}:"))
+                    .output();
+                let _ = Command::new("jail").args(["-r", &jail]).output();
+            }
+            for mount in mounts(&self.0).iter().rev() {
+                let _ = Command::new("umount").args(["-f", mount]).output();
+            }
+            let _ = jailer::layer::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(tmp.path().to_path_buf());
+    let wait_for = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let running = |seconds: &str| {
+        Command::new("pgrep")
+            .args(["-f", &format!("^/bin/sleep {seconds}$")])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let rules = || {
+        let out = Command::new("rctl").output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["build", "-t", "i:1", base.to_str().unwrap()]);
+
+    // Ctrl-C, as a terminal sends it: to the whole group. The step goes,
+    // with its jail, mounts and limits, and so does the build.
+    let mut build = jailer()
+        .args(["build", "--pids-limit", "50", "-t", "s:1"])
+        .arg(&step)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    wait_for("the step never started", &mut || running("7721"));
+    let jail = jails(tmp.path()).pop().unwrap();
+    assert!(rules().contains(&jail), "{}", rules());
+    unsafe { libc::kill(-(build.id() as i32), libc::SIGINT) };
+    let status = build.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(jails(tmp.path()), Vec::<String>::new());
+    assert_eq!(mounts(tmp.path()), Vec::<String>::new());
+    assert!(!rules().contains(&jail), "{}", rules());
+
+    // `run --rm` outlives its command to remove it: when Ctrl-C ends the
+    // command, when the command takes it and ends as it likes, and when a
+    // signal comes for `run` alone.
+    for (seconds, script, to, signal, code) in [
+        ("7722", "exec /bin/sleep 7722", -1, libc::SIGINT, 130),
+        (
+            "7723",
+            "trap 'exit 5' INT; /bin/sleep 7723 & wait",
+            -1,
+            libc::SIGINT,
+            5,
+        ),
+        ("7724", "exec /bin/sleep 7724", 1, libc::SIGTERM, 143),
+    ] {
+        let mut run = jailer()
+            .args(["run", "--rm", "--name", "gone", "--entrypoint", "/bin/sh"])
+            .args(["i:1", "-c", script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        wait_for("the command never started", &mut || running(seconds));
+        unsafe { libc::kill(to * run.id() as i32, signal) };
+        let status = run.wait().unwrap();
+        assert_eq!(status.code(), Some(code), "{script}: {status:?}");
+        let all = ok(&["ps", "-a"]);
+        assert!(!all.contains("gone"), "{script}: {all}");
+        assert_eq!(jails(tmp.path()), Vec::<String>::new(), "{script}");
+        assert_eq!(mounts(tmp.path()), Vec::<String>::new(), "{script}");
+    }
+}

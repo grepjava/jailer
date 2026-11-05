@@ -931,43 +931,50 @@ async fn run() -> Result<()> {
                     .with_context(|| format!("--label {kv:?} must be KEY=VALUE"))?;
                 parsed_labels.insert(k.to_owned(), v.to_owned());
             }
-            let res = jailer::build::build(
-                &store,
-                &runtime,
-                &BuildOptions {
-                    context_dir: context.clone(),
-                    containerfile: file.clone(),
-                    tag: tag.clone(),
-                    build_args: parsed_args,
-                    target: target.clone(),
-                    backend: *backend,
-                    creds: jailer::auth::CredsSource {
-                        creds: creds.clone(),
-                        authfile: authfile.clone(),
-                    },
-                    strict_lint: *strict,
-                    no_cache: *no_cache,
-                    squash: *squash,
-                    cache_max: match cache_max.as_str() {
-                        "none" => None,
-                        v => Some(jailer::containerfile::parse_size(v).ok_or_else(|| {
-                            anyhow::anyhow!("--cache-max {v:?}: give a size such as 10g, or none")
-                        })?),
-                    },
-                    secrets: parse_secrets(secrets)?,
-                    ssh: parse_ssh(ssh)?,
-                    jail_params: jailer::runtime::step_params(params, sysv)?,
-                    labels: parsed_labels,
-                    timestamp: *timestamp,
-                    limits: limits.parse()?,
-                    compression: *compression,
-                    cpuset: limits.cpuset_cpus.clone(),
-                    annotations: parsed_annotations,
-                    cache_from,
-                    cache_to,
+            let options = BuildOptions {
+                context_dir: context.clone(),
+                containerfile: file.clone(),
+                tag: tag.clone(),
+                build_args: parsed_args,
+                target: target.clone(),
+                backend: *backend,
+                creds: jailer::auth::CredsSource {
+                    creds: creds.clone(),
+                    authfile: authfile.clone(),
                 },
-            )
-            .await?;
+                strict_lint: *strict,
+                no_cache: *no_cache,
+                squash: *squash,
+                cache_max: match cache_max.as_str() {
+                    "none" => None,
+                    v => Some(jailer::containerfile::parse_size(v).ok_or_else(|| {
+                        anyhow::anyhow!("--cache-max {v:?}: give a size such as 10g, or none")
+                    })?),
+                },
+                secrets: parse_secrets(secrets)?,
+                ssh: parse_ssh(ssh)?,
+                jail_params: jailer::runtime::step_params(params, sysv)?,
+                labels: parsed_labels,
+                timestamp: *timestamp,
+                limits: limits.parse()?,
+                compression: *compression,
+                cpuset: limits.cpuset_cpus.clone(),
+                annotations: parsed_annotations,
+                cache_from,
+                cache_to,
+            };
+            // Dropped, the build takes a running step's jail, mounts and
+            // limits with it.
+            let build = jailer::build::build(&store, &runtime, &options);
+            let signalled = signalled(false)?;
+            let res = tokio::select! {
+                res = build => Ok(res?),
+                code = signalled => Err(code),
+            };
+            let res = match res {
+                Ok(res) => res,
+                Err(code) => std::process::exit(code),
+            };
 
             print_report(&res.report);
             // The image may carry other names too, of builds that gave the
@@ -1332,12 +1339,13 @@ async fn run() -> Result<()> {
 }
 
 /// Resolves, to the exit code of a process it killed, on the first signal
-/// that should end this process. With a command `on_terminal`, Ctrl-C and
-/// Ctrl-\ are the command's to act on, or not: it gets them too, and this
-/// process lives to report its exit and to keep the terminal open for it.
-/// Being handled rather than ignored, they stay default in the command.
+/// that should end this process. With a command `shared`, in this process's
+/// group, Ctrl-C and Ctrl-\ are the command's to act on, or not: it gets
+/// them too, and this process lives to report its exit, clean up after it
+/// and keep its terminal open. Being handled rather than ignored, they stay
+/// default in the command.
 #[cfg(unix)]
-fn signalled(on_terminal: bool) -> std::io::Result<impl Future<Output = i32>> {
+fn signalled(shared: bool) -> std::io::Result<impl Future<Output = i32>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut quit = signal(SignalKind::quit())?;
@@ -1351,11 +1359,16 @@ fn signalled(on_terminal: bool) -> std::io::Result<impl Future<Output = i32>> {
                 _ = terminate.recv() => libc::SIGTERM,
                 _ = hangup.recv() => libc::SIGHUP,
             };
-            if !on_terminal || (got != libc::SIGINT && got != libc::SIGQUIT) {
+            if !shared || (got != libc::SIGINT && got != libc::SIGQUIT) {
                 return 128 + got;
             }
         }
     })
+}
+
+#[cfg(not(unix))]
+fn signalled(_: bool) -> std::io::Result<impl Future<Output = i32>> {
+    Ok(std::future::pending())
 }
 
 /// `run`, `ps`, `logs`, `exec`, `stop` and `rm`: containers, which need
@@ -1516,7 +1529,15 @@ async fn containers(cli: &Cli) -> Result<()> {
                 println!("{id}");
                 return Ok(());
             }
-            let code = runtime.run_attached(&id, *interactive, *tty).await;
+            // In this process's group, the command takes Ctrl-C itself, and
+            // ending is its own: what follows cleans up after it. Dropped,
+            // the run kills it and takes its jail down.
+            let attached = runtime.run_attached(&id, *interactive, *tty);
+            let signalled = signalled(true)?;
+            let code = tokio::select! {
+                code = attached => code,
+                code = signalled => Ok(code),
+            };
             if auto_rm {
                 let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
             } else {
