@@ -17,7 +17,6 @@ CARGO_CRATES=	adler2-2.0.1 \
 		bytes-1.12.1 \
 		cc-1.10.0 \
 		cfg-if-1.0.5 \
-		cfg_aliases-0.2.2 \
 		chacha20-0.10.2 \
 		clap-4.6.7 \
 		clap_builder-4.6.7 \
@@ -101,7 +100,6 @@ CARGO_CRATES=	adler2-2.0.1 \
 		linux-raw-sys-0.12.1 \
 		litemap-0.8.3 \
 		log-0.4.35 \
-		lru-slab-0.1.3 \
 		matchers-0.2.0 \
 		memchr-2.8.3 \
 		miniz_oxide-0.9.1 \
@@ -120,23 +118,17 @@ CARGO_CRATES=	adler2-2.0.1 \
 		potential_utf-0.1.6 \
 		primeorder-0.13.6 \
 		proc-macro2-1.0.107 \
-		quinn-0.11.12 \
-		quinn-proto-0.11.19 \
-		quinn-udp-0.5.16 \
 		quote-1.0.47 \
 		r-efi-5.3.0 \
 		r-efi-6.0.0 \
 		rand-0.10.3 \
 		rand_core-0.6.4 \
 		rand_core-0.10.1 \
-		rand_pcg-0.10.2 \
 		regex-automata-0.4.18 \
 		regex-syntax-0.8.11 \
-		reqwest-0.12.28 \
 		reqwest-0.13.5 \
 		rfc6979-0.4.0 \
 		ring-0.17.14 \
-		rustc-hash-2.1.3 \
 		rustc_version-0.4.1 \
 		rustix-1.1.6 \
 		rustls-0.23.46 \
@@ -223,12 +215,9 @@ CARGO_CRATES=	adler2-2.0.1 \
 		wasm-bindgen-macro-0.2.130 \
 		wasm-bindgen-macro-support-0.2.130 \
 		wasm-bindgen-shared-0.2.130 \
-		wasm-streams-0.4.2 \
 		wasm-streams-0.5.0 \
 		web-sys-0.3.107 \
-		web-time-1.1.0 \
 		webpki-root-certs-1.0.11 \
-		webpki-roots-1.0.11 \
 		winapi-util-0.1.11 \
 		windows-link-0.2.1 \
 		windows-registry-0.6.1 \
@@ -260,4 +249,4 @@ CARGO_CRATES=	adler2-2.0.1 \
 		zstd-0.13.3 \
 		zstd-safe-7.3.0 \
 		zstd-sys-2.1.2+zstd.1.5.7 \
-		legion-api,legion-image,legion-jail,legion-net,legion-runtime,legion-sys@git+https://github.com/grepjava/legion?tag=v0.1.7\#1afaa13c72c5adb1743c10527f9ca8981259ad39
+		legion-api,legion-image,legion-jail,legion-net,legion-runtime,legion-sys@git+https://github.com/grepjava/legion?tag=v0.1.11\#99f5d3d37a9c142d694fec02ada27a28e1f3bf43
