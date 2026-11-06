@@ -417,13 +417,21 @@ impl Drop for StageCleanup {
         for (root, dataset) in self.stages.iter().rev() {
             if let Some(ds) = dataset
                 && self.sys.zfs_list(ds).is_ok_and(|l| !l.is_empty())
+                && self.sys.zfs_destroy(ds, true).is_err()
             {
-                let _ = self.sys.zfs_destroy(ds, true);
+                // A step's jail may be dying yet, its connections in
+                // TIME_WAIT holding the root. Nothing runs there now.
+                let _ = self.sys.unmount(&root.to_string_lossy());
+                if let Err(e) = self.sys.zfs_destroy(ds, true) {
+                    eprintln!("warning: {ds} stays: {e}");
+                }
             }
             let _ = layer::remove_tree(root);
         }
-        if let Some(ds) = &self.parent {
-            let _ = self.sys.zfs_destroy(ds, true);
+        if let Some(ds) = &self.parent
+            && let Err(e) = self.sys.zfs_destroy(ds, true)
+        {
+            eprintln!("warning: {ds} stays: {e}");
         }
     }
 }
@@ -2937,6 +2945,35 @@ async fn build_with_buildah(
 
 #[cfg(test)]
 mod tests {
+    /// As a jail still dying after a step's connections holds its root.
+    #[test]
+    fn a_stage_held_by_a_dying_jail_goes_with_the_build() {
+        use legion_sys::Sys as _;
+        let sys = std::sync::Arc::new(legion_sys::FakeSys::new());
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("stage-0");
+        std::fs::create_dir_all(&root).unwrap();
+        let mountpoint = root.to_str().unwrap();
+        sys.zfs_create("tank/build", &[("mountpoint", "none")])
+            .unwrap();
+        sys.zfs_create("tank/build/mine", &[("mountpoint", "none")])
+            .unwrap();
+        sys.zfs_create("tank/build/mine/stage-0", &[("mountpoint", mountpoint)])
+            .unwrap();
+        sys.hold(mountpoint);
+        drop(super::StageCleanup {
+            sys: sys.clone(),
+            stages: vec![(root.clone(), Some("tank/build/mine/stage-0".to_owned()))],
+            parent: Some("tank/build/mine".to_owned()),
+        });
+        assert!(
+            sys.zfs_list("tank/build/mine")
+                .map_or(true, |l| l.is_empty()),
+            "the stage stayed"
+        );
+        assert!(!root.exists());
+    }
+
     /// The stages built for `text`: `--target target`, with an image's
     /// `ONBUILD` triggers from `triggers`.
     async fn plan(text: &str, target: Option<&str>, triggers: &[&str]) -> Vec<usize> {
