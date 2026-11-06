@@ -1,0 +1,32 @@
+# jailer's manifest for Legion's scripts/qualify. See that script for the
+# format. From jailer's root, with the script from the Legion tag jailer pins:
+#
+#   qualify --manifest scripts/jailer.qualify --profile shared --pool POOL
+project jailer
+scan tests/*.rs
+
+# What jailer's tests make, in the before/after snapshots. The bridge jailer0
+# and the anchor jailer/nat stay: every pod on a host shares them.
+own ^jail [^ ]+ /tmp/\.tmp
+own ^mount .* on /tmp/\.tmp
+own ^if jp
+own ^anchor jailer/[0-9a-f]
+own ^rctl jail:
+own ^zfs [^/]+/jailer-test
+
+env JAILER_TEST_POOL @zfsmount@
+
+run clippy 3600 cargo clippy --all-targets -- -D warnings
+run unit 3600 cargo test --no-fail-fast
+
+# Safe on a shared, public host: throwaway jails, and ports published only on
+# a test address.
+test . freebsd_jail_test real_freebsd_jail_build_run_export_workflow host shared 900
+test . freebsd_jail_test run_mounts_reach_the_step_but_not_the_image host shared 600
+test . freebsd_jail_test cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid host shared 600
+test . freebsd_jail_test stage_copies_keep_owners_archives_take_flags_and_cache_options_count host shared 600
+test . freebsd_jail_test the_pods_hostname_wins_and_a_stop_ends_an_attached_run host shared 600
+test . freebsd_jail_test a_signal_to_exec_ends_its_command host shared 600
+test . freebsd_jail_test interrupted_builds_and_runs_leave_nothing host shared 600
+test . freebsd_jail_test another_users_state_directory_is_refused_by_name host shared 300
+test . freebsd_jail_test a_failing_stage_nothing_needs_does_not_run host shared 300

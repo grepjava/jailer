@@ -43,7 +43,7 @@ Do not treat these as features still needing implementation:
 | Memory limits | RCTL limits resident memory per process, rather than enforcing a total container-memory budget. Sharing `legion-jail` does not include Legion agent-side aggregate-memory enforcement. |
 | Image trust | Key-based signatures exist; SBOM/provenance attestations, keyless signing and transparency-log integration are absent from the reviewed interface. |
 | Runtime equivalence | Local jail execution shares runtime primitives, but does not reproduce the full Legion agent, probes, reconciliation or service lifecycle. |
-| Qualification | FreeBSD live tests exist, but are compiled only on FreeBSD and return without exercising the workflow when not root. The reviewed checkout has no `.github` workflow directory. |
+| Qualification | FreeBSD live tests are compiled only on FreeBSD and run through `scripts/qualify`, on amd64 so far. The checkout has no `.github` workflow directory. |
 
 ## P0 — Repeatable FreeBSD qualification
 
@@ -74,7 +74,9 @@ host. That gives evidence, but does not meet "disposable", and arm64 is a VM.
 
 Harness, agreed with Legion: one runner, `scripts/qualify` in Legion's repository,
 fetched at the pinned tag, with a manifest per project and a JSON result per
-run. Done here: `QUALIFY_REQUIRE_LIVE` makes what a jail test would skip fail it.
+run. Done here: `QUALIFY_REQUIRE_LIVE` makes what a jail test would skip fail
+it, and `scripts/jailer.qualify` lists the jail tests, which `cargo test` now
+reports as ignored.
 
 Also close here the paths with no live coverage: the default `(self)` publish,
 the address fix after a failed teardown, and `login` refusing a token realm

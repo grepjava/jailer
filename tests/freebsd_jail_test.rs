@@ -21,11 +21,12 @@ fn live(test: &str) -> bool {
         return true;
     }
     assert!(!must_run(), "{test} requires root");
-    eprintln!("skipping {test} (requires root)");
+    println!("QUALIFY-SKIP: {test} requires root");
     false
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn real_freebsd_jail_build_run_export_workflow() {
     if !live("real_freebsd_jail_build_run_export_workflow") {
         return;
@@ -852,6 +853,7 @@ RUN cat /one /two > /both
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn run_mounts_reach_the_step_but_not_the_image() {
     if !live("run_mounts_reach_the_step_but_not_the_image") {
         return;
@@ -1063,6 +1065,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
     if !live("cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid") {
         return;
@@ -1136,6 +1139,7 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
     if !live("stage_copies_keep_owners_archives_take_flags_and_cache_options_count") {
         return;
@@ -1229,6 +1233,7 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
     if !live("the_pods_hostname_wins_and_a_stop_ends_an_attached_run") {
         return;
@@ -1331,6 +1336,7 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn a_signal_to_exec_ends_its_command() {
     if !live("a_signal_to_exec_ends_its_command") {
         return;
@@ -1429,6 +1435,7 @@ fn a_signal_to_exec_ends_its_command() {
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn interrupted_builds_and_runs_leave_nothing() {
     use std::os::unix::process::CommandExt;
     if !live("interrupted_builds_and_runs_leave_nothing") {
@@ -1599,6 +1606,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn another_users_state_directory_is_refused_by_name() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -1627,6 +1635,7 @@ fn another_users_state_directory_is_refused_by_name() {
 }
 
 #[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn a_failing_stage_nothing_needs_does_not_run() {
     if !live("a_failing_stage_nothing_needs_does_not_run") {
         return;
