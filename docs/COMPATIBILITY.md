@@ -12,6 +12,9 @@ What is claimed here was tested with:
 | Buildah | Podman 5.8.6 (Buildah 1.43.2) | FreeBSD 15.1 | `tests/compat/expected/buildah` |
 | jailer | this tree | FreeBSD 15.1, and Windows without file modes | `tests/compat_test.rs` |
 
+Only amd64 has a qualified run. jailer builds on arm64, and its tests passed on an
+arm64 VM before this qualification existed, so arm64 is not called supported yet.
+
 `tests/compat_test.rs` builds every case in `tests/compat/cases` and compares
 the image's config and files with both tools' records. A difference fails the
 test unless `tests/compat/differences.buildkit` or `.buildah` names it, with

@@ -73,7 +73,7 @@ Other FreeBSD tools, as their own documentation described them in November 2026:
 
 ## Installing
 
-Release tarballs for FreeBSD 15.1 and later, amd64 and aarch64, are on
+Release tarballs for FreeBSD 15.1 and later, for amd64, are on
 the [releases page](https://github.com/grepjava/jailer/releases). They
 are built on 15.1 and need its libc, so on 15.0 build from source or the
 port.
