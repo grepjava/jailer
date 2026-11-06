@@ -1,6 +1,7 @@
 # Jailer roadmap
 
-Reviewed against v0.5.3 (`1562c2c`) on 2026-11-06.
+Reviewed at `1562c2c` (four commits after v0.5.3) on 2026-11-06. Sequencing
+revised the same day against v0.5.4 and Legion v0.1.12's roadmap.
 
 Jailer is a standalone FreeBSD OCI image builder, local jail test runner,
 compatibility checker and registry publisher. This roadmap compares its
@@ -67,10 +68,21 @@ Acceptance criteria:
   Legion dependency version.
 - Fast unit and mock-based checks remain available independently.
 
+Hosts: Legion's P0.1 needs the same disposable FreeBSD hosts, so one harness
+should serve both. Until they exist, qualification runs on the shared test
+host. That gives evidence, but does not meet "disposable", and arm64 is a VM.
+
+Also close here the paths with no live coverage: the default `(self)` publish,
+the address fix after a failed teardown, and `login` refusing a token realm
+that is not https, which needs an https registry.
+
 ### Shared Jailer–Legion qualification
 
 Extend qualification across the product boundary, using a recorded pair of
-Jailer and Legion versions and their shared crate revisions.
+Jailer and Legion versions and their shared crate revisions. This is a
+separate milestone from P0 above: the registry and offline routes need Legion's
+P1.3, the stateful scenarios its P0.2, P1.2 and P1.4, so it does not hold P0
+open.
 
 - Build and test a native application with Jailer, sign and push its immutable
   digest, then deploy that exact image through Legion.
@@ -106,11 +118,12 @@ Acceptance criteria:
 - An unused failing stage does not affect an independent target.
 - Dependencies through inherited stages, copies and mounts are built exactly
   when needed, including applicable base-image `ONBUILD` triggers.
+- An unknown `--target` is reported before any stage runs.
 - Existing cache, rootfs pinning and cleanup guarantees remain correct.
 - Stage execution can remain sequential initially; parallelism is a later step.
 
-Dependencies: existing multi-stage implementation; P0 qualification for live
-regression evidence.
+Dependencies: existing multi-stage implementation. Planning is testable
+without jails, so this runs alongside P0, which adds live regression evidence.
 
 ## P1.2 — Versioned compatibility contract
 
@@ -134,7 +147,7 @@ Acceptance criteria:
 - Registry-cache documentation explicitly describes Jailer's own format.
 - Compatibility claims identify tested tool versions and platforms.
 
-Dependencies: P1.1 for target-selection semantics.
+Dependencies: P1.1 for target-selection semantics only.
 
 ## P1.3 — Precise local-versus-Legion guarantees
 
@@ -188,10 +201,12 @@ Acceptance criteria:
 - Failure to verify under a required policy prevents deployment, with an
   actionable result. This requires coordinated Legion work.
 
-Dependencies: existing signing, registry and index support; shared P0
-qualification. Coordinate with Legion's immutable rollout and trust-policy
-milestones. The release-record subset of structured output belongs here;
-broader CI diagnostics remain P2.3.
+Dependencies: existing signing, registry and index support. The record,
+references and verification results are Jailer's, and need only P0. The
+deployment criteria above are joint: they close with shared qualification,
+after Legion's P1.3 (immutable identities) and P2.1 (trust policy). The
+release-record subset of structured output belongs here; broader CI
+diagnostics remain P2.3.
 
 ## P2.1 — Provenance and SBOM integration
 
@@ -252,7 +267,8 @@ Deliverables:
 - Structured compatibility-check and build results with stable finding codes,
   severity, output digests and clear exit-status semantics.
 - Read-only host diagnostics covering relevant RACCT, PF anchors, forwarding,
-  ZFS access and Linux ABI prerequisites.
+  ZFS access and Linux ABI prerequisites. Legion's `legion doctor` (its P1.1)
+  checks the same things: share them through a Legion crate, not a copy.
 
 Acceptance criteria:
 
@@ -281,10 +297,15 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 
 ## Scope and sequencing
 
-Start with explicit privileged qualification and dependency-aware stage
-selection. Follow with compatibility documentation, runtime guarantees and
-immutable image handoff, then full supply-chain attestations, remote builds
-and automation support.
+| Phase | Work | Waits on |
+|---|---|---|
+| 1. Honest tests | P0: required live runs, a recorded qualification script, ZFS and plain-directory storage, the uncovered paths | Nothing; hosts for the full matrix |
+| 2. Stage planning | P1.1 | Nothing; runs alongside phase 1 |
+| 3. Stated guarantees | P1.2, P1.3 | Phase 2 for target semantics |
+| 4. Image handoff | P1.4's Jailer side, with structured `check` output | Phase 1 |
+| 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
+| 6. Supply chain and automation | P2.1, P2.2, P2.3 | Phases 1 and 4; a shared diagnostics crate |
+| 7. Parallel stages | P3 | Phases 1 and 2 |
 
 Use Build → Sign → Push → Deploy → Drain → Migrate → Recover as the shared
 engineering contract. Test each boundary while retaining clear ownership:
