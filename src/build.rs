@@ -436,7 +436,7 @@ pub async fn build(
 
     final_config.config.labels.extend(opts.labels.clone());
     if let Some(secs) = opts.timestamp {
-        let created = rfc3339(secs);
+        let created = legion_api::clock::format(secs);
         // This build's history, not the base image's, takes its time.
         for h in final_config
             .history
@@ -2665,27 +2665,6 @@ fn set_env(env: &mut Vec<String>, key: &str, value: &str) {
     }
 }
 
-/// `secs` since 1970 as an RFC 3339 UTC time, as image configs give it.
-fn rfc3339(secs: i64) -> String {
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Days to a civil date (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
-    )
-}
-
 fn record_history(cfg: &mut ImageConfig, created_by: &str, empty_layer: bool) {
     cfg.history.push(History {
         created: String::new(),
@@ -2790,7 +2769,8 @@ async fn build_with_buildah(
 
 #[cfg(test)]
 mod tests {
-    use super::{pull_creds, rfc3339};
+    use super::pull_creds;
+    use legion_api::clock::format as rfc3339;
 
     #[test]
     fn times_are_given_as_image_configs_give_them() {
