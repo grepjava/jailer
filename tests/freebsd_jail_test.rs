@@ -9,10 +9,25 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Whether a qualification run asked for: there, what a test would skip
+/// fails it instead, so that a pass means it ran.
+fn must_run() -> bool {
+    std::env::var_os("QUALIFY_REQUIRE_LIVE").is_some()
+}
+
+/// Whether `test` can run, which takes root.
+fn live(test: &str) -> bool {
+    if is_root() {
+        return true;
+    }
+    assert!(!must_run(), "{test} requires root");
+    eprintln!("skipping {test} (requires root)");
+    false
+}
+
 #[test]
 fn real_freebsd_jail_build_run_export_workflow() {
-    if !is_root() {
-        eprintln!("skipping real_freebsd_jail_build_run_export_workflow (requires root)");
+    if !live("real_freebsd_jail_build_run_export_workflow") {
         return;
     }
 
@@ -522,6 +537,7 @@ CMD ["default-arg"]
             assert!(!rules.contains("18080"), "{anchor}: {rules}");
         }
     } else {
+        assert!(!must_run(), "pf.conf does not call jailer's anchors");
         let out = try_cmd(&[&["run", "--vnet"][..], &shell, &["true"]].concat());
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -837,8 +853,7 @@ RUN cat /one /two > /both
 
 #[test]
 fn run_mounts_reach_the_step_but_not_the_image() {
-    if !is_root() {
-        eprintln!("skipping run_mounts_reach_the_step_but_not_the_image (requires root)");
+    if !live("run_mounts_reach_the_step_but_not_the_image") {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
@@ -1049,10 +1064,7 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
 
 #[test]
 fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
-    if !is_root() {
-        eprintln!(
-            "skipping cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid (requires root)"
-        );
+    if !live("cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid") {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
@@ -1125,10 +1137,7 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
 
 #[test]
 fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
-    if !is_root() {
-        eprintln!(
-            "skipping stage_copies_keep_owners_archives_take_flags_and_cache_options_count (requires root)"
-        );
+    if !live("stage_copies_keep_owners_archives_take_flags_and_cache_options_count") {
         return;
     }
     use std::os::unix::fs::PermissionsExt;
@@ -1221,10 +1230,7 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
 
 #[test]
 fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
-    if !is_root() {
-        eprintln!(
-            "skipping the_pods_hostname_wins_and_a_stop_ends_an_attached_run (requires root)"
-        );
+    if !live("the_pods_hostname_wins_and_a_stop_ends_an_attached_run") {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
@@ -1326,8 +1332,7 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
 
 #[test]
 fn a_signal_to_exec_ends_its_command() {
-    if !is_root() {
-        eprintln!("skipping a_signal_to_exec_ends_its_command (requires root)");
+    if !live("a_signal_to_exec_ends_its_command") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1426,8 +1431,7 @@ fn a_signal_to_exec_ends_its_command() {
 #[test]
 fn interrupted_builds_and_runs_leave_nothing() {
     use std::os::unix::process::CommandExt;
-    if !is_root() {
-        eprintln!("skipping interrupted_builds_and_runs_leave_nothing (requires root)");
+    if !live("interrupted_builds_and_runs_leave_nothing") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1598,8 +1602,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
 fn another_users_state_directory_is_refused_by_name() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
-    if !is_root() {
-        eprintln!("skipping another_users_state_directory_is_refused_by_name (requires root)");
+    if !live("another_users_state_directory_is_refused_by_name") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1621,4 +1624,41 @@ fn another_users_state_directory_is_refused_by_name() {
             "{command:?}: {err}"
         );
     }
+}
+
+#[test]
+fn a_failing_stage_nothing_needs_does_not_run() {
+    if !live("a_failing_stage_nothing_needs_does_not_run") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1 AS unused\nRUN false\n\
+         FROM docker.io/freebsd/freebsd-runtime:15.1 AS wanted\nRUN : > /built\n",
+    )
+    .unwrap();
+    let build = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .args(["--state-dir"])
+            .arg(tmp.path().join("state"))
+            .args(["--no-zfs", "build"])
+            .args(args)
+            .arg(&ctx)
+            .output()
+            .unwrap()
+    };
+    let out = build(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = build(&["--target", "unused"]);
+    assert!(
+        !out.status.success(),
+        "the stage still fails when asked for"
+    );
 }
