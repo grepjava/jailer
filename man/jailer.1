@@ -153,6 +153,19 @@ or
 .Cm none
 for no limit), when a build drops the least recently used.
 .Pp
+Only the stage asked for, by
+.Fl -target
+or as the last, and the stages it needs are built: those it is built on or
+copies from, through
+.Cm FROM ,
+.Cm COPY Fl -from ,
+a bind mount's
+.Cm from ,
+or an
+.Cm ONBUILD
+trigger.
+A source given by a variable keeps every stage before it.
+.Pp
 A
 .Cm RUN
 step may take, as in Docker,

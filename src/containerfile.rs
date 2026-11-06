@@ -208,6 +208,29 @@ pub enum Instruction {
     Onbuild(String),
 }
 
+impl Instruction {
+    /// What this takes files from besides the context, stages or images, as
+    /// written.
+    pub fn sources(&self) -> Vec<&str> {
+        match self {
+            Instruction::Copy(spec) | Instruction::Add(spec) => {
+                spec.from.iter().map(String::as_str).collect()
+            }
+            Instruction::Run(_, options) => options
+                .mounts
+                .iter()
+                .filter_map(|m| match m {
+                    RunMount::Bind {
+                        from: Some(from), ..
+                    } => Some(from.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 impl Containerfile {
     pub fn parse_file(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path)

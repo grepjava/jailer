@@ -1579,3 +1579,82 @@ fn check_fails_on_an_image_whose_files_cannot_be_prepared() {
         String::from_utf8_lossy(&second.stderr)
     );
 }
+
+#[tokio::test]
+async fn a_build_takes_only_the_stages_its_target_needs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("f"), "f\n").unwrap();
+    // The stage between has no `f2`, and fails if it is built.
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM scratch AS used\nCOPY f /one\nFROM scratch AS broken\nCOPY f2 /two\n\
+         FROM scratch AS last\nCOPY --from=0 /one /copied\n",
+    )
+    .unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let store = Arc::new(
+        jailer::store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        Config {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    let opts = |target: Option<&str>| BuildOptions {
+        context_dir: ctx.clone(),
+        containerfile: None,
+        tag: "localhost/stages:1".to_owned(),
+        build_args: BTreeMap::new(),
+        target: target.map(str::to_owned),
+        backend: BuildBackend::Native,
+        creds: Default::default(),
+        strict_lint: false,
+        no_cache: false,
+        squash: false,
+        cache_max: None,
+        secrets: BTreeMap::new(),
+        ssh: BTreeMap::new(),
+        jail_params: Vec::new(),
+        labels: BTreeMap::new(),
+        timestamp: None,
+        limits: Default::default(),
+        compression: Default::default(),
+        cpuset: None,
+        annotations: BTreeMap::new(),
+        cache_from: Vec::new(),
+        cache_to: None,
+    };
+
+    // The last stage needs the first by index, not the broken one between.
+    let built = build(&store, &runtime, &opts(None)).await.unwrap();
+    let root = tmp.path().join("root");
+    store.prepare_rootfs(&built.image, &root, None).unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("copied")).unwrap(), "f\n");
+
+    // The broken one still fails when it is what was asked for, ...
+    let err = build(&store, &runtime, &opts(Some("broken")))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("f2"), "{err}");
+    // ... and a target that is not there is refused before any stage runs.
+    let err = build(&store, &runtime, &opts(Some("typo")))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("\"typo\" not found"), "{err}");
+}

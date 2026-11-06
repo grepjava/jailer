@@ -36,7 +36,7 @@ Do not treat these as features still needing implementation:
 
 | Area | Current boundary |
 |---|---|
-| Stage execution | Native builds execute stages sequentially in file order until the selected target, including unrelated earlier stages. |
+| Stage execution | Native builds execute only the stages the target needs, one at a time in file order. |
 | Containerfile syntax | Broad support, but `# syntax=` is ignored and `COPY --link` has no special behavior. |
 | Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. Publishing a multi-architecture index does not coordinate the builds. |
 | Registry cache | OCI transport with a Jailer-specific cache configuration format; not an interchangeable BuildKit cache. |
@@ -72,6 +72,10 @@ Hosts: Legion's P0.1 needs the same disposable FreeBSD hosts, so one harness
 should serve both. Until they exist, qualification runs on the shared test
 host. That gives evidence, but does not meet "disposable", and arm64 is a VM.
 
+Harness, agreed with Legion: one runner, `scripts/qualify` in Legion's repository,
+fetched at the pinned tag, with a manifest per project and a JSON result per
+run. Done here: `QUALIFY_REQUIRE_LIVE` makes what a jail test would skip fail it.
+
 Also close here the paths with no live coverage: the default `(self)` publish,
 the address fix after a failed teardown, and `login` refusing a token realm
 that is not https, which needs an https registry.
@@ -102,8 +106,8 @@ than presume that failure detection stopped the old process.
 
 ## P1.1 — Build-stage dependency planning
 
-Build only stages needed by the selected target. Today an unrelated earlier
-stage containing `RUN false` can fail a later independent target.
+Build only stages needed by the selected target. Done on main: an unrelated
+earlier stage containing `RUN false` no longer fails a later independent target.
 
 Deliverables:
 

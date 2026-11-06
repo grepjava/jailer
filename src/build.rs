@@ -12,7 +12,7 @@ use clap::ValueEnum;
 use crate::check::{CheckReport, check_containerfile, check_image};
 use crate::containerfile::{
     self, Containerfile, CopySpec, IgnoreMatcher, Instruction, RunMount, RunOptions, Sharing,
-    expand_vars, expand_word, glob_match,
+    Stage, expand_vars, expand_word, glob_match,
 };
 use crate::layer::{self, TreeState};
 use crate::oci::{self, Descriptor, History, ImageConfig};
@@ -79,6 +79,7 @@ pub struct BuildResult {
 }
 
 struct BuiltStage {
+    index: usize,
     name: Option<String>,
     root: PathBuf,
     /// With a ZFS store, the dataset mounted on `root`, which later stages
@@ -146,6 +147,7 @@ pub async fn build(
     for w in &cf.warnings {
         eprintln!("warning: {w}");
     }
+    let target = target_stage(&cf, opts.target.as_deref())?;
     let mut report = check_containerfile(&cf, opts.target.as_deref());
 
     if opts.backend == BuildBackend::Buildah {
@@ -205,6 +207,16 @@ pub async fn build(
     } else {
         crate::cache::Imported::read(store.client(), &opts.cache_from).await
     };
+    let needed = needed_stages(
+        &cf.stages[..=target],
+        &from_vars,
+        async |stage: &Stage, base: &str| {
+            check_platform(stage, &from_vars, &platform)?;
+            let image = pinned_base(store, &pin, opts, base).await?;
+            Ok(image.config.config.on_build)
+        },
+    )
+    .await?;
     let used = std::sync::Mutex::new(Vec::new());
     let env = BuildEnv {
         store,
@@ -248,18 +260,9 @@ pub async fn build(
         cleanup_guard.parent = Some(mine.clone());
     }
 
-    for stage_def in &cf.stages {
+    for (stage_def, _) in cf.stages.iter().zip(&needed).filter(|(_, n)| **n) {
         let base_ref = expand_word(&stage_def.base, &from_vars);
-        if let Some(p) = &stage_def.platform {
-            let p = expand_word(p, &from_vars);
-            let mut parts = p.split('/');
-            if parts.next() != Some("freebsd") || parts.next() != Some(oci::arch()) {
-                return Err(Error::Build(format!(
-                    "line {}: FROM --platform={p}: jailer builds for {platform}, this host's platform; build {p} images on such a host and combine them with `jailer manifest push`",
-                    stage_def.line
-                )));
-            }
-        }
+        check_platform(stage_def, &from_vars, &platform)?;
         let stage_root = build_tmp.path().join(format!("stage-{}", stage_def.index));
         std::fs::create_dir_all(&stage_root)?;
         let dataset = stage_datasets
@@ -275,6 +278,7 @@ pub async fn build(
                 store.sys().zfs_create(ds, &[("mountpoint", &mountpoint)])?;
             }
             BuiltStage {
+                index: stage_def.index,
                 name: stage_def.name.clone(),
                 root: stage_root,
                 dataset,
@@ -304,6 +308,7 @@ pub async fn build(
                 _ => layer::copy_tree(&prev.root, &stage_root)?,
             }
             BuiltStage {
+                index: stage_def.index,
                 name: stage_def.name.clone(),
                 root: stage_root,
                 dataset,
@@ -317,24 +322,7 @@ pub async fn build(
             }
         } else {
             println!("Step 0/{}: FROM {base_ref}", stage_def.instructions.len());
-            let base_img = match store.pin_image(&pin, &base_ref).await? {
-                Some(img) => img,
-                None => {
-                    println!("Pulling base image {base_ref}...");
-                    store
-                        .pull(
-                            &base_ref,
-                            pull_creds(&opts.creds, &base_ref)?.as_ref(),
-                            "root",
-                        )
-                        .await?;
-                    store.pin_image(&pin, &base_ref).await?.ok_or_else(|| {
-                        Error::Build(format!(
-                            "base image {base_ref} was removed during the build"
-                        ))
-                    })?
-                }
-            };
+            let base_img = pinned_base(store, &pin, opts, &base_ref).await?;
             store.prepare_rootfs(&base_img, &stage_root, dataset.as_deref())?;
             let mut cfg = base_img.config.clone();
             if cfg.os.is_empty() {
@@ -344,6 +332,7 @@ pub async fn build(
                 cfg.architecture = oci::arch().to_owned();
             }
             BuiltStage {
+                index: stage_def.index,
                 name: stage_def.name.clone(),
                 root: stage_root,
                 dataset,
@@ -379,25 +368,8 @@ pub async fn build(
             execute_instruction(env, &completed_stages, &mut built, &mut vars, sp, step_no).await?;
         }
 
-        let reached_target = opts
-            .target
-            .as_ref()
-            .is_some_and(|t| built.name.as_deref() == Some(t.as_str()));
         built.vars = vars;
         completed_stages.push(built);
-        if reached_target {
-            break;
-        }
-    }
-
-    if let Some(target_name) = &opts.target
-        && !completed_stages
-            .iter()
-            .any(|s| s.name.as_deref() == Some(target_name.as_str()))
-    {
-        return Err(Error::Build(format!(
-            "target stage {target_name:?} not found in Containerfile"
-        )));
     }
 
     let final_stage = completed_stages
@@ -570,13 +542,138 @@ impl Drop for TempTree {
     }
 }
 
-fn find_stage<'a>(stages: &'a [BuiltStage], name_or_idx: &str) -> Option<&'a BuiltStage> {
-    if let Ok(idx) = name_or_idx.parse::<usize>() {
-        return stages.get(idx);
+/// Whether `reference`, a stage's index or its name, is this stage.
+fn names_stage(reference: &str, index: usize, name: Option<&str>) -> bool {
+    match reference.parse::<usize>() {
+        Ok(i) => i == index,
+        Err(_) => name == Some(reference),
     }
+}
+
+fn find_stage<'a>(stages: &'a [BuiltStage], name_or_idx: &str) -> Option<&'a BuiltStage> {
     stages
         .iter()
-        .find(|s| s.name.as_deref() == Some(name_or_idx))
+        .find(|s| names_stage(name_or_idx, s.index, s.name.as_deref()))
+}
+
+/// The index of the stage `target` names, or of the last.
+fn target_stage(cf: &Containerfile, target: Option<&str>) -> Result<usize, Error> {
+    match target {
+        Some(name) => cf
+            .stages
+            .iter()
+            .position(|s| s.name.as_deref() == Some(name))
+            .ok_or_else(|| {
+                Error::Build(format!("target stage {name:?} not found in Containerfile"))
+            }),
+        None => cf
+            .stages
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| Error::Build("no stage built".to_owned())),
+    }
+}
+
+/// Which of `stages` the last of them needs, itself included: those it is
+/// built on or takes files from, by `FROM`, `COPY --from`, `--mount=from` or
+/// the `ONBUILD` triggers it runs, and so on from those. A stage can name
+/// only those before it, so one walk back finds them all. `image_triggers`
+/// gives the triggers of the image a stage is built on. A source with a
+/// variable in it is known only when its step runs, so it needs all the
+/// stages before it.
+async fn needed_stages(
+    stages: &[Stage],
+    from_vars: &BTreeMap<String, String>,
+    mut image_triggers: impl AsyncFnMut(&Stage, &str) -> Result<Vec<String>, Error>,
+) -> Result<Vec<bool>, Error> {
+    let mut needed = vec![false; stages.len()];
+    if let Some(last) = needed.last_mut() {
+        *last = true;
+    }
+    for (i, stage) in stages.iter().enumerate().rev() {
+        if !needed[i] {
+            continue;
+        }
+        let earlier = &stages[..i];
+        let find = |r: &str| {
+            earlier
+                .iter()
+                .position(|s| names_stage(r, s.index, s.name.as_deref()))
+        };
+        let base = expand_word(&stage.base, from_vars);
+        let triggers = if base.eq_ignore_ascii_case("scratch") {
+            Vec::new()
+        } else if let Some(b) = find(&base) {
+            needed[b] = true;
+            earlier[b]
+                .instructions
+                .iter()
+                .filter_map(|sp| match &sp.instruction {
+                    Instruction::Onbuild(trigger) => Some(trigger.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            image_triggers(stage, &base).await?
+        };
+        let triggers = triggers
+            .iter()
+            .map(|t| containerfile::parse_trigger(t, stage.line))
+            .collect::<Result<Vec<_>, _>>()?;
+        let steps = stage.instructions.iter().chain(&triggers);
+        for source in steps.flat_map(|sp| sp.instruction.sources()) {
+            if source.contains('$') {
+                needed[..i].fill(true);
+            } else if let Some(j) = find(source) {
+                needed[j] = true;
+            }
+        }
+    }
+    Ok(needed)
+}
+
+/// Refuses a stage's `FROM --platform` unless it is this host's.
+fn check_platform(
+    stage: &Stage,
+    from_vars: &BTreeMap<String, String>,
+    platform: &str,
+) -> Result<(), Error> {
+    if let Some(p) = &stage.platform {
+        let p = expand_word(p, from_vars);
+        let mut parts = p.split('/');
+        if parts.next() != Some("freebsd") || parts.next() != Some(oci::arch()) {
+            return Err(Error::Build(format!(
+                "line {}: FROM --platform={p}: jailer builds for {platform}, this host's platform",
+                stage.line
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The image `base_ref`, pulled if it is not here, held by `pin`.
+async fn pinned_base(
+    store: &Store,
+    pin: &Pin,
+    opts: &BuildOptions,
+    base_ref: &str,
+) -> Result<Image, Error> {
+    if let Some(image) = store.pin_image(pin, base_ref).await? {
+        return Ok(image);
+    }
+    println!("Pulling base image {base_ref}...");
+    store
+        .pull(
+            base_ref,
+            pull_creds(&opts.creds, base_ref)?.as_ref(),
+            "root",
+        )
+        .await?;
+    store.pin_image(pin, base_ref).await?.ok_or_else(|| {
+        Error::Build(format!(
+            "base image {base_ref} was removed during the build"
+        ))
+    })
 }
 
 async fn execute_instruction(
@@ -2729,6 +2826,85 @@ async fn build_with_buildah(
 
 #[cfg(test)]
 mod tests {
+    /// The stages built for `text`: `--target target`, with an image's
+    /// `ONBUILD` triggers from `triggers`.
+    async fn plan(text: &str, target: Option<&str>, triggers: &[&str]) -> Vec<usize> {
+        let cf = super::Containerfile::parse(text).unwrap();
+        let last = super::target_stage(&cf, target).unwrap();
+        let vars = std::collections::BTreeMap::from([("V".to_owned(), "b".to_owned())]);
+        let needed = super::needed_stages(&cf.stages[..=last], &vars, async |_, _: &str| {
+            Ok(triggers.iter().map(|t| (*t).to_owned()).collect())
+        })
+        .await
+        .unwrap();
+        (0..needed.len()).filter(|i| needed[*i]).collect()
+    }
+
+    #[tokio::test]
+    async fn only_the_stages_a_target_needs_are_built() {
+        let three = "FROM x AS a\nFROM x AS b\nFROM x AS c\n";
+        assert_eq!(plan(three, None, &[]).await, [2]);
+        assert_eq!(plan(three, Some("a"), &[]).await, [0]);
+        assert_eq!(plan(three, Some("b"), &[]).await, [1]);
+
+        let on = |last: &str| format!("FROM x AS a\nFROM x AS b\nFROM x AS c\n{last}\n");
+        // By `FROM`, a name or an index, and a global ARG in it.
+        let from = "FROM x AS a\nFROM a AS b\nFROM x AS c\nFROM b\n";
+        assert_eq!(plan(from, None, &[]).await, [0, 1, 3]);
+        let from = "FROM x AS a\nFROM x AS b\nFROM $V\n";
+        assert_eq!(plan(from, None, &[]).await, [1, 2]);
+        // By `COPY --from`, a name or an index, and through what it needs.
+        assert_eq!(
+            plan(&on("FROM x\nCOPY --from=b /f /f"), None, &[]).await,
+            [1, 3]
+        );
+        assert_eq!(
+            plan(&on("FROM x\nCOPY --from=0 /f /f"), None, &[]).await,
+            [0, 3]
+        );
+        let chain = "FROM x AS a\nFROM x AS b\nCOPY --from=a /f /f\nFROM x\nCOPY --from=b /f /f\n";
+        assert_eq!(plan(chain, None, &[]).await, [0, 1, 2]);
+        // By a mount.
+        assert_eq!(
+            plan(
+                &on("FROM x\nRUN --mount=type=bind,from=a,target=/m true"),
+                None,
+                &[]
+            )
+            .await,
+            [0, 3]
+        );
+        // An image is no stage, and a later stage is not an earlier one.
+        assert_eq!(
+            plan(&on("FROM x\nCOPY --from=y /f /f"), None, &[]).await,
+            [3]
+        );
+        let later = "FROM x AS a\nCOPY --from=b /f /f\nFROM x AS b\n";
+        assert_eq!(plan(later, Some("a"), &[]).await, [0]);
+    }
+
+    #[tokio::test]
+    async fn stages_named_by_triggers_or_variables_are_kept() {
+        // The triggers of a stage it is built on, not those it declares.
+        let local = "FROM x AS a\nFROM x AS b\nONBUILD COPY --from=a /f /f\nFROM b\n";
+        assert_eq!(plan(local, None, &[]).await, [0, 1, 2]);
+        let own = "FROM x AS a\nFROM x\nONBUILD COPY --from=a /f /f\n";
+        assert_eq!(plan(own, None, &[]).await, [1]);
+        // Those of an image.
+        let image = "FROM x AS a\nFROM x AS b\nFROM x\n";
+        assert_eq!(plan(image, None, &["COPY --from=b /f /f"]).await, [1, 2]);
+        // Known only when the step runs: all before it stay.
+        let var = "FROM x AS a\nFROM x AS b\nFROM x\nARG S=a\nCOPY --from=$S /f /f\n";
+        assert_eq!(plan(var, None, &[]).await, [0, 1, 2]);
+    }
+
+    #[test]
+    fn an_unknown_target_is_refused_by_name() {
+        let cf = super::Containerfile::parse("FROM x AS a\n").unwrap();
+        let err = super::target_stage(&cf, Some("typo")).unwrap_err();
+        assert!(err.to_string().contains("\"typo\" not found"), "{err}");
+    }
+
     use super::pull_creds;
     use legion_api::clock::format as rfc3339;
 
