@@ -1,5 +1,5 @@
 # jailer's manifest for Legion's scripts/qualify. See that script for the
-# format. From jailer's root, with the script from the Legion tag jailer pins:
+# format. From jailer's root, with the script from the Legion revision jailer pins:
 #
 #   qualify --manifest scripts/jailer.qualify --profile shared --pool POOL
 project jailer
@@ -33,3 +33,4 @@ test . freebsd_jail_test a_failing_stage_nothing_needs_does_not_run host shared 
 test . freebsd_jail_test memory_limits_each_process_not_the_container host shared 300
 test . freebsd_jail_test an_sbom_lists_what_pkg_knows_of_an_image host shared 300
 test . freebsd_jail_test stages_at_once_finish_sooner_share_caches_and_fail_together host shared 300
+test . freebsd_jail_test a_container_left_without_its_root_is_listed_and_removed host shared 300

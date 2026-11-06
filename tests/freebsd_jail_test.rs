@@ -9,19 +9,12 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Whether a qualification run asked for: there, what a test would skip
-/// fails it instead, so that a pass means it ran.
-fn must_run() -> bool {
-    std::env::var_os("QUALIFY_REQUIRE_LIVE").is_some()
-}
-
 /// Whether `test` can run, which takes root.
 fn live(test: &str) -> bool {
     if is_root() {
         return true;
     }
-    assert!(!must_run(), "{test} requires root");
-    println!("QUALIFY-SKIP: {test} requires root");
+    legion_sys::live::skip(&format!("{test} requires root"));
     false
 }
 
@@ -545,7 +538,8 @@ CMD ["default-arg"]
             assert!(!rules.contains("18080"), "{anchor}: {rules}");
         }
     } else {
-        assert!(!must_run(), "pf.conf does not call jailer's anchors");
+        // Tested still: the refusal below is what such a host gets.
+        legion_sys::live::skip("pf.conf does not call jailer's anchors");
         let out = try_cmd(&[&["run", "--vnet"][..], &shell, &["true"]].concat());
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1877,4 +1871,92 @@ fn stages_at_once_finish_sooner_share_caches_and_fail_together() {
         !String::from_utf8_lossy(&jails.stdout).contains(state.to_str().unwrap()),
         "jails stay"
     );
+}
+
+/// What a process killed during a create leaves: a record and no root.
+/// `ps -a` must show it and `rm` must clear it, or its name stays taken.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_container_left_without_its_root_is_listed_and_removed() {
+    if !live("a_container_left_without_its_root_is_listed_and_removed") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let out = jailer(args);
+        assert!(
+            out.status.success(),
+            "jailer {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    ok(&["build", "-t", "i:1", project.to_str().unwrap()]);
+    ok(&[
+        "run",
+        "--network",
+        "none",
+        "--name",
+        "left",
+        "--entrypoint",
+        "/bin/sh",
+        "localhost/i:1",
+        "-c",
+        "true",
+    ]);
+
+    // Down to what the kill leaves.
+    let containers = state.join("containers");
+    let dirs: Vec<_> = std::fs::read_dir(&containers)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("root").is_dir())
+        .collect();
+    // Its pod has none of its own.
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let dir = &dirs[0];
+    let root = dir.join("root");
+    assert!(
+        Command::new("chflags")
+            .args(["-R", "0"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    for file in ["run.json", "exit.json"] {
+        let _ = std::fs::remove_file(dir.join(file));
+    }
+
+    let ps = ok(&["ps", "-a"]);
+    let line = ps
+        .lines()
+        .find(|l| l.contains(" left "))
+        .unwrap_or_default();
+    assert!(line.contains("created"), "{ps}");
+    assert_eq!(ok(&["rm", "left"]).trim(), "left");
+    assert!(!ok(&["ps", "-a"]).contains(" left "));
+    assert!(!dir.exists(), "{}", dir.display());
+    let rest: Vec<_> = std::fs::read_dir(&containers)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("record.json").exists())
+        .collect();
+    assert!(rest.is_empty(), "its pod stays: {rest:?}");
 }

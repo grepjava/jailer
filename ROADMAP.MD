@@ -73,7 +73,7 @@ should serve both. Until they exist, qualification runs on the shared test
 host. That gives evidence, but does not meet "disposable", and arm64 is a VM.
 
 Harness, agreed with Legion: one runner, `scripts/qualify` in Legion's repository,
-fetched at the pinned tag, with a manifest per project and a JSON result per
+fetched at the pinned revision, with a manifest per project and a JSON result per
 run. Done here: `QUALIFY_REQUIRE_LIVE` makes what a jail test would skip fail
 it, and `scripts/jailer.qualify` lists the jail tests, which `cargo test` now
 reports as ignored.
