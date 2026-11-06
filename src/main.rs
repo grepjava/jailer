@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use jailer::auth::{check_credentials, resolve_credentials, save_credentials};
+use jailer::auth::{resolve_credentials, save_credentials};
 use jailer::build::{BuildBackend, BuildOptions};
 use jailer::check::{CheckReport, Severity, check_containerfile};
 use jailer::containerfile::Containerfile;
@@ -1286,7 +1286,11 @@ async fn run() -> Result<()> {
                 .plain_http
                 .iter()
                 .any(|h| *h == *registry || *h == jailer::registry_of(registry));
-            check_credentials(registry, &creds, plain).await?;
+            let mut client = Client::new()?;
+            if plain {
+                client = client.plain_http(&jailer::registry_of(registry));
+            }
+            client.check_login(registry, &creds).await?;
             let path = save_credentials(registry, &creds, authfile.as_deref())?;
             println!(
                 "Login succeeded for {registry} (saved to {})",

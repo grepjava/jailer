@@ -33,47 +33,21 @@ impl Compression {
 
     /// Compresses the tar `tar` into `out`, returning both digests.
     pub fn compress(self, tar: &Path, out: &Path) -> Result<LayerArtifact, Error> {
-        if self == Compression::Gzip {
-            return Ok(compress(tar, out)?);
-        }
-        let mut input = std::io::BufReader::new(std::fs::File::open(tar)?);
-        let mut enc = zstd::stream::Encoder::new(
-            std::io::BufWriter::new(std::fs::File::create(out)?),
-            zstd::DEFAULT_COMPRESSION_LEVEL,
-        )?;
-        let mut diff = Sha256::new();
-        let mut buf = vec![0u8; 1 << 16];
-        loop {
-            let n = std::io::Read::read(&mut input, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            diff.update(&buf[..n]);
-            enc.write_all(&buf[..n])?;
-        }
-        enc.finish()?.flush()?;
-        let mut blob = Sha256::new();
-        let mut size = 0u64;
-        let mut input = std::fs::File::open(out)?;
-        loop {
-            let n = std::io::Read::read(&mut input, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            blob.update(&buf[..n]);
-            size += n as u64;
-        }
-        Ok(LayerArtifact {
-            diff_id: format!("sha256:{:x}", diff.finalize()),
-            blob_digest: format!("sha256:{:x}", blob.finalize()),
-            blob_size: size,
+        Ok(match self {
+            Compression::Gzip => compress(tar, out)?,
+            Compression::Zstd => compress_with(
+                tar,
+                out,
+                |file| zstd::stream::Encoder::new(file, zstd::DEFAULT_COMPRESSION_LEVEL),
+                |enc| enc.finish()?.flush(),
+            )?,
         })
     }
 }
 
 pub use legion_image::layer::{
-    LayerArtifact, Whiteout, apply, apply_whiteouts, compress, copy_tree, decompress, extract,
-    remove_tree, whiteouts,
+    LayerArtifact, Whiteout, apply, apply_whiteouts, compress, compress_with, copy_tree,
+    decompress, extract, remove_tree, set_flags, whiteouts,
 };
 
 const WHITEOUT: &str = ".wh.";
@@ -126,24 +100,6 @@ pub fn file_flags(meta: &std::fs::Metadata) -> u32 {
 #[cfg(not(target_os = "freebsd"))]
 pub fn file_flags(_: &std::fs::Metadata) -> u32 {
     0
-}
-
-/// Sets `path`'s file flags (not following a link).
-#[cfg(target_os = "freebsd")]
-pub fn set_flags(path: &Path, flags: u32) -> Result<(), Error> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::Build(format!("a NUL in {}", path.display())))?;
-    // SAFETY: `c` is a valid NUL-terminated path.
-    if unsafe { libc::lchflags(c.as_ptr(), flags.into()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "freebsd"))]
-pub fn set_flags(_: &Path, _: u32) -> Result<(), Error> {
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

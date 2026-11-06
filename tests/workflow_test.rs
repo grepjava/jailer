@@ -1159,10 +1159,13 @@ async fn login_checks_credentials_with_the_registry() {
         username: "me".to_owned(),
         password: password.to_owned(),
     };
-    jailer::auth::check_credentials(&registry, &creds("secret"), true)
+    let client = Client::new().unwrap().plain_http(&registry);
+    client
+        .check_login(&registry, &creds("secret"))
         .await
         .unwrap();
-    let err = jailer::auth::check_credentials(&registry, &creds("bad"), true)
+    let err = client
+        .check_login(&registry, &creds("bad"))
         .await
         .unwrap_err()
         .to_string();

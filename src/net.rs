@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use legion_net::PodNetwork;
+pub use legion_net::lb::Proto;
 use legion_sys::{Ipv4Net, Sys};
 
 use crate::Error;
@@ -50,21 +51,6 @@ pub fn network() -> PodNetwork {
 /// The bridge's address, every pod's default route.
 pub fn gateway() -> Ipv4Addr {
     network().gateway()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Proto {
-    Tcp,
-    Udp,
-}
-
-impl Proto {
-    fn as_str(self) -> &'static str {
-        match self {
-            Proto::Tcp => "tcp",
-            Proto::Udp => "udp",
-        }
-    }
 }
 
 /// A published port: `-p [IP:]HOST:CONTAINER[/tcp|udp]`.
@@ -139,18 +125,7 @@ impl Port {
 
 /// The hooks the host's main pf ruleset lacks.
 pub fn missing_hooks(main_rules: &str) -> Vec<&'static str> {
-    let called = |kind: &str| {
-        main_rules.lines().any(|l| {
-            let l = l.trim();
-            l.starts_with(kind) && l.contains("\"jailer/*\"")
-        })
-    };
-    ["nat-anchor", "rdr-anchor", "anchor"]
-        .into_iter()
-        .zip(HOOKS)
-        .filter(|(kind, _)| !called(kind))
-        .map(|(_, hook)| hook)
-        .collect()
+    legion_net::lb::missing_hooks_of(main_rules, "jailer/*", HOOKS)
 }
 
 /// The interface that `route -n get` says an address in jailer's subnet

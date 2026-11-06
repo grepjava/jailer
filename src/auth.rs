@@ -30,23 +30,19 @@ struct AuthEntry {
 }
 
 impl AuthEntry {
+    /// As `legion_api::login::decode` reads it: `auth` wins. An entry naming
+    /// only a user, or only a password, has the other empty; one with
+    /// neither form, as with an identity token, is no login.
     fn into_credentials(self) -> Option<Credentials> {
-        if !self.username.is_empty() || !self.password.is_empty() {
-            return Some(Credentials {
-                username: self.username,
-                password: self.password,
-            });
-        }
-        if !self.auth.is_empty() {
-            let decoded = STANDARD.decode(self.auth.trim()).ok()?;
-            let text = String::from_utf8(decoded).ok()?;
-            let (u, p) = text.split_once(':')?;
-            return Some(Credentials {
-                username: u.to_owned(),
-                password: p.to_owned(),
-            });
-        }
-        None
+        let auth = Some(self.auth.as_str()).filter(|a| !a.is_empty());
+        let named = !self.username.is_empty() || !self.password.is_empty();
+        let (username, password) = legion_api::login::decode(
+            auth,
+            named.then_some(self.username.as_str()),
+            named.then_some(self.password.as_str()),
+        )
+        .ok()?;
+        Some(Credentials { username, password })
     }
 }
 
@@ -162,117 +158,6 @@ pub fn save_credentials(
     Ok(path)
 }
 
-/// Checks `creds` with `registry` as `docker login` does: asks for the
-/// registry's API root, and when that wants a login, gives the credentials
-/// to it (Basic) or to the token service it names (Bearer). A registry that
-/// asks for no login takes any credentials.
-pub async fn check_credentials(
-    registry: &str,
-    creds: &Credentials,
-    plain_http: bool,
-) -> Result<(), Error> {
-    let registry = registry_of(registry);
-    // Docker Hub's API is not at `docker.io`.
-    let host = if registry == "docker.io" {
-        "registry-1.docker.io"
-    } else {
-        registry.as_str()
-    };
-    let scheme = if plain_http { "http" } else { "https" };
-    let fail = |e: String| Error::Registry(format!("{registry}: {e}"));
-    let refused = || {
-        Error::Registry(format!(
-            "{registry}: login refused for {}: wrong username, password or token",
-            creds.username
-        ))
-    };
-    let http = crate::http_client()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| fail(e.to_string()))?;
-    let root = format!("{scheme}://{host}/v2/");
-    let resp = http
-        .get(&root)
-        .send()
-        .await
-        .map_err(|e| fail(e.to_string()))?;
-    if resp.status().is_success() {
-        return Ok(());
-    }
-    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err(fail(format!("HTTP {} from {root}", resp.status())));
-    }
-    let challenge = resp
-        .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    let (kind, params) = challenge.split_once(' ').unwrap_or((&challenge, ""));
-    let req = if kind.eq_ignore_ascii_case("basic") {
-        http.get(&root)
-    } else if kind.eq_ignore_ascii_case("bearer") {
-        let params = parse_challenge(params);
-        let realm = params
-            .get("realm")
-            .ok_or_else(|| fail(format!("auth challenge without realm: {challenge}")))?;
-        if !realm_allowed(realm, plain_http) {
-            return Err(fail(format!(
-                "the registry sends logins to {realm}, which is not https"
-            )));
-        }
-        let mut query = vec![("account", creds.username.as_str())];
-        if let Some(service) = params.get("service") {
-            query.push(("service", service));
-        }
-        http.get(realm).query(&query)
-    } else {
-        return Err(fail(format!("unknown auth challenge: {challenge}")));
-    };
-    let resp = req
-        .basic_auth(&creds.username, Some(&creds.password))
-        .send()
-        .await
-        .map_err(|e| fail(e.to_string()))?;
-    match resp.status() {
-        s if s.is_success() => Ok(()),
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(refused()),
-        s => Err(fail(format!("HTTP {s} logging in"))),
-    }
-}
-
-/// Whether a login may go to `realm`: in the clear only to a registry spoken
-/// to in the clear, as Legion's client has it.
-fn realm_allowed(realm: &str, plain_http: bool) -> bool {
-    realm.starts_with("https://") || (plain_http && realm.starts_with("http://"))
-}
-
-/// `realm="...",service="..."`, the parameters of an auth challenge.
-fn parse_challenge(s: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let mut rest = s.trim();
-    while let Some((key, after)) = rest.split_once('=') {
-        let key = key
-            .trim()
-            .trim_start_matches(',')
-            .trim()
-            .to_ascii_lowercase();
-        let (value, next) = match after.strip_prefix('"') {
-            Some(quoted) => match quoted.find('"') {
-                Some(end) => (&quoted[..end], &quoted[end + 1..]),
-                None => (quoted, ""),
-            },
-            None => match after.find(',') {
-                Some(end) => (&after[..end], &after[end..]),
-                None => (after, ""),
-            },
-        };
-        out.insert(key, value.to_owned());
-        rest = next.trim_start_matches(',').trim();
-    }
-    out
-}
-
 fn default_auth_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(p) = std::env::var("REGISTRY_AUTH_FILE") {
@@ -301,29 +186,33 @@ fn default_write_auth_path() -> Result<PathBuf, Error> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn logins_go_in_the_clear_only_to_a_registry_in_the_clear() {
-        use super::realm_allowed;
-        assert!(realm_allowed("https://auth.example/token", false));
-        assert!(realm_allowed("https://auth.example/token", true));
-        assert!(realm_allowed("http://localhost:5000/token", true));
-        assert!(!realm_allowed("http://auth.example/token", false));
-        assert!(!realm_allowed("ftp://auth.example/token", true));
-        assert!(!realm_allowed("auth.example/token", true));
-    }
-
     use super::*;
 
     #[test]
-    fn challenges_give_realm_and_service() {
-        let p = parse_challenge(
-            r#"realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull""#,
+    fn auth_wins_and_an_entry_needs_a_login() {
+        let read = |entry: &str| {
+            from_json(
+                &format!(r#"{{"auths": {{"ghcr.io": {entry}}}}}"#),
+                "ghcr.io",
+            )
+            .unwrap()
+            .map(|c| (c.username, c.password))
+        };
+        let pair = |u: &str, p: &str| Some((u.to_owned(), p.to_owned()));
+        // Y2k6c2VjcmV0 is ci:secret.
+        assert_eq!(
+            read(r#"{"auth": "Y2k6c2VjcmV0", "username": "me", "password": "tok"}"#),
+            pair("ci", "secret")
         );
-        assert_eq!(p["realm"], "https://ghcr.io/token");
-        assert_eq!(p["service"], "ghcr.io");
-        let p = parse_challenge(r#"realm=https://r/t, service="a,b""#);
-        assert_eq!(p["realm"], "https://r/t");
-        assert_eq!(p["service"], "a,b");
+        // A bad `auth` is not passed over for the rest of the entry.
+        assert_eq!(
+            read(r#"{"auth": "%%%", "username": "me", "password": "tok"}"#),
+            None
+        );
+        assert_eq!(read(r#"{"username": "me"}"#), pair("me", ""));
+        assert_eq!(read(r#"{"password": "tok"}"#), pair("", "tok"));
+        assert_eq!(read(r#"{"auth": "", "identitytoken": "x"}"#), None);
+        assert_eq!(read("{}"), None);
     }
 
     #[test]

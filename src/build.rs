@@ -2261,53 +2261,13 @@ pub(crate) fn resolve_in_jail(
     path: &str,
     follow_last: bool,
 ) -> Result<PathBuf, Error> {
-    let rel = path;
-    // What is left to walk, last first.
-    let mut todo: Vec<std::ffi::OsString> = Path::new(rel)
-        .components()
-        .rev()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_owned()),
-            Component::ParentDir => Some("..".into()),
-            _ => None,
-        })
-        .collect();
-    let mut done = root.to_path_buf();
-    let mut depth = 0usize;
-    let mut links = 0;
-    while let Some(name) = todo.pop() {
-        if name == ".." {
-            if depth > 0 {
-                done.pop();
-                depth -= 1;
-            }
-            continue;
-        }
-        let next = done.join(&name);
-        let is_link = std::fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink());
-        if is_link && (follow_last || !todo.is_empty()) {
-            links += 1;
-            if links > 40 {
-                return Err(Error::Build(format!("path {rel:?}: too many links")));
-            }
-            let link = std::fs::read_link(&next)?;
-            if link.has_root() {
-                done = root.to_path_buf();
-                depth = 0;
-            }
-            for c in link.components().rev() {
-                match c {
-                    Component::Normal(s) => todo.push(s.to_owned()),
-                    Component::ParentDir => todo.push("..".into()),
-                    _ => {}
-                }
-            }
+    legion_jail::inroot::resolve(root, path, follow_last).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            Error::Build(format!("path {path:?}: too many links"))
         } else {
-            done = next;
-            depth += 1;
+            e.into()
         }
-    }
-    Ok(done)
+    })
 }
 
 /// Unpacks a tar archive `ADD` names into `dst`, with what a layer keeps
@@ -2569,7 +2529,7 @@ impl Copier {
     /// Sets the flags kept: files before the directories holding them.
     fn finish(&self) -> Result<(), Error> {
         for (path, flags) in self.flags.borrow().iter() {
-            layer::set_flags(path, *flags)?;
+            layer::set_flags(path, (*flags).into())?;
         }
         Ok(())
     }
