@@ -871,9 +871,6 @@ async fn execute_instruction(
                         .chain(id.iter().map(|b| format!("{b:02x}")))
                         .collect();
                     let sys = &**store.sys();
-                    // Legion's steps take no links in their working
-                    // directory, as `/home` (`usr/home`) is in FreeBSD's.
-                    let work_dir = without_links(&stage.root, &stage.config.config.working_dir)?;
                     // Taken away again however the step ends.
                     let limited = crate::runtime::limited(sys, &name, &opts.limits)?;
                     let code = runtime
@@ -883,7 +880,7 @@ async fn execute_instruction(
                             argv: &argv,
                             env: &run_env,
                             user: &stage.config.config.user,
-                            work_dir: &work_dir,
+                            work_dir: &stage.config.config.working_dir,
                             mounts: &mounts.mounts,
                             network: if run_opts.no_network {
                                 StepNetwork::None
@@ -2313,17 +2310,6 @@ pub(crate) fn resolve_in_jail(
     Ok(done)
 }
 
-/// `path`, a path in the root filesystem at `root`, as the same path with
-/// no links in it; `""` stays `""`.
-fn without_links(root: &Path, path: &str) -> Result<String, Error> {
-    if path.is_empty() {
-        return Ok(String::new());
-    }
-    let full = resolve_in_jail(root, path, true)?;
-    let rel = full.strip_prefix(root).unwrap_or(&full);
-    Ok(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
-}
-
 /// Unpacks a tar archive `ADD` names into `dst`, with what a layer keeps
 /// (numeric owners, modes, file flags) but every name in it: a `.wh.` file
 /// is an ordinary one here, not a whiteout.
@@ -2914,12 +2900,6 @@ mod tests {
         let jail = |p: &str| super::resolve_in_jail(&root, p, true).unwrap();
         assert_eq!(jail("/usr/home/../../etc"), root.join("etc"));
         assert_eq!(jail("../../x"), root.join("x"));
-        // A step's working directory, as Legion takes it.
-        assert_eq!(
-            super::without_links(&root, "/home/app").unwrap(),
-            "/usr/home/app"
-        );
-        assert_eq!(super::without_links(&root, "").unwrap(), "");
     }
 
     #[cfg(unix)]
