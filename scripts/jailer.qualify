@@ -5,6 +5,11 @@
 project jailer
 scan tests/*.rs
 
+# What a result must name beyond the host: the Legion it tested, and storage,
+# which each test sets for itself.
+record legion grep -o 'legion?rev=[0-9a-f]*' Cargo.lock | sort -u | cut -d= -f2 | grep .
+record storage echo "ZFS and plain directories, by test"
+
 # What jailer's tests make, in the before/after snapshots. The bridge jailer0
 # and the anchor jailer/nat stay: every pod on a host shares them.
 own ^jail [^ ]+ /tmp/\.tmp
