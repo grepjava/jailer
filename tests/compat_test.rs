@@ -77,7 +77,7 @@ fn files(root: &Path) -> BTreeMap<String, String> {
 }
 
 /// What the case gives: its config and files, or the build's error.
-async fn built(case: &Path, tmp: &Path) -> Result<Value, String> {
+async fn built(case: &Path, tmp: &Path, jobs: usize) -> Result<Value, String> {
     let sys = Arc::new(FakeSys::new());
     let store: Arc<Store> = Arc::new(
         jailer::store::open(
@@ -107,6 +107,7 @@ async fn built(case: &Path, tmp: &Path) -> Result<Value, String> {
         target: std::fs::read_to_string(case.join("target"))
             .ok()
             .map(|t| t.trim().to_owned()),
+        jobs,
         backend: BuildBackend::Native,
         creds: Default::default(),
         strict_lint: false,
@@ -280,7 +281,12 @@ async fn containerfiles_build_as_they_do_with_the_reference_builders() {
     for name in names {
         let tmp = tempfile::tempdir().unwrap();
         let case = compat().join("cases").join(&name);
-        made.insert(name, built(&case, tmp.path()).await);
+        let one = built(&case, tmp.path(), 1).await;
+        // Stages at once give what they give one at a time.
+        let tmp = tempfile::tempdir().unwrap();
+        let many = built(&case, tmp.path(), 4).await;
+        assert_eq!(one.as_ref().ok(), many.as_ref().ok(), "{name}");
+        made.insert(name, one);
     }
     let failures: Vec<String> = ["buildkit", "buildah"]
         .iter()

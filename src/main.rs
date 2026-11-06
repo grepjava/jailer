@@ -94,6 +94,10 @@ pub enum Commands {
         #[arg(long, value_name = "STAGE")]
         target: Option<String>,
 
+        /// Stages to build at once, of those that do not need each other
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        jobs: usize,
+
         /// Write a release record of this build (see docs/RELEASE-RECORD.md)
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
@@ -1093,6 +1097,7 @@ async fn run() -> Result<()> {
             cache_to,
             creds,
             authfile,
+            jobs,
             record,
             context,
         } => {
@@ -1145,6 +1150,7 @@ async fn run() -> Result<()> {
                 tag: tag.clone(),
                 build_args: parsed_args,
                 target: target.clone(),
+                jobs: *jobs,
                 backend: *backend,
                 creds: jailer::auth::CredsSource {
                     creds: creds.clone(),

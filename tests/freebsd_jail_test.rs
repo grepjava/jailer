@@ -510,9 +510,12 @@ CMD ["default-arg"]
             .args(["jailer_test_client", "sh", "-c", "echo hi | nc -N -l 9999"])
             .spawn()
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(
-            cmd(&[
+        // The listener may take its time on a busy host, and nc says nothing
+        // of a connection refused.
+        let mut got = String::new();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let out = try_cmd(&[
                 "run",
                 "--vnet",
                 "--entrypoint",
@@ -522,9 +525,13 @@ CMD ["default-arg"]
                 "5",
                 "10.99.0.2",
                 "9999",
-            ]),
-            "hi\n"
-        );
+            ]);
+            got = String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() {
+                break;
+            }
+        }
+        assert_eq!(got, "hi\n");
         listener.wait().unwrap();
         // Right after serving TCP: the jail may be dying still.
         cmd(&["rm", "-f", "web"]);
@@ -1792,5 +1799,82 @@ fn an_sbom_lists_what_pkg_knows_of_an_image() {
         packages[1]["versionInfo"]
             .as_str()
             .is_some_and(|v| !v.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stages_at_once_finish_sooner_share_caches_and_fail_together() {
+    if !live("stages_at_once_finish_sooner_share_caches_and_fail_together") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    let build = |file: &str, jobs: &str| {
+        std::fs::write(ctx.join("Containerfile"), file).unwrap();
+        let start = std::time::Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .args(["--no-zfs", "build", "--no-cache", "--jobs", jobs])
+            .arg(&ctx)
+            .output()
+            .unwrap();
+        (out, start.elapsed().as_secs_f64())
+    };
+    let ok = |(out, took): (std::process::Output, f64)| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        took
+    };
+
+    // Two stages of nothing but waiting, and a last one taking from both.
+    let waits = format!(
+        "FROM {image} AS a\nRUN sleep 6; : > /a\nFROM {image} AS b\nRUN sleep 6; : > /b\n\
+         FROM {image}\nCOPY --from=a /a /a\nCOPY --from=b /b /b\n"
+    );
+    ok(build(&format!("FROM {image}\n"), "1"));
+    let one = ok(build(&waits, "1"));
+    let two = ok(build(&waits, "2"));
+    println!("one at a time {one:.1}s, two at once {two:.1}s");
+    assert!(
+        two + 3.0 < one,
+        "one at a time {one:.1}s, two at once {two:.1}s"
+    );
+
+    // A locked cache: one stage holds it until the other has waited for it.
+    let locked = format!(
+        "FROM {image} AS a\nRUN --mount=type=cache,id=c,target=/c,sharing=locked sleep 3\n\
+         FROM {image} AS b\nRUN --mount=type=cache,id=c,target=/c,sharing=locked sleep 3\n\
+         FROM {image}\nCOPY --from=a /etc/passwd /a\nCOPY --from=b /etc/passwd /b\n"
+    );
+    ok(build(&locked, "2"));
+
+    // One fails: the other stops with it, and nothing stays.
+    let failing = format!(
+        "FROM {image} AS a\nRUN sleep 120\nFROM {image} AS b\nRUN false\n\
+         FROM {image}\nCOPY --from=a /etc/passwd /a\nCOPY --from=b /etc/passwd /b\n"
+    );
+    let (out, took) = build(&failing, "2");
+    assert!(!out.status.success());
+    assert!(
+        took < 60.0,
+        "the waiting stage was left running: {took:.0}s"
+    );
+    let state = tmp.path().join("state");
+    let mounts = Command::new("mount").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&mounts.stdout).contains(state.to_str().unwrap()),
+        "mounts stay"
+    );
+    let jails = Command::new("jls").arg("path").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&jails.stdout).contains(state.to_str().unwrap()),
+        "jails stay"
     );
 }

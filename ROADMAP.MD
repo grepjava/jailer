@@ -36,7 +36,7 @@ Do not treat these as features still needing implementation:
 
 | Area | Current boundary |
 |---|---|
-| Stage execution | Native builds execute only the stages the target needs, one at a time in file order. |
+| Stage execution | Native builds execute only the stages the target needs, one at a time, or independent ones at once with `--jobs`. |
 | Containerfile syntax | Broad support, tested against BuildKit and Buildah: see `docs/COMPATIBILITY.md`. |
 | Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. `jailer publish` coordinates native builds on several hosts; there is no emulation. |
 | Registry cache | OCI transport with a Jailer-specific cache configuration format; not an interchangeable BuildKit cache. |
@@ -311,7 +311,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
 | 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
 | 6. Supply chain and automation | P2.1 and P2.2 done. P2.3's host diagnostics wait on the shared crate | A shared diagnostics crate |
-| 7. Parallel stages | P3 | Phases 1 and 2 |
+| 7. Parallel stages | P3: `--jobs`, default 1, in waves of what is ready | Phases 1 and 2 |
 
 Use Build → Sign → Push → Deploy → Drain → Migrate → Recover as the shared
 engineering contract. Test each boundary while retaining clear ownership:

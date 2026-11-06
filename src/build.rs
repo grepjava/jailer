@@ -3,7 +3,7 @@
 //! diffing layers) or via `buildah` when `--backend buildah` is selected,
 //! followed by Legion compatibility verification.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,6 +37,8 @@ pub struct BuildOptions {
     pub tag: String,
     pub build_args: BTreeMap<String, String>,
     pub target: Option<String>,
+    /// Stages built at once, at most.
+    pub jobs: usize,
     pub backend: BuildBackend,
     /// Credentials, looked up for the registry of each image pulled.
     pub creds: crate::auth::CredsSource,
@@ -268,118 +270,50 @@ pub async fn build(
         cleanup_guard.parent = Some(mine.clone());
     }
 
-    for (stage_def, _) in cf.stages.iter().zip(&needed).filter(|(_, n)| **n) {
-        let base_ref = expand_word(&stage_def.base, &from_vars);
-        check_platform(stage_def, &from_vars, &platform)?;
-        let stage_root = build_tmp.path().join(format!("stage-{}", stage_def.index));
-        std::fs::create_dir_all(&stage_root)?;
-        let dataset = stage_datasets
-            .as_ref()
-            .map(|(_, mine)| format!("{mine}/stage-{}", stage_def.index));
-        cleanup_guard
-            .stages
-            .push((stage_root.clone(), dataset.clone()));
-        let mountpoint = stage_root.to_string_lossy().into_owned();
-
-        let mut built = if base_ref.eq_ignore_ascii_case("scratch") {
-            if let Some(ds) = &dataset {
-                store.sys().zfs_create(ds, &[("mountpoint", &mountpoint)])?;
-            }
-            BuiltStage {
-                index: stage_def.index,
-                name: stage_def.name.clone(),
-                root: stage_root,
-                dataset,
-                config: ImageConfig {
-                    architecture: oci::arch().to_owned(),
-                    os: "freebsd".to_owned(),
-                    ..Default::default()
-                },
-                layers: Vec::new(),
-                descriptors: Vec::new(),
-                cmd_set: false,
-                cache_key: root_key(opts, &["scratch"]),
-                tree: None,
-                vars: BTreeMap::new(),
-            }
-        } else if let Some(prev) = find_stage(&completed_stages, &base_ref) {
-            match (&prev.dataset, &dataset) {
-                (Some(from), Some(ds)) => {
-                    // A stage is done with once built on: the snapshot
-                    // holds it as it ended.
-                    let snapshot = format!("{from}@stage-{}", stage_def.index);
-                    store.sys().zfs_snapshot(&snapshot)?;
-                    store
-                        .sys()
-                        .zfs_clone(&snapshot, ds, &[("mountpoint", &mountpoint)])?;
-                }
-                _ => layer::copy_tree(&prev.root, &stage_root)?,
-            }
-            BuiltStage {
-                index: stage_def.index,
-                name: stage_def.name.clone(),
-                root: stage_root,
-                dataset,
-                config: prev.config.clone(),
-                layers: prev.layers.clone(),
-                descriptors: prev.descriptors.clone(),
-                cmd_set: false,
-                cache_key: prev.cache_key.clone(),
-                tree: None,
-                vars: prev.vars.clone(),
-            }
-        } else {
-            println!("Step 0/{}: FROM {base_ref}", stage_def.instructions.len());
-            let base_img = pinned_base(store, &pin, opts, &base_ref).await?;
-            env.base(&base_ref, &base_img);
-            store.prepare_rootfs(&base_img, &stage_root, dataset.as_deref())?;
-            let mut cfg = base_img.config.clone();
-            if cfg.os.is_empty() {
-                cfg.os = "freebsd".to_owned();
-            }
-            if cfg.architecture.is_empty() {
-                cfg.architecture = oci::arch().to_owned();
-            }
-            BuiltStage {
-                index: stage_def.index,
-                name: stage_def.name.clone(),
-                root: stage_root,
-                dataset,
-                config: cfg,
-                layers: base_img.layers.clone(),
-                descriptors: base_img.layer_descriptors.clone(),
-                cmd_set: false,
-                cache_key: root_key(opts, &["from", &base_img.id]),
-                tree: None,
-                vars: BTreeMap::new(),
-            }
-        };
-
-        // Seed `vars` with any ENV already present in the base image.
-        let mut vars = std::mem::take(&mut built.vars);
-        for kv in &built.config.config.env {
-            if let Some((k, v)) = kv.split_once('=') {
-                vars.insert(k.to_owned(), v.to_owned());
-            }
+    let jobs = opts.jobs.max(1);
+    let mut waiting: Vec<(&Stage, BTreeSet<usize>)> = cf
+        .stages
+        .iter()
+        .zip(needed)
+        .filter_map(|(stage, deps)| Some((stage, deps?)))
+        .collect();
+    // In waves of what is ready, at most `jobs` at a time. The first failure
+    // drops the rest of its wave, and a running step goes with it.
+    while !waiting.is_empty() {
+        let built: BTreeSet<usize> = completed_stages.iter().map(|s| s.index).collect();
+        let (mut ready, rest): (Vec<_>, Vec<_>) = waiting
+            .into_iter()
+            .partition(|(_, deps)| deps.is_subset(&built));
+        let later = ready.split_off(ready.len().min(jobs));
+        waiting = later.into_iter().chain(rest).collect();
+        waiting.sort_by_key(|(stage, _)| stage.index);
+        if ready.is_empty() {
+            return Err(Error::Build("stages wait on each other".to_owned()));
         }
-
-        let total = stage_def.instructions.len();
-        // The base's ONBUILD triggers run first, and are not passed on.
-        let triggers = std::mem::take(&mut built.config.config.on_build);
-        for trigger in &triggers {
-            println!("Step 0/{total}: ONBUILD {trigger}");
-            let sp = containerfile::parse_trigger(trigger, stage_def.line)?;
-            execute_instruction(env, &completed_stages, &mut built, &mut vars, &sp, 0).await?;
+        let mut wave = Vec::new();
+        for (stage_def, _) in &ready {
+            let stage_root = build_tmp.path().join(format!("stage-{}", stage_def.index));
+            std::fs::create_dir_all(&stage_root)?;
+            let dataset = stage_datasets
+                .as_ref()
+                .map(|(_, mine)| format!("{mine}/stage-{}", stage_def.index));
+            cleanup_guard
+                .stages
+                .push((stage_root.clone(), dataset.clone()));
+            wave.push(build_stage(
+                env,
+                stage_def,
+                &completed_stages,
+                &from_vars,
+                &platform,
+                stage_root,
+                dataset,
+            ));
         }
-        for (idx, sp) in stage_def.instructions.iter().enumerate() {
-            let step_no = idx + 1;
-            println!("Step {step_no}/{total}: {}", sp.raw);
-            execute_instruction(env, &completed_stages, &mut built, &mut vars, sp, step_no).await?;
-        }
-
-        built.vars = vars;
-        completed_stages.push(built);
+        let finished = futures::future::try_join_all(wave).await?;
+        completed_stages.extend(finished);
     }
+    completed_stages.sort_by_key(|s| s.index);
 
     let final_stage = completed_stages
         .pop()
@@ -572,6 +506,137 @@ impl Drop for TempTree {
     }
 }
 
+/// Builds one stage, given those it may name.
+async fn build_stage(
+    env: BuildEnv<'_>,
+    stage_def: &Stage,
+    completed_stages: &[BuiltStage],
+    from_vars: &BTreeMap<String, String>,
+    platform: &str,
+    stage_root: PathBuf,
+    dataset: Option<String>,
+) -> Result<BuiltStage, Error> {
+    let (store, pin, opts) = (env.store, env.pin, env.opts);
+    // A step's files are named by its number: stages at once need rooms of
+    // their own.
+    let stage_tmp = env.tmp_dir.join(format!("steps-{}", stage_def.index));
+    std::fs::create_dir_all(&stage_tmp)?;
+    let env = BuildEnv {
+        tmp_dir: &stage_tmp,
+        ..env
+    };
+    let tag = match (opts.jobs > 1, &stage_def.name) {
+        (false, _) => String::new(),
+        (true, Some(name)) => format!("[{name}] "),
+        (true, None) => format!("[{}] ", stage_def.index),
+    };
+    let base_ref = expand_word(&stage_def.base, from_vars);
+    check_platform(stage_def, from_vars, platform)?;
+    let mountpoint = stage_root.to_string_lossy().into_owned();
+
+    let mut built = if base_ref.eq_ignore_ascii_case("scratch") {
+        if let Some(ds) = &dataset {
+            store.sys().zfs_create(ds, &[("mountpoint", &mountpoint)])?;
+        }
+        BuiltStage {
+            index: stage_def.index,
+            name: stage_def.name.clone(),
+            root: stage_root,
+            dataset,
+            config: ImageConfig {
+                architecture: oci::arch().to_owned(),
+                os: "freebsd".to_owned(),
+                ..Default::default()
+            },
+            layers: Vec::new(),
+            descriptors: Vec::new(),
+            cmd_set: false,
+            cache_key: root_key(opts, &["scratch"]),
+            tree: None,
+            vars: BTreeMap::new(),
+        }
+    } else if let Some(prev) = find_stage(completed_stages, &base_ref) {
+        match (&prev.dataset, &dataset) {
+            (Some(from), Some(ds)) => {
+                // A stage is done with once built on: the snapshot
+                // holds it as it ended.
+                let snapshot = format!("{from}@stage-{}", stage_def.index);
+                store.sys().zfs_snapshot(&snapshot)?;
+                store
+                    .sys()
+                    .zfs_clone(&snapshot, ds, &[("mountpoint", &mountpoint)])?;
+            }
+            _ => layer::copy_tree(&prev.root, &stage_root)?,
+        }
+        BuiltStage {
+            index: stage_def.index,
+            name: stage_def.name.clone(),
+            root: stage_root,
+            dataset,
+            config: prev.config.clone(),
+            layers: prev.layers.clone(),
+            descriptors: prev.descriptors.clone(),
+            cmd_set: false,
+            cache_key: prev.cache_key.clone(),
+            tree: None,
+            vars: prev.vars.clone(),
+        }
+    } else {
+        println!(
+            "{tag}Step 0/{}: FROM {base_ref}",
+            stage_def.instructions.len()
+        );
+        let base_img = pinned_base(store, pin, opts, &base_ref).await?;
+        env.base(&base_ref, &base_img);
+        store.prepare_rootfs(&base_img, &stage_root, dataset.as_deref())?;
+        let mut cfg = base_img.config.clone();
+        if cfg.os.is_empty() {
+            cfg.os = "freebsd".to_owned();
+        }
+        if cfg.architecture.is_empty() {
+            cfg.architecture = oci::arch().to_owned();
+        }
+        BuiltStage {
+            index: stage_def.index,
+            name: stage_def.name.clone(),
+            root: stage_root,
+            dataset,
+            config: cfg,
+            layers: base_img.layers.clone(),
+            descriptors: base_img.layer_descriptors.clone(),
+            cmd_set: false,
+            cache_key: root_key(opts, &["from", &base_img.id]),
+            tree: None,
+            vars: BTreeMap::new(),
+        }
+    };
+
+    // Seed `vars` with any ENV already present in the base image.
+    let mut vars = std::mem::take(&mut built.vars);
+    for kv in &built.config.config.env {
+        if let Some((k, v)) = kv.split_once('=') {
+            vars.insert(k.to_owned(), v.to_owned());
+        }
+    }
+
+    let total = stage_def.instructions.len();
+    // The base's ONBUILD triggers run first, and are not passed on.
+    let triggers = std::mem::take(&mut built.config.config.on_build);
+    for trigger in &triggers {
+        println!("{tag}Step 0/{total}: ONBUILD {trigger}");
+        let sp = containerfile::parse_trigger(trigger, stage_def.line)?;
+        execute_instruction(env, completed_stages, &mut built, &mut vars, &sp, 0).await?;
+    }
+    for (idx, sp) in stage_def.instructions.iter().enumerate() {
+        let step_no = idx + 1;
+        println!("{tag}Step {step_no}/{total}: {}", sp.raw);
+        execute_instruction(env, completed_stages, &mut built, &mut vars, sp, step_no).await?;
+    }
+
+    built.vars = vars;
+    Ok(built)
+}
+
 /// Whether `reference`, a stage's index or its name, is this stage.
 fn names_stage(reference: &str, index: usize, name: Option<&str>) -> bool {
     match reference.parse::<usize>() {
@@ -604,7 +669,8 @@ fn target_stage(cf: &Containerfile, target: Option<&str>) -> Result<usize, Error
     }
 }
 
-/// Which of `stages` the last of them needs, itself included: those it is
+/// Which of `stages` the last of them needs, itself included, each with the
+/// stages it waits on, and `None` for the others: those it is
 /// built on or takes files from, by `FROM`, `COPY --from`, `--mount=from` or
 /// the `ONBUILD` triggers it runs, and so on from those. A stage can name
 /// only those before it, so one walk back finds them all. `image_triggers`
@@ -615,15 +681,16 @@ async fn needed_stages(
     stages: &[Stage],
     from_vars: &BTreeMap<String, String>,
     mut image_triggers: impl AsyncFnMut(&Stage, &str) -> Result<Vec<String>, Error>,
-) -> Result<Vec<bool>, Error> {
-    let mut needed = vec![false; stages.len()];
+) -> Result<Vec<Option<BTreeSet<usize>>>, Error> {
+    let mut needed: Vec<Option<BTreeSet<usize>>> = vec![None; stages.len()];
     if let Some(last) = needed.last_mut() {
-        *last = true;
+        *last = Some(BTreeSet::new());
     }
     for (i, stage) in stages.iter().enumerate().rev() {
-        if !needed[i] {
+        if needed[i].is_none() {
             continue;
         }
+        let mut waits_on = BTreeSet::new();
         let earlier = &stages[..i];
         let find = |r: &str| {
             earlier
@@ -634,7 +701,7 @@ async fn needed_stages(
         let triggers = if base.eq_ignore_ascii_case("scratch") {
             Vec::new()
         } else if let Some(b) = find(&base) {
-            needed[b] = true;
+            waits_on.insert(b);
             earlier[b]
                 .instructions
                 .iter()
@@ -653,11 +720,15 @@ async fn needed_stages(
         let steps = stage.instructions.iter().chain(&triggers);
         for source in steps.flat_map(|sp| sp.instruction.sources()) {
             if source.contains('$') {
-                needed[..i].fill(true);
+                waits_on.extend(0..i);
             } else if let Some(j) = find(source) {
-                needed[j] = true;
+                waits_on.insert(j);
             }
         }
+        for j in &waits_on {
+            needed[*j].get_or_insert_with(BTreeSet::new);
+        }
+        needed[i] = Some(waits_on);
     }
     Ok(needed)
 }
@@ -1101,7 +1172,7 @@ impl RunMounts {
             placed: Vec::new(),
         };
         let mounts: Vec<RunMount> = opts.mounts.iter().map(|m| m.expanded(vars)).collect();
-        let caches = lock_caches(&mut out, store.dir(), &mounts, tmp_dir, step_no)?;
+        let caches = lock_caches(&mut out, store.dir(), &mounts, tmp_dir, step_no).await?;
         for (i, m) in mounts.iter().enumerate() {
             let scratch = tmp_dir.join(format!("mount-{step_no}-{i}"));
             match m {
@@ -1318,7 +1389,7 @@ impl RunMounts {
 /// as the strictest mount of it asks. `prune --cache` leaves a cache that
 /// is held. Returns each cache's directory by name: a `private` one in use
 /// elsewhere is an empty one of this step's.
-fn lock_caches(
+async fn lock_caches(
     out: &mut RunMounts,
     store_dir: &Path,
     mounts: &[RunMount],
@@ -1362,10 +1433,20 @@ fn lock_caches(
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 println!(" ---> Waiting for cache {id:?}, in use by another build");
-                if shared {
-                    lock.lock_shared()?;
-                } else {
-                    lock.lock()?;
+                // Not by blocking: the build holding it may be a stage of
+                // this one, which needs this thread to finish.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let tried = if shared {
+                        lock.try_lock_shared()
+                    } else {
+                        lock.try_lock()
+                    };
+                    match tried {
+                        Ok(()) => break,
+                        Err(std::fs::TryLockError::WouldBlock) => {}
+                        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                    }
                 }
                 out.locks.push(lock);
             }
@@ -2772,6 +2853,7 @@ async fn build_with_buildah(
         (opts.cpuset.is_some(), "--cpuset-cpus"),
         (!opts.cache_from.is_empty(), "--cache-from"),
         (opts.cache_to.is_some(), "--cache-to"),
+        (opts.jobs > 1, "--jobs"),
     ];
     if let Some((_, flag)) = unsupported.iter().find(|(set, _)| *set) {
         return Err(Error::Build(format!(
@@ -2866,7 +2948,7 @@ mod tests {
         })
         .await
         .unwrap();
-        (0..needed.len()).filter(|i| needed[*i]).collect()
+        (0..needed.len()).filter(|i| needed[*i].is_some()).collect()
     }
 
     #[tokio::test]
@@ -2925,6 +3007,23 @@ mod tests {
         // Known only when the step runs: all before it stay.
         let var = "FROM x AS a\nFROM x AS b\nFROM x\nARG S=a\nCOPY --from=$S /f /f\n";
         assert_eq!(plan(var, None, &[]).await, [0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_stage_waits_only_on_what_it_names() {
+        let cf = super::Containerfile::parse(
+            "FROM x AS a\nFROM x AS b\nFROM x AS c\nCOPY --from=a /f /f\nFROM x\nCOPY --from=b /f /f\nCOPY --from=c /f /g\n",
+        )
+        .unwrap();
+        let vars = std::collections::BTreeMap::new();
+        let needed = super::needed_stages(&cf.stages, &vars, async |_, _: &str| Ok(Vec::new()))
+            .await
+            .unwrap();
+        let of = |i: usize| needed[i].clone().unwrap().into_iter().collect::<Vec<_>>();
+        assert_eq!(of(0), Vec::<usize>::new());
+        assert_eq!(of(1), Vec::<usize>::new());
+        assert_eq!(of(2), [0]);
+        assert_eq!(of(3), [1, 2]);
     }
 
     #[test]

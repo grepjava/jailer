@@ -73,7 +73,13 @@ Only the target, and the stages it needs, are built. That is `--target`, or the
 last stage. A stage is needed through `FROM`, `COPY --from`, a bind mount's
 `from`, or an `ONBUILD` trigger, including one from a base image. A source given
 by a variable keeps every stage before it, as its value is known only when the
-step runs. Stages run one at a time.
+step runs.
+
+Stages run one at a time, or with `--jobs N`, up to `N` of those that do not need
+each other at once. They give the same image either way. It helps most where
+steps wait, as on a download. Steps' output then interleaves, each `Step` line
+marked with its stage, and if one stage fails the others stop with it. A
+`sharing=locked` cache mount is held by one stage at a time.
 
 `BUILDPLATFORM`, `TARGETPLATFORM`, `BUILDOS`, `TARGETOS`, `BUILDARCH` and
 `TARGETARCH` are set, all to this host. A foreign `FROM --platform` is refused.

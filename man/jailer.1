@@ -121,6 +121,7 @@ overwrites an existing
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -ssh Ar id Ns Op = Ns Ar socket
 .Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
+.Op Fl -jobs Ar n
 .Op Fl -record Ar file
 .Op Fl -target Ar stage
 .Op Fl -timestamp Ar seconds
@@ -394,6 +395,11 @@ jailer builds only for the host's platform, and refuses any other.
 fails the build when the compatibility check reports an error.
 .Fl -target
 stops at the named stage, which is the one checked.
+.Fl -jobs
+builds up to
+.Ar n
+stages at once, of those that do not need each other (default 1);
+if one fails, the others stop with it.
 .Fl -record
 writes a release record to
 .Ar file :
