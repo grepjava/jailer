@@ -249,4 +249,4 @@ CARGO_CRATES=	adler2-2.0.1 \
 		zstd-0.13.3 \
 		zstd-safe-7.3.0 \
 		zstd-sys-2.1.2+zstd.1.5.7 \
-		legion-api,legion-image,legion-jail,legion-net,legion-runtime,legion-sys@git+https://github.com/grepjava/legion?tag=v0.1.11\#99f5d3d37a9c142d694fec02ada27a28e1f3bf43
+		legion-api,legion-image,legion-jail,legion-net,legion-runtime,legion-sys@git+https://github.com/grepjava/legion?tag=v0.1.12\#38dffa28dccdce98999f89c4162698ac67a999bd

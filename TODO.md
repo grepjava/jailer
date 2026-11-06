@@ -13,9 +13,9 @@ people building images for Legion.
   one signed index naming both, each architecture pulling its own. The
   test suite passes on arm64 (FreeBSD 15.1 VM).
 
-- [ ] **Packaging.** v0.5.3 is released with an amd64 tarball (aarch64 to come),
+- [ ] **Packaging.** v0.5.4 is released with an amd64 tarball (aarch64 to come),
   built by `scripts/release.sh` on FreeBSD 15.1 (they need its libc,
-  FBSD_1.9). The port in `ports/sysutils/jailer` is at 0.5.3 (FreeBSD 15+,
+  FBSD_1.9). The port in `ports/sysutils/jailer` is at 0.5.4 (FreeBSD 15+,
   amd64 and aarch64), with Legion's git crates fetched by the ports
   framework (`scripts/port-crates.sh` lists them) and libzstd from
   `archivers/zstd`; `poudriere testport` passes on 15.1 amd64, and its
