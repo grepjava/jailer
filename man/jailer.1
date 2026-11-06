@@ -730,6 +730,7 @@ needs
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password
 .Op Fl -record Ar file
+.Op Fl -type Cm provenance | sbom
 .Ar reference
 .Xc
 Check that the image
@@ -748,6 +749,39 @@ and
 .Pa jailer.pub .
 .Ql cosign import-key-pair
 turns them into cosign's own key format.
+.It Xo
+.Nm attest
+.Fl -key Ar path
+.Fl -type Cm provenance | sbom
+.Op Fl -authfile Ar path
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -image Ar image
+.Op Fl -record Ar file
+.Ar reference
+.Xc
+Sign a statement about the image
+.Ar reference
+names and push it, as
+.Ql cosign attest
+does:
+.Cm provenance
+is SLSA provenance, from the release record
+.Fl -record
+names;
+.Cm sbom
+is an SPDX document of the packages in the local
+.Ar image .
+.Nm verify Fl -type
+checks one, and prints what it says.
+.It Xo
+.Nm sbom
+.Op Fl o Ar path
+.Ar image
+.Xc
+Print an SPDX document of the packages
+.Xr pkg 8
+has registered in a local image.
+Files put there any other way are not listed, and the document says so.
 .It Xo
 .Nm export
 .Op Fl o Ar path

@@ -41,7 +41,7 @@ Do not treat these as features still needing implementation:
 | Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. Publishing a multi-architecture index does not coordinate the builds. |
 | Registry cache | OCI transport with a Jailer-specific cache configuration format; not an interchangeable BuildKit cache. |
 | Memory limits | RCTL limits resident memory per process. Legion's agent also holds a container's total, which `jailer run` does not: decided, see `docs/LOCAL-AND-LEGION.md`. |
-| Image trust | Key-based signatures exist; SBOM/provenance attestations, keyless signing and transparency-log integration are absent from the reviewed interface. |
+| Image trust | Key-based signatures, and SLSA provenance and SPDX SBOM attestations, which cosign verifies. Keyless signing and transparency-log integration are absent. |
 | Runtime equivalence | Local jail execution shares runtime primitives, but does not reproduce the full Legion agent, probes, reconciliation or service lifecycle. |
 | Qualification | FreeBSD live tests are compiled only on FreeBSD and run through `scripts/qualify`, on amd64 so far. The checkout has no `.github` workflow directory. |
 

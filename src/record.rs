@@ -35,6 +35,8 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified: Vec<Verified>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<Attested>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archives: Vec<Archive>,
 }
 
@@ -84,6 +86,16 @@ pub struct Verified {
     pub reference: String,
     /// The sha256 of the public key's file.
     pub key: String,
+}
+
+/// An attestation pushed about `digest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attested {
+    pub digest: String,
+    #[serde(rename = "predicateType")]
+    pub predicate_type: String,
+    /// Where it is.
+    pub reference: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +195,7 @@ impl Default for Record {
             bases: Vec::new(),
             published: Vec::new(),
             verified: Vec::new(),
+            attestations: Vec::new(),
             archives: Vec::new(),
         }
     }
@@ -324,7 +337,7 @@ impl Record {
                 .any(|p| p.digest == digest || p.platforms.values().any(|d| d == digest))
     }
 
-    fn refuse_unknown(&self, digest: &str) -> Result<(), Error> {
+    pub fn refuse_unknown(&self, digest: &str) -> Result<(), Error> {
         if self.names(digest) {
             return Ok(());
         }
@@ -352,6 +365,25 @@ impl Record {
         };
         if !self.verified.contains(&verified) {
             self.verified.push(verified);
+        }
+        Ok(())
+    }
+
+    /// An attestation of `digest` was pushed to `reference`.
+    pub fn attested(
+        &mut self,
+        digest: &str,
+        predicate_type: &str,
+        reference: String,
+    ) -> Result<(), Error> {
+        self.refuse_unknown(digest)?;
+        let attested = Attested {
+            digest: digest.to_owned(),
+            predicate_type: predicate_type.to_owned(),
+            reference,
+        };
+        if !self.attestations.contains(&attested) {
+            self.attestations.push(attested);
         }
         Ok(())
     }

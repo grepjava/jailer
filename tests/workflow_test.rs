@@ -1814,6 +1814,60 @@ async fn a_release_record_follows_one_image_and_refuses_another() {
         String::from_utf8_lossy(&pulled.stdout)
     );
 
+    // Provenance and an SBOM, signed, about the recorded image alone.
+    ok(jailer(&[
+        "attest",
+        "--key",
+        &private,
+        "--type",
+        "provenance",
+        "--record",
+        &rec,
+        pinned,
+    ])
+    .await);
+    ok(jailer(&[
+        "attest", "--key", &private, "--type", "sbom", "--image", "app:1", "--record", &rec, pinned,
+    ])
+    .await);
+    let shown = ok(jailer(&[
+        "verify",
+        "--key",
+        &public,
+        "--type",
+        "provenance",
+        "--record",
+        &rec,
+        pinned,
+    ])
+    .await);
+    let provenance: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(
+        provenance["buildDefinition"]["externalParameters"]["context"],
+        r["source"]["context"]
+    );
+    let shown = ok(jailer(&["verify", "--key", &public, "--type", "sbom", pinned]).await);
+    let sbom: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
+    let comment = sbom["creationInfo"]["comment"].as_str().unwrap();
+    assert!(comment.contains("NOT AN INVENTORY"), "{comment}");
+    assert_eq!(read()["attestations"].as_array().unwrap().len(), 2);
+    // The tag is another image's by now: nothing here is about it.
+    let none = jailer(&["verify", "--key", &public, "--type", "provenance", &target]).await;
+    assert!(!none.status.success());
+    let other = jailer(&[
+        "attest",
+        "--key",
+        &private,
+        "--type",
+        "provenance",
+        "--record",
+        &rec,
+        &target,
+    ])
+    .await;
+    assert!(!other.status.success(), "the record is not of this image");
+
     // A build names the images it took anything from, as they resolved.
     std::fs::write(
         ctx.join("Containerfile"),

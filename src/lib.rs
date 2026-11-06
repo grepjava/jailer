@@ -4,6 +4,7 @@
 //! own `legion-image`, containers are `legion-jail`'s, and the system
 //! calls `legion-sys`.
 
+pub mod attest;
 pub mod auth;
 pub mod build;
 pub mod cache;

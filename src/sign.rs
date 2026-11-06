@@ -97,7 +97,23 @@ pub async fn sign(
     let payload = payload(r, digest);
     let signature: Signature = key.sign(&payload);
     let signature = B64.encode(signature.to_der().as_bytes());
-    let payload_digest = sha256(&payload);
+    let annotations = BTreeMap::from([(SIGNATURE.to_owned(), signature)]);
+    let at = signature_ref(r, digest);
+    add_layer(client, r, &at, PAYLOAD_TYPE, &payload, annotations, creds).await
+}
+
+/// Adds `body` as a layer of the manifest tagged `at` in `r`'s repository,
+/// as cosign keeps signatures and attestations. One already there stays.
+pub(crate) async fn add_layer(
+    client: &Client,
+    r: &Reference,
+    at: &Reference,
+    media_type: &str,
+    body: &[u8],
+    annotations: BTreeMap<String, String>,
+    creds: Option<&Credentials>,
+) -> Result<(), Error> {
+    let body_digest = sha256(body);
     let tmp = tempfile::tempdir()?;
     let put = |name: &str, bytes: &[u8]| -> Result<std::path::PathBuf, Error> {
         let path = tmp.path().join(name);
@@ -105,29 +121,28 @@ pub async fn sign(
         Ok(path)
     };
     client
-        .push_blob(r, &payload_digest, &put("payload", &payload)?, creds)
+        .push_blob(r, &body_digest, &put("body", body)?, creds)
         .await?;
 
-    let sig_ref = signature_ref(r, digest);
-    let mut layers = match client.document(&sig_ref, sig_ref.target(), creds).await {
+    let mut layers = match client.document(at, at.target(), creds).await {
         Ok((_, doc)) => doc.into_manifest()?.layers,
         Err(legion_image::Error::NotFound(_)) => Vec::new(),
         Err(e) => return Err(e.into()),
     };
     if layers
         .iter()
-        .any(|l| l.annotations.get(SIGNATURE) == Some(&signature))
+        .any(|l| l.digest == body_digest && l.annotations == annotations)
     {
         return Ok(());
     }
     layers.push(Descriptor {
-        media_type: PAYLOAD_TYPE.to_owned(),
-        digest: payload_digest,
-        size: payload.len() as u64,
+        media_type: media_type.to_owned(),
+        digest: body_digest,
+        size: body.len() as u64,
         platform: None,
-        annotations: BTreeMap::from([(SIGNATURE.to_owned(), signature)]),
+        annotations,
     });
-    // As cosign writes it: one diff id for each signature layer.
+    // As cosign writes it: one diff id for each layer.
     let config = json!({
         "architecture": "",
         "config": {},
@@ -151,7 +166,7 @@ pub async fn sign(
         },
         layers,
     );
-    client.push_manifest(&sig_ref, &manifest, creds).await?;
+    client.push_manifest(at, &manifest, creds).await?;
     Ok(())
 }
 

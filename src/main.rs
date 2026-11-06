@@ -328,12 +328,56 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         authfile: Option<PathBuf>,
 
+        /// Check an attestation of this kind, not a signature, and print it
+        #[arg(long = "type", value_enum)]
+        kind: Option<AttestationArg>,
+
         /// Add to this release record (see docs/RELEASE-RECORD.md)
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
 
         /// The image, e.g. ghcr.io/me/app:1.0
         reference: String,
+    },
+
+    /// Attest provenance or an SBOM for an image in a registry, as cosign does
+    Attest {
+        /// The private key (PEM), from `jailer key generate`
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+
+        /// What to attest
+        #[arg(long = "type", value_enum)]
+        kind: AttestationArg,
+
+        /// The release record: provenance comes from it, and it is added to
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The local image an SBOM is of [default: the reference's]
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+
+        /// Registry credentials (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// The image, e.g. ghcr.io/me/app:1.0
+        reference: String,
+    },
+
+    /// Print an image's SBOM, as SPDX JSON
+    Sbom {
+        /// Write it here, not to standard output
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// A local image
+        image: String,
     },
 
     /// Make signing keys
@@ -671,6 +715,47 @@ fn resolve_zfs_root(cli: &Cli, sys: &dyn Sys) -> Option<String> {
     }
     let _ = sys;
     None
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationArg {
+    Provenance,
+    Sbom,
+}
+
+impl AttestationArg {
+    fn predicate_type(self) -> &'static str {
+        match self {
+            AttestationArg::Provenance => jailer::attest::PROVENANCE,
+            AttestationArg::Sbom => jailer::attest::SBOM,
+        }
+    }
+}
+
+/// `image`'s SBOM: its packages are read from a copy of its root filesystem.
+fn image_sbom(
+    store: &Store,
+    image: &jailer::store::Image,
+    name: &str,
+) -> Result<serde_json::Value> {
+    let tmp = tempfile::Builder::new()
+        .prefix("sbom")
+        .tempdir_in(store.dir().join("tmp"))?;
+    let root = tmp.path().join("root");
+    store.prepare_rootfs(image, &root, None)?;
+    let listed = jailer::attest::packages(&root);
+    jailer::layer::remove_tree(&root)?;
+    let listed = listed?;
+    eprintln!("{}", jailer::attest::coverage(listed.as_deref()));
+    let created = Some(image.config.created.as_str())
+        .filter(|c| !c.is_empty())
+        .unwrap_or("1970-01-01T00:00:00Z");
+    Ok(jailer::attest::sbom(
+        name,
+        &image.digest,
+        created,
+        listed.as_deref(),
+    ))
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1109,7 +1194,6 @@ async fn run() -> Result<()> {
             let digest = store
                 .push(&source_image, &target_ref, resolved_creds.as_ref())
                 .await?;
-            println!("Pushed {} ({digest})", target_ref);
             if let Some(path) = record {
                 let image = store
                     .find(&source_image)?
@@ -1123,6 +1207,7 @@ async fn run() -> Result<()> {
                 )?;
                 r.save(path)?;
             }
+            println!("Pushed {} ({digest})", target_ref);
             if let Some(path) = sign_key {
                 sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
                 signed_in(record, &target_ref, &digest)?;
@@ -1145,7 +1230,6 @@ async fn run() -> Result<()> {
             let digest = store
                 .push_index(&target_ref, sources, resolved_creds.as_ref())
                 .await?;
-            println!("Pushed {target_ref} ({digest})");
             if let Some(path) = record {
                 let (_, doc) = store
                     .client()
@@ -1160,6 +1244,7 @@ async fn run() -> Result<()> {
                 )?;
                 r.save(path)?;
             }
+            println!("Pushed {target_ref} ({digest})");
             if let Some(path) = sign_key {
                 sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
                 signed_in(record, &target_ref, &digest)?;
@@ -1190,6 +1275,7 @@ async fn run() -> Result<()> {
             key,
             creds,
             authfile,
+            kind,
             record,
             reference,
         } => {
@@ -1197,6 +1283,21 @@ async fn run() -> Result<()> {
             let r = Reference::parse(reference)?;
             let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
             let public = jailer::sign::verifying_key(&jailer::sign::read_key(key)?)?;
+            if let Some(kind) = kind {
+                let (digest, predicate) = jailer::attest::verify(
+                    store.client(),
+                    &r,
+                    kind.predicate_type(),
+                    &public,
+                    creds.as_ref(),
+                )
+                .await?;
+                if let Some(path) = record {
+                    Record::open(path)?.refuse_unknown(&digest)?;
+                }
+                println!("{}", serde_json::to_string_pretty(&predicate)?);
+                return Ok(());
+            }
             let digest = jailer::sign::verify(store.client(), &r, &public, creds.as_ref()).await?;
             if let Some(path) = record {
                 let mut rec = Record::open(path)?;
@@ -1208,6 +1309,77 @@ async fn run() -> Result<()> {
                 rec.save(path)?;
             }
             println!("{r} ({digest}) is signed by the key");
+            Ok(())
+        }
+
+        Commands::Attest {
+            key,
+            kind,
+            record,
+            image,
+            creds,
+            authfile,
+            reference,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let r = Reference::parse(reference)?;
+            let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
+            let private = jailer::sign::signing_key(&jailer::sign::read_key(key)?)?;
+            let (digest, _) = store
+                .client()
+                .document(&r, r.target(), creds.as_ref())
+                .await?;
+            let mut rec = record.as_deref().map(Record::open).transpose()?;
+            if let Some(rec) = &rec {
+                rec.refuse_unknown(&digest)?;
+            }
+            let predicate = match kind {
+                AttestationArg::Provenance => {
+                    let rec = rec
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("provenance comes from --record"))?;
+                    jailer::attest::provenance(rec)?
+                }
+                AttestationArg::Sbom => {
+                    let wanted = image.as_deref().unwrap_or(reference);
+                    let local = store.find(wanted)?.ok_or_else(|| {
+                        anyhow::anyhow!("{wanted}: no such local image: give --image")
+                    })?;
+                    if local.digest != digest {
+                        bail!("{wanted} is {}, but {r} is {digest}", local.digest);
+                    }
+                    image_sbom(&store, &local, reference)?
+                }
+            };
+            jailer::attest::attest(
+                store.client(),
+                &r,
+                &digest,
+                kind.predicate_type(),
+                &predicate,
+                &private,
+                creds.as_ref(),
+            )
+            .await?;
+            let at = jailer::attest::attestation_ref(&r, &digest);
+            if let (Some(path), Some(rec)) = (record, &mut rec) {
+                rec.attested(&digest, kind.predicate_type(), at.to_string())?;
+                rec.save(path)?;
+            }
+            println!("Attested {r} ({digest}) as {at}");
+            Ok(())
+        }
+
+        Commands::Sbom { output, image } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let local = store
+                .find(image)?
+                .ok_or_else(|| anyhow::anyhow!("{image}: no such local image"))?;
+            let doc = serde_json::to_string_pretty(&image_sbom(&store, &local, image)?)?;
+            match output {
+                Some(path) => std::fs::write(path, doc + "\n")?,
+                None => println!("{doc}"),
+            }
             Ok(())
         }
 

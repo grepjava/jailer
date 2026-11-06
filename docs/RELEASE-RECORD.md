@@ -14,7 +14,7 @@ jailer export --record release.json app:1 app.tar
 Deploy the `pinned` reference from `published`, which names a digest. A tag can
 move later, and `pinned` cannot.
 
-`--record` also works with `manifest push` and `sign`. A `build` starts a new
+`--record` also works with `manifest push`, `sign` and `attest`. A `build` starts a new
 record. The other commands add to the file, and start one if it is not there,
 without a build's `source` and `bases`. `--backend buildah` has no record.
 
@@ -43,6 +43,7 @@ without a build's `source` and `bases`. `--backend buildah` has no record.
 | `published` | Each push: `reference` as pushed, `digest`, `pinned`, and `signature`, where the signature is, if it was signed. |
 | `published[].platforms` | For an index: each platform's manifest digest. `digest` is then the index's. |
 | `verified` | Each good signature check: `digest`, `reference`, and `key`, the digest of the public key's file. |
+| `attestations` | Each attestation pushed: `digest`, `predicateType`, and `reference`, where it is. |
 | `archives` | Each export: `file`, its `sha256`, and the `manifest` inside. |
 
 These are three different digests: an image's config, its manifest, and an index
@@ -52,6 +53,33 @@ manifest each platform gets.
 A record holds digests and names only. Secrets, build arguments and credentials
 stay out of it. A base's `reference` is written as the Containerfile gives it.
 
+## Attestations
+
+```sh
+jailer attest --key cosign.key --type provenance --record release.json ghcr.io/me/app@sha256:...
+jailer attest --key cosign.key --type sbom --image app:1 --record release.json ghcr.io/me/app@sha256:...
+jailer verify --key cosign.pub --type provenance ghcr.io/me/app@sha256:...
+```
+
+An attestation is an in-toto statement in a DSSE envelope, signed with the same
+keys as a signature and kept as cosign keeps them, at the tag `sha256-<hex>.att`.
+`jailer verify --type` prints the predicate if it is good. Tested with cosign
+3.1.4, which reads both kinds with `verify-attestation --type slsaprovenance1` or
+`--type spdxjson` and `--insecure-ignore-tlog`, as no transparency log entry is
+made. There is no keyless signing. `scripts/attest-check.sh` repeats that test.
+
+- `--type provenance` is SLSA provenance v1, from the record: the digests of the
+  Containerfile and the context, and each base as resolved. Build arguments are
+  left out, as they may hold what is not to be published, so provenance does not
+  tell two builds apart that differ only there.
+- `--type sbom` is an SPDX 2.3 document, also printed by `jailer sbom`. It needs
+  the local image with the same manifest digest, and `pkg(8)` on the host.
+
+An SBOM lists only packages registered with `pkg(8)`. Files put in the image any
+other way, such as by `COPY` or a build from source, are not in it, and the
+document says so. An image with no package database gets a document saying it is
+not an inventory, not an empty list that reads as complete.
+
 ## What a record does not do
 
 `verified` says a signature was good when jailer checked it. It does not stop a
@@ -59,7 +87,8 @@ deployment: enforcing that is the job of the deployment's own policy, and Legion
 does not read these records yet. See `ROADMAP.MD`.
 
 An offline archive keeps the image's manifest digest, which `archives[].manifest`
-records. A signature lives in the registry, so it does not travel in the archive.
+records. Signatures and attestations live in the registry, so they do not travel
+in the archive.
 
 ## `jailer check --json`
 

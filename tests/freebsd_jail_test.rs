@@ -1757,3 +1757,40 @@ fn memory_limits_each_process_not_the_container() {
     assert!(!out.status.success());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
 }
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn an_sbom_lists_what_pkg_knows_of_an_image() {
+    if !live("an_sbom_lists_what_pkg_knows_of_an_image") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .arg("--no-zfs")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    assert!(jailer(&["pull", image]).status.success());
+    let out = jailer(&["sbom", image]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let comment = doc["creationInfo"]["comment"].as_str().unwrap();
+    let packages = doc["packages"].as_array().unwrap();
+    println!("{} entries: {comment}", packages.len());
+    assert!(packages.len() > 1, "{comment}");
+    assert!(comment.contains("not listed"), "{comment}");
+    assert!(
+        packages[1]["versionInfo"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+    );
+}
