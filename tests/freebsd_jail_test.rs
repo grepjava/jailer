@@ -9,6 +9,78 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// What a host command printed.
+fn host(args: &[&str]) -> String {
+    let out = Command::new(args[0]).args(&args[1..]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A listener's image: the host's nc and the libraries it needs, on `from`.
+fn nc_context(dir: &Path, from: &str) {
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::copy("/usr/bin/nc", dir.join("nc")).unwrap();
+    for lib in ["libipsec.so.4", "libsbuf.so.6", "libstats.so.0"] {
+        std::fs::copy(Path::new("/lib").join(lib), dir.join("lib").join(lib)).unwrap();
+    }
+    std::fs::write(
+        dir.join("Containerfile"),
+        format!("FROM {from}\nCOPY nc /usr/bin/nc\nCOPY lib/ /lib/\n"),
+    )
+    .unwrap();
+}
+
+/// A jail on an epair of its own, at 10.99.0.2 with the host at 10.99.0.1,
+/// standing in for another machine: the host's own connections to its
+/// addresses go through lo0, where pf cannot send them on.
+struct ClientJail(String);
+
+impl ClientJail {
+    fn new() -> Self {
+        let a = host(&["ifconfig", "epair", "create"]).trim().to_owned();
+        let client = ClientJail(a.clone());
+        let b = format!("{}b", a.trim_end_matches('a'));
+        host(&["ifconfig", &a, "inet", "10.99.0.1/30", "up"]);
+        host(&[
+            "jail",
+            "-c",
+            "name=jailer_test_client",
+            "path=/",
+            "vnet",
+            "persist",
+            &format!("vnet.interface={b}"),
+        ]);
+        client.exec(&["ifconfig", &b, "inet", "10.99.0.2/30", "up"]);
+        client.exec(&["route", "add", "default", "10.99.0.1"]);
+        client
+    }
+
+    fn exec(&self, args: &[&str]) -> String {
+        host(&[&["jexec", "jailer_test_client"][..], args].concat())
+    }
+
+    /// What connecting to `address` gets, trying while a listener starts.
+    fn read(&self, address: &str, port: &str) -> String {
+        let mut got = String::new();
+        for _ in 0..20 {
+            got = self.exec(&["nc", "-w", "2", address, port]);
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        got
+    }
+}
+
+impl Drop for ClientJail {
+    fn drop(&mut self) {
+        let _ = Command::new("jail")
+            .args(["-r", "jailer_test_client"])
+            .status();
+        let _ = Command::new("ifconfig").args([&self.0, "destroy"]).status();
+    }
+}
+
 /// Whether `test` can run, which takes root.
 fn live(test: &str) -> bool {
     if is_root() {
@@ -408,23 +480,9 @@ CMD ["default-arg"]
 
     // --vnet puts the pod on jailer's bridge; -p publishes its ports. Both
     // need pf.conf to call jailer's anchors.
-    let host = |args: &[&str]| {
-        let out = Command::new(args[0]).args(&args[1..]).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
     if host(&["pfctl", "-sn"]).contains("\"jailer/*\"") {
-        // A listener: the host's nc and the libraries it needs.
         let nc_dir = tmp.path().join("nc");
-        std::fs::create_dir_all(nc_dir.join("lib")).unwrap();
-        std::fs::copy("/usr/bin/nc", nc_dir.join("nc")).unwrap();
-        for lib in ["libipsec.so.4", "libsbuf.so.6", "libstats.so.0"] {
-            std::fs::copy(Path::new("/lib").join(lib), nc_dir.join("lib").join(lib)).unwrap();
-        }
-        std::fs::write(
-            nc_dir.join("Containerfile"),
-            "FROM localhost/hello-service:latest\nCOPY nc /usr/bin/nc\nCOPY lib/ /lib/\n",
-        )
-        .unwrap();
+        nc_context(&nc_dir, "localhost/hello-service:latest");
         cmd(&["build", "-t", "nc:1", nc_dir.to_str().unwrap()]);
         cmd(&[
             "run",
@@ -450,42 +508,8 @@ CMD ["default-arg"]
             .find(|w| w.starts_with("10.77.0."))
             .unwrap()
             .to_owned();
-        // From outside: the host's own connections to its addresses go
-        // through lo0, where pf cannot send them on. A client jail on an
-        // epair of its own stands in for another machine.
-        struct Client(String);
-        impl Drop for Client {
-            fn drop(&mut self) {
-                let _ = Command::new("jail")
-                    .args(["-r", "jailer_test_client"])
-                    .status();
-                let _ = Command::new("ifconfig").args([&self.0, "destroy"]).status();
-            }
-        }
-        let a = host(&["ifconfig", "epair", "create"]).trim().to_owned();
-        let _client = Client(a.clone());
-        let b = format!("{}b", a.trim_end_matches('a'));
-        host(&["ifconfig", &a, "inet", "10.99.0.1/30", "up"]);
-        host(&[
-            "jail",
-            "-c",
-            "name=jailer_test_client",
-            "path=/",
-            "vnet",
-            "persist",
-            &format!("vnet.interface={b}"),
-        ]);
-        let inside = |args: &[&str]| host(&[&["jexec", "jailer_test_client"][..], args].concat());
-        inside(&["ifconfig", &b, "inet", "10.99.0.2/30", "up"]);
-        inside(&["route", "add", "default", "10.99.0.1"]);
-        let mut got = String::new();
-        for _ in 0..20 {
-            got = inside(&["nc", "-w", "2", "10.99.0.1", "18080"]);
-            if !got.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
+        let client = ClientJail::new();
+        let got = client.read("10.99.0.1", "18080");
         assert_eq!(got, "hello\n", "published port 18080, from outside");
         // Its command done, the container is kept and its pod lets go of
         // its address and port.
@@ -2040,4 +2064,338 @@ fn doctor_reports_on_the_host_and_changes_nothing() {
     assert!(!passed, "{nobody}");
     assert_eq!(check(&nobody, "root")["state"], "unmet");
     assert_eq!(check(&nobody, "pf.anchors")["state"], "unknown", "{nobody}");
+}
+
+/// `jailer` on a state directory of a test's own.
+fn jailer_in(state: &Path) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+    c
+}
+
+fn succeeded(c: &mut Command) -> String {
+    let out = c.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{c:?}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Removes containers, should a failed assertion leave them running.
+struct RemoveAll<'a>(&'a Path, &'a [&'a str]);
+
+impl Drop for RemoveAll<'_> {
+    fn drop(&mut self) {
+        for name in self.1 {
+            let _ = jailer_in(self.0).args(["rm", "-f", name]).output();
+        }
+    }
+}
+
+/// A port given no address is published with `(self)`, on all the host's
+/// addresses. That is why this is not for a shared host: on a public one
+/// the port would be open to the world.
+#[test]
+#[ignore = "needs root and a disposable host: scripts/jailer.qualify runs it"]
+fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
+    if !live("a_port_given_no_address_answers_on_the_hosts_own_addresses") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let context = tmp.path().join("nc");
+    nc_context(&context, "docker.io/freebsd/freebsd-runtime:15.1");
+    succeeded(jailer_in(&state).args(["build", "-t", "nc:1", context.to_str().unwrap()]));
+
+    let _remove = RemoveAll(&state, &["open"]);
+    let client = ClientJail::new();
+    succeeded(jailer_in(&state).args([
+        "run",
+        "-d",
+        "--name",
+        "open",
+        "-p",
+        "18083:8080",
+        "--entrypoint",
+        "/bin/sh",
+        "nc:1",
+        "-c",
+        "while :; do echo hello | /usr/bin/nc -N -l 8080; done",
+    ]));
+
+    // The address the client came in on, and the one the host goes out on.
+    assert_eq!(client.read("10.99.0.1", "18083"), "hello\n");
+    let route = host(&["route", "-n", "get", "default"]);
+    let egress = route
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface: "))
+        .unwrap_or_else(|| panic!("no default route: {route}"));
+    let inet = host(&["ifconfig", egress, "inet"]);
+    let own = inet
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("inet "))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{egress} has no address: {inet}"));
+    assert_eq!(client.read(own, "18083"), "hello\n", "on {own}");
+
+    succeeded(jailer_in(&state).args(["rm", "-f", "open"]));
+    for anchor in host(&["pfctl", "-a", "jailer", "-sA"]).split_whitespace() {
+        let rules = host(&["pfctl", "-a", anchor, "-sn"]);
+        assert!(!rules.contains("18083"), "{anchor}: {rules}");
+    }
+}
+
+/// A pod's ports that can't be taken away keep its address, or its
+/// redirects would reach whoever had it next; once they can go, it goes.
+/// A `pfctl` first on the PATH refuses for as long as `refuse` exists.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_failed_teardown_keeps_the_address_until_it_can_go() {
+    use std::os::unix::fs::PermissionsExt;
+    if !live("a_failed_teardown_keeps_the_address_until_it_can_go") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    let bin = tmp.path().join("bin");
+    let refuse = tmp.path().join("refuse");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    let pfctl = bin.join("pfctl");
+    std::fs::write(
+        &pfctl,
+        format!(
+            "#!/bin/sh\n\
+             case \" $* \" in\n\
+             *\" -a jailer/nat \"*) ;;\n\
+             *\" -a jailer/\"*\" -F \"*)\n\
+                 if [ -e {} ]; then echo 'pfctl: refused' >&2; exit 1; fi ;;\n\
+             esac\n\
+             exec /sbin/pfctl \"$@\"\n",
+            refuse.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&pfctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let shimmed = || {
+        let mut c = jailer_in(&state);
+        c.env("PATH", &path);
+        c
+    };
+    // On the test address alone, not every test host being private.
+    let run_args = |name: &'static str| {
+        [
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            "10.99.0.1:18084:8080",
+            "--entrypoint",
+            "/bin/sh",
+            "localhost/i:1",
+            "-c",
+            "sleep 300",
+        ]
+    };
+
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["held", "next"]);
+    succeeded(shimmed().args(run_args("held")));
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    let ip = ps
+        .split_whitespace()
+        .find(|w| w.starts_with("10.77.0."))
+        .unwrap_or_else(|| panic!("no address: {ps}"))
+        .to_owned();
+    let lease = Path::new("/var/run/jailer/net").join(&ip);
+    let pod = std::fs::read_to_string(&lease)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let anchor = format!("jailer/{}", &pod[pod.len().saturating_sub(12)..]);
+    assert!(host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+
+    // The pod goes outside jailer, its rules refusing to.
+    std::fs::write(&refuse, "").unwrap();
+    assert!(
+        Command::new("jail")
+            .args(["-r", &pod])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        lease.exists(),
+        "the address went with its rules still there"
+    );
+    assert!(host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+
+    // Still refused: the address stays, and its port with it.
+    let out = shimmed().args(run_args("next")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("18084"), "{err}");
+    assert!(lease.exists());
+
+    // Once they can go, they do, and the address is free again.
+    std::fs::remove_file(&refuse).unwrap();
+    let _ = jailer_in(&state).args(["rm", "-f", "next"]).output();
+    succeeded(jailer_in(&state).args(run_args("next")));
+    assert!(!host(&["pfctl", "-a", &anchor, "-sn"]).contains("18084"));
+    let now = std::fs::read_to_string(&lease).unwrap_or_default();
+    assert!(!now.starts_with(&pod), "{now}");
+}
+
+/// A registry that sends logins to plain http: the password must not go.
+/// An https server of the test's own, with `SSL_CERT_FILE` trusting it.
+#[test]
+fn login_refuses_a_token_realm_that_is_not_https() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = |name: &str| tmp.path().join(name);
+    let openssl = |args: &[&str]| {
+        let out = Command::new("openssl").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let path = |name: &str| file(name).to_str().unwrap().to_owned();
+    // A CA to trust and a server's certificate from it: webpki refuses a CA
+    // certificate as a server's own.
+    let curve = [
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+    ];
+    openssl(
+        &[
+            &["req", "-x509"][..],
+            &curve,
+            &["-subj", "/CN=test CA", "-days", "1"],
+            &["-keyout", &path("ca.key"), "-out", &path("ca.pem")],
+        ]
+        .concat(),
+    );
+    openssl(
+        &[
+            &["req", "-new"][..],
+            &curve,
+            &["-subj", "/CN=127.0.0.1"],
+            &["-addext", "subjectAltName=IP:127.0.0.1"],
+            &["-keyout", &path("k.pem"), "-out", &path("c.csr")],
+        ]
+        .concat(),
+    );
+    openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        &path("c.csr"),
+        "-CA",
+        &path("ca.pem"),
+        "-CAkey",
+        &path("ca.key"),
+        "-CAcreateserial",
+        "-copy_extensions",
+        "copyall",
+        "-days",
+        "1",
+        "-outform",
+        "DER",
+        "-out",
+        &path("c.der"),
+    ]);
+    openssl(&[
+        "pkcs8",
+        "-topk8",
+        "-nocrypt",
+        "-in",
+        &path("k.pem"),
+        "-outform",
+        "DER",
+        "-out",
+        &path("k.der"),
+    ]);
+    let (der, pk8) = (file("c.der"), file("k.der"));
+
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(std::fs::read(&der).unwrap())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&pk8).unwrap())),
+    )
+    .unwrap();
+    let config = Arc::new(config);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Where a password would go. Nothing may come.
+    let realm = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    realm.set_nonblocking(true).unwrap();
+    let realm_port = realm.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { return };
+            let Ok(mut tls) = rustls::ServerConnection::new(config.clone()) else {
+                return;
+            };
+            let mut stream = rustls::Stream::new(&mut tls, &mut tcp);
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).is_err() {
+                continue;
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{realm_port}/token\",service=\"t\"\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let mut login = Command::new(env!("CARGO_BIN_EXE_jailer"));
+    login
+        .env("SSL_CERT_FILE", file("ca.pem"))
+        .args(["--state-dir", path("state").as_str(), "--no-zfs", "login"])
+        .args(["--username", "u", "--password-stdin"])
+        .arg(format!("127.0.0.1:{port}"))
+        .env("HOME", tmp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = login.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"secret\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("not https"), "{err}");
+    assert!(realm.accept().is_err(), "the login went to the http realm");
 }

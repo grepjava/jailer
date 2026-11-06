@@ -78,9 +78,10 @@ run. Done here: `QUALIFY_REQUIRE_LIVE` makes what a jail test would skip fail
 it, and `scripts/jailer.qualify` lists the jail tests, which `cargo test` now
 reports as ignored.
 
-Also close here the paths with no live coverage: the default `(self)` publish,
-the address fix after a failed teardown, and `login` refusing a token realm
-that is not https, which needs an https registry.
+The paths that had no live coverage now have tests: the address kept after a
+failed teardown and `login` refusing a token realm that is not https both pass
+on the shared host. The default `(self)` publish opens a port on every address,
+so its test is `isolated` in the manifest and has yet to run on a disposable host.
 
 ### Shared Jailer–Legion qualification
 
