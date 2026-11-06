@@ -216,6 +216,11 @@ pub async fn check_credentials(
         let realm = params
             .get("realm")
             .ok_or_else(|| fail(format!("auth challenge without realm: {challenge}")))?;
+        if !realm_allowed(realm, plain_http) {
+            return Err(fail(format!(
+                "the registry sends logins to {realm}, which is not https"
+            )));
+        }
         let mut query = vec![("account", creds.username.as_str())];
         if let Some(service) = params.get("service") {
             query.push(("service", service));
@@ -234,6 +239,12 @@ pub async fn check_credentials(
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(refused()),
         s => Err(fail(format!("HTTP {s} logging in"))),
     }
+}
+
+/// Whether a login may go to `realm`: in the clear only to a registry spoken
+/// to in the clear, as Legion's client has it.
+fn realm_allowed(realm: &str, plain_http: bool) -> bool {
+    realm.starts_with("https://") || (plain_http && realm.starts_with("http://"))
 }
 
 /// `realm="...",service="..."`, the parameters of an auth challenge.
@@ -290,6 +301,17 @@ fn default_write_auth_path() -> Result<PathBuf, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logins_go_in_the_clear_only_to_a_registry_in_the_clear() {
+        use super::realm_allowed;
+        assert!(realm_allowed("https://auth.example/token", false));
+        assert!(realm_allowed("https://auth.example/token", true));
+        assert!(realm_allowed("http://localhost:5000/token", true));
+        assert!(!realm_allowed("http://auth.example/token", false));
+        assert!(!realm_allowed("ftp://auth.example/token", true));
+        assert!(!realm_allowed("auth.example/token", true));
+    }
+
     use super::*;
 
     #[test]
