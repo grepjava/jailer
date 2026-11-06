@@ -38,7 +38,7 @@ Do not treat these as features still needing implementation:
 |---|---|
 | Stage execution | Native builds execute only the stages the target needs, one at a time in file order. |
 | Containerfile syntax | Broad support, tested against BuildKit and Buildah: see `docs/COMPATIBILITY.md`. |
-| Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. Publishing a multi-architecture index does not coordinate the builds. |
+| Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. `jailer publish` coordinates native builds on several hosts; there is no emulation. |
 | Registry cache | OCI transport with a Jailer-specific cache configuration format; not an interchangeable BuildKit cache. |
 | Memory limits | RCTL limits resident memory per process. Legion's agent also holds a container's total, which `jailer run` does not: decided, see `docs/LOCAL-AND-LEGION.md`. |
 | Image trust | Key-based signatures, and SLSA provenance and SPDX SBOM attestations, which cosign verifies. Keyless signing and transparency-log integration are absent. |
@@ -310,7 +310,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
 | 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
-| 6. Supply chain and automation | P2.1, P2.2, P2.3 | Phases 1 and 4; a shared diagnostics crate |
+| 6. Supply chain and automation | P2.1 and P2.2 done. P2.3's host diagnostics wait on the shared crate | A shared diagnostics crate |
 | 7. Parallel stages | P3 | Phases 1 and 2 |
 
 Use Build → Sign → Push → Deploy → Drain → Migrate → Recover as the shared

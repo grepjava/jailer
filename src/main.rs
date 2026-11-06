@@ -288,6 +288,56 @@ pub enum Commands {
         refs: Vec<String>,
     },
 
+    /// Build on a host for each platform, then push one index of them all
+    Publish {
+        /// A platform's build host: PLATFORM=DEST, as freebsd/arm64=me@host
+        #[arg(long = "host", value_name = "PLATFORM=DEST", required = true)]
+        hosts: Vec<String>,
+
+        /// The Containerfile, relative to the context
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        file: Option<String>,
+
+        /// Build-time variable (KEY=VALUE)
+        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
+        build_args: Vec<String>,
+
+        /// Target build stage to stop at
+        #[arg(long, value_name = "STAGE")]
+        target: Option<String>,
+
+        /// Registry credentials for the index (USER[:PASSWORD])
+        #[arg(long, value_name = "USER[:PASSWORD]")]
+        creds: Option<String>,
+
+        /// Path to Docker/Podman auth.json file
+        #[arg(long, value_name = "PATH")]
+        authfile: Option<PathBuf>,
+
+        /// Sign the index with this private key, as cosign does
+        #[arg(long = "sign-key", value_name = "PATH")]
+        sign_key: Option<PathBuf>,
+
+        /// Write a release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
+        /// The jailer on the hosts
+        #[arg(long, value_name = "PATH", default_value = "jailer")]
+        remote_jailer: String,
+
+        /// The program to reach the hosts with
+        #[arg(long, env = "JAILER_SSH", value_name = "PATH", default_value = "ssh")]
+        ssh: String,
+
+        /// Registry reference to publish to (e.g. ghcr.io/me/app:1.0)
+        reference: String,
+
+        /// The build context
+        #[arg(default_value = ".")]
+        context: PathBuf,
+    },
+
     /// Publish or inspect multi-architecture image indexes
     #[command(subcommand)]
     Manifest(ManifestCommand),
@@ -1208,6 +1258,56 @@ async fn run() -> Result<()> {
                 r.save(path)?;
             }
             println!("Pushed {} ({digest})", target_ref);
+            if let Some(path) = sign_key {
+                sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
+            }
+            Ok(())
+        }
+
+        Commands::Publish {
+            hosts,
+            file,
+            build_args,
+            target,
+            creds,
+            authfile,
+            sign_key,
+            record,
+            remote_jailer,
+            ssh,
+            reference,
+            context,
+        } => {
+            let (_, store, _) = open_context(&cli, true)?;
+            let target_ref = Reference::parse(reference)?;
+            let resolved_creds =
+                resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            let hosts = hosts
+                .iter()
+                .map(|h| {
+                    h.split_once('=')
+                        .map(|(p, d)| (p.to_owned(), d.to_owned()))
+                        .ok_or_else(|| anyhow::anyhow!("--host {h:?}: give PLATFORM=DEST"))
+                })
+                .collect::<Result<_>>()?;
+            let plan = jailer::remote::Publish {
+                target: target_ref.clone(),
+                hosts,
+                context: context.clone(),
+                containerfile: file.clone(),
+                build_stage: target.clone(),
+                build_args: build_args.clone(),
+                remote_jailer: remote_jailer.clone(),
+                ssh: ssh.clone(),
+            };
+            let mut published =
+                jailer::remote::publish(&store, &plan, resolved_creds.as_ref()).await?;
+            if let Some(path) = record {
+                published.save(path)?;
+            }
+            let digest = published.published[0].digest.clone();
+            println!("Published {target_ref} ({digest})");
             if let Some(path) = sign_key {
                 sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
                 signed_in(record, &target_ref, &digest)?;

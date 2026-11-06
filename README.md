@@ -34,6 +34,7 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
   - Warns on `Containerfile` settings Legion ignores (`HEALTHCHECK`) and uncleaned `pkg` caches (`/var/cache/pkg`, `/var/db/pkg/repos`).
 - **Release records:** `--record FILE` follows one image through build, push, signing and export in one JSON file, with the digest to deploy, and refuses a step on another image or a moved tag ([format](docs/RELEASE-RECORD.md)).
 - **Provenance and SBOMs:** `jailer attest` signs SLSA provenance and SPDX SBOMs, which cosign verifies; an SBOM says what it cannot cover ([details](docs/RELEASE-RECORD.md#attestations)).
+- **Native multi-architecture releases:** `jailer publish` builds on a host for each platform over ssh and pushes the index only if every build succeeded ([details](docs/RELEASE-RECORD.md#several-platforms)).
 - **Offline archives for `legion image load`:** `jailer export app.tar` writes an `oci-archive` tarball annotated with `org.opencontainers.image.ref.name`, ready for `legion image load app.tar --zfs-root zroot/legion`.
 
 ## Compared with other tools

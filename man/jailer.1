@@ -821,6 +821,37 @@ Pull an image into the local store.
 .Fl -linux
 accepts a Linux image when the registry offers no FreeBSD one.
 .It Xo
+.Nm publish
+.Fl -host Ar platform Ns = Ns Ar dest ...
+.Op Fl -authfile Ar path
+.Op Fl -build-arg Ar key Ns = Ns Ar value
+.Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl f Ar file
+.Op Fl -record Ar file
+.Op Fl -remote-jailer Ar path
+.Op Fl -sign-key Ar path
+.Op Fl -ssh Ar path
+.Op Fl -target Ar stage
+.Ar reference
+.Op Ar context
+.Xc
+Build
+.Ar context
+natively on a host for each
+.Ar platform
+over
+.Xr ssh 1 ,
+all at once, each pushing to a staging tag of
+.Ar reference
+named for its platform.
+Only when all have, each the platform it was named for and from the same
+source, is an index of them pushed to
+.Ar reference .
+A failed host leaves
+.Ar reference
+as it was.
+Each host logs in to the registry itself.
+.It Xo
 .Nm manifest push
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password

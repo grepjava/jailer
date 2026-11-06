@@ -14,6 +14,7 @@ pub mod init;
 pub mod layer;
 pub mod net;
 pub mod record;
+pub mod remote;
 pub mod runtime;
 pub mod sign;
 pub mod store;

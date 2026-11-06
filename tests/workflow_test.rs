@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::Arc;
 
 use jailer::Reference;
@@ -1925,4 +1927,120 @@ fn check_can_answer_in_json() {
         .collect();
     assert!(codes.contains(&("LEGION001", "warning")), "{codes:?}");
     assert!(codes.contains(&("LEGION003", "error")), "{codes:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_pushes_the_index_only_when_every_host_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, registry) = start_mock_registry().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("f"), "one\n").unwrap();
+    std::fs::write(ctx.join("x.log"), "left out\n").unwrap();
+    std::fs::write(ctx.join(".containerignore"), "*.log\n").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM scratch\nARG V\nLABEL v=$V\nCOPY f /f\n",
+    )
+    .unwrap();
+
+    // Stands for ssh: the destination names a state directory here, and one
+    // called `broken` fails. Each runs jailer with no ssh and no second host.
+    let bin = Path::new(env!("CARGO_BIN_EXE_jailer"));
+    let ssh = tmp.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nshift 2\ndest=$1\nshift\n\
+             [ \"$dest\" != broken ] || {{ echo refused >&2; exit 7; }}\n\
+             mkdir -p {bindir}\nln -sf {bin} {bindir}/jailer\n\
+             PATH={bindir}:$PATH JAILER_STATE_DIR={state}/$dest exec sh -c \"$*\"\n",
+            bindir = tmp.path().join("bin").display(),
+            bin = bin.display(),
+            state = tmp.path().display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let wrapper = tmp.path().join("remote-jailer");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec jailer --no-zfs --plain-http {host} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let platform = format!("freebsd/{}", jailer::oci::arch());
+    let target = format!("{host}/app:1");
+    let record = tmp.path().join("release.json");
+    let publish = |hosts: Vec<String>| {
+        let mut c = Command::new(bin);
+        c.args(["--no-zfs", "--plain-http", &host, "--state-dir"])
+            .arg(tmp.path().join("local"))
+            .arg("publish")
+            .arg("--ssh")
+            .arg(&ssh)
+            .arg("--remote-jailer")
+            .arg(&wrapper)
+            .arg("--record")
+            .arg(&record)
+            .args(["--build-arg", "V=a b"]);
+        for h in hosts {
+            c.args(["--host", &h]);
+        }
+        c.arg(&target).arg(&ctx);
+        tokio::task::spawn_blocking(move || c.output().unwrap())
+    };
+    let tagged = |tag: &str| registry.manifests.lock().unwrap().contains_key(tag);
+
+    // A host fails, the other does not: the target's tag is not touched.
+    let out = publish(vec![
+        format!("{platform}=one"),
+        "freebsd/riscv64=broken".to_owned(),
+    ])
+    .await
+    .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nothing published"), "{err}");
+    assert!(err.contains("freebsd/riscv64"), "{err}");
+    assert!(!tagged("1"), "a partial release under the final tag");
+    assert!(!record.exists());
+
+    // A host of another platform than it was named for.
+    let out = publish(vec!["freebsd/riscv64=one".to_owned()])
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("the host built"), "{err}");
+    assert!(!tagged("1"));
+
+    // All well: the index is there, and the record says what is in it.
+    let out = publish(vec![format!("{platform}=one")]).await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tagged("1"));
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    let manifest = r["builds"][&platform]["image"]["manifest"]
+        .as_str()
+        .unwrap();
+    let published = &r["published"][0];
+    assert_eq!(published["platforms"][&platform], manifest);
+    assert_ne!(published["digest"], manifest);
+    assert!(
+        r["source"]["context"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(!std::fs::read_to_string(&record).unwrap().contains("a b"));
 }

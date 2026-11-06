@@ -30,6 +30,9 @@ pub struct Record {
     /// The images it was built from, as they resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bases: Vec<Base>,
+    /// For a release of several platforms: each one's build, by platform.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builds: BTreeMap<String, Build>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub published: Vec<Published>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -38,6 +41,15 @@ pub struct Record {
     pub attestations: Vec<Attested>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archives: Vec<Archive>,
+}
+
+/// What one host built of a release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    pub image: Built,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bases: Vec<Base>,
+    pub builder: String,
 }
 
 /// One image: its config's digest is not its manifest's.
@@ -112,11 +124,13 @@ pub fn file_digest(path: &Path) -> Result<String, Error> {
     Ok(format!("sha256:{:x}", hash.finalize()))
 }
 
-/// One digest for the files under `dir` a build can see: their relative
-/// paths, kinds, modes where there are any, and contents, or a link's target.
-/// What `ignore` leaves out does not count, nor do times or owners.
-pub fn context_digest(dir: &Path, ignore: &IgnoreMatcher) -> Result<String, Error> {
-    let mut entries = BTreeMap::new();
+/// The files under `dir` a build can see, by relative path: what `ignore`
+/// leaves out is not among them.
+pub fn context_files(
+    dir: &Path,
+    ignore: &IgnoreMatcher,
+) -> Result<BTreeMap<String, std::path::PathBuf>, Error> {
+    let mut files = BTreeMap::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(at) = todo.pop() {
         for entry in std::fs::read_dir(&at)? {
@@ -126,25 +140,31 @@ pub fn context_digest(dir: &Path, ignore: &IgnoreMatcher) -> Result<String, Erro
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let meta = std::fs::symlink_metadata(&path)?;
             let left_out = ignore.is_ignored(&rel);
-            if meta.is_dir() {
+            if std::fs::symlink_metadata(&path)?.is_dir() {
                 if !left_out || ignore.may_reinclude(&rel) {
                     todo.push(path);
                 }
-            } else if left_out {
-                continue;
-            } else if meta.is_symlink() {
-                let to = std::fs::read_link(&path)?;
-                entries.insert(rel, format!("link {}", to.display()));
-            } else {
-                let mode = mode_of(&meta);
-                entries.insert(rel, format!("file {mode} {}", file_digest(&path)?));
+            } else if !left_out {
+                files.insert(rel, path);
             }
         }
     }
+    Ok(files)
+}
+
+/// One digest for the files under `dir` a build can see: their relative
+/// paths, kinds, modes where there are any, and contents, or a link's target.
+/// What `ignore` leaves out does not count, nor do times or owners.
+pub fn context_digest(dir: &Path, ignore: &IgnoreMatcher) -> Result<String, Error> {
     let mut hash = Sha256::new();
-    for (rel, entry) in entries {
+    for (rel, path) in context_files(dir, ignore)? {
+        let meta = std::fs::symlink_metadata(&path)?;
+        let entry = if meta.is_symlink() {
+            format!("link {}", std::fs::read_link(&path)?.display())
+        } else {
+            format!("file {} {}", mode_of(&meta), file_digest(&path)?)
+        };
         hash.update(rel.as_bytes());
         hash.update(b"\0");
         hash.update(entry.as_bytes());
@@ -193,6 +213,7 @@ impl Default for Record {
             image: None,
             source: None,
             bases: Vec::new(),
+            builds: BTreeMap::new(),
             published: Vec::new(),
             verified: Vec::new(),
             attestations: Vec::new(),

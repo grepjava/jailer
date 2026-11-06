@@ -18,6 +18,34 @@ move later, and `pinned` cannot.
 record. The other commands add to the file, and start one if it is not there,
 without a build's `source` and `bases`. `--backend buildah` has no record.
 
+## Several platforms
+
+`jailer publish` builds natively on a host for each platform and pushes one
+index of them:
+
+```sh
+jailer publish --host freebsd/amd64=me@amd64-host --host freebsd/arm64=me@arm64-host \
+    --record release.json --sign-key cosign.key ghcr.io/me/app:1 .
+```
+
+Each host needs `jailer`, `tar`, and its own login to the registry: no
+credentials are sent to it. `publish` sends the same context to every host, as a
+build sees it, and they build at once. Each host pushes to a staging tag of its
+own, `app:1-freebsd-arm64` here, and removes its working directory however it
+ends.
+
+The index goes to `app:1` only when every host has finished, each built the
+platform it was named for, and all had the same Containerfile and context. If
+not, the command fails naming the hosts, and `app:1` stays as it was. Staging tags
+already pushed stay in the registry, and the next `publish` replaces them.
+Stopping `publish` drops the ssh connections: a host may finish its step, but
+nothing is published.
+
+The record has `builds`, each platform's image and bases, in place of `image`,
+and `published` has the index with its `platforms`. `jailer manifest push` and
+per-host builds still work as before. It has been tested through a stand-in for ssh on one
+host, not yet across two real architectures: see `ROADMAP.MD`.
+
 ## A record cannot mix images
 
 - `push` and `export` refuse an image other than the record's. `push` checks
@@ -40,6 +68,7 @@ without a build's `source` and `bases`. `--backend buildah` has no record.
 | `source.containerfile` | The digest of the Containerfile. |
 | `source.context` | One digest over the files a build can see: paths, kinds, modes and contents. Ignored files, times and owners do not count. |
 | `bases` | Each image built from or copied from: `reference` as named, with its `config` and `manifest` as resolved. |
+| `builds` | From `publish`: for each platform, its `image`, `bases`, and `builder`. |
 | `published` | Each push: `reference` as pushed, `digest`, `pinned`, and `signature`, where the signature is, if it was signed. |
 | `published[].platforms` | For an index: each platform's manifest digest. `digest` is then the index's. |
 | `verified` | Each good signature check: `digest`, `reference`, and `key`, the digest of the public key's file. |
