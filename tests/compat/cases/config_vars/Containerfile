@@ -1,0 +1,15 @@
+FROM scratch
+ARG P=8080
+ARG S=SIGQUIT
+ARG V=/vol
+ARG U=1000
+ENV D=/data
+COPY a.txt /a
+EXPOSE $P ${P}/udp
+STOPSIGNAL $S
+VOLUME $V
+VOLUME ["$D"]
+USER $U
+WORKDIR $D/x
+LABEL "quoted key"=v k2="a\"b" k3=a\ b
+CMD ["$P", "${D}"]

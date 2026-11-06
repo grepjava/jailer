@@ -1,0 +1,35 @@
+{
+ "config": {
+  "Cmd": [
+   "arg"
+  ],
+  "Entrypoint": [
+   "/bin/app"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "X=1"
+  ],
+  "ExposedPorts": {
+   "443/tcp": {},
+   "53/udp": {},
+   "80/tcp": {}
+  },
+  "Labels": {
+   "io.buildah.version": "1.43.2",
+   "one": "1",
+   "two": "2"
+  },
+  "StopSignal": "SIGTERM",
+  "User": "1000:1000",
+  "Volumes": {
+   "/data": {},
+   "/logs": {},
+   "/more": {}
+  },
+  "WorkingDir": "/app"
+ },
+ "files": {
+  "a": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+ }
+}

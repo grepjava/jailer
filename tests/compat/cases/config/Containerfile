@@ -1,0 +1,13 @@
+FROM scratch
+COPY a.txt /a
+ENV X=1
+USER 1000:1000
+WORKDIR /app
+EXPOSE 80 443/tcp 53/udp
+VOLUME /data /more
+VOLUME ["/logs"]
+STOPSIGNAL SIGTERM
+LABEL one=1 two="2"
+ONBUILD COPY a.txt /b
+ENTRYPOINT ["/bin/app"]
+CMD ["arg"]

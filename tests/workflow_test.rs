@@ -533,7 +533,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     assert!(vars.config.config.env.contains(&"B=old".to_owned()));
 
     // A global ARG's default sees the ones before it; a stage built on a
-    // stage has its ARGs; an ENV goes over an ARG of its name; one ARG line
+    // stage has its ARGs; an ARG with a value goes over an ENV of its name in what follows; one ARG line
     // may name several.
     write_cf(
         "ARG A=hello\nARG B=${A}-world\nFROM scratch AS parent\nARG B\nARG P=inherited\nFROM parent\nENV E=env\nARG E=arg\nARG X Y=two\nLABEL b=$B p=$P e=$E y=$Y\n"
@@ -546,7 +546,7 @@ ADD --checksum={sum} http://127.0.0.1:{}/files/data.bin /dl/
     let labels = &scoped.config.config.labels;
     assert_eq!(labels["b"], "hello-world");
     assert_eq!(labels["p"], "inherited");
-    assert_eq!(labels["e"], "env");
+    assert_eq!(labels["e"], "arg");
     assert_eq!(labels["y"], "two");
 
     // Many matches of one source go into a directory, as several sources

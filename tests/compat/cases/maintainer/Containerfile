@@ -1,0 +1,3 @@
+FROM scratch
+COPY a.txt /a
+MAINTAINER someone <someone@example.org>

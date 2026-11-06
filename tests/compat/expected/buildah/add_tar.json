@@ -1,0 +1,22 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "Labels": {
+   "io.buildah.version": "1.43.2"
+  },
+  "WorkingDir": "/"
+ },
+ "files": {
+  "x": "dir 755",
+  "x/in": "dir 755",
+  "x/in/one": "file 644 4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+  "x/two": "file 644 53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+  "y": "dir 755",
+  "y/in": "dir 755",
+  "y/in/one": "file 644 4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+  "y/two": "file 644 53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+  "z": "file 644 069aba12bacca4cc7c561c4a7ac211317f7b5563910f401a99a99eb65d94f284"
+ }
+}

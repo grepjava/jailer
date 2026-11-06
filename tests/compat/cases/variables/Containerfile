@@ -1,0 +1,12 @@
+ARG BASE=scratch
+ARG UNUSED
+FROM $BASE
+ARG A=one
+ARG B="two words"
+ARG EMPTY=
+ENV P=$A Q=${A}x R="$B" S='$A' T=\$A
+ENV U=${MISSING:-dflt} V=${A:-dflt} W=${A:+alt} X=${MISSING:+alt} Y=${EMPTY:-dflt} Z=${EMPTY-dflt}
+ENV OLD value with spaces
+LABEL a=$A "b c"="d e" e='$A'
+WORKDIR /w/$A
+WORKDIR sub

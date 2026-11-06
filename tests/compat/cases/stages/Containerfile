@@ -1,0 +1,13 @@
+FROM scratch AS a
+COPY a.txt /a
+FROM scratch AS b
+COPY b.txt /b
+ENV FROM_B=1
+FROM b AS c
+COPY --from=a /a /from-a
+ENV FROM_C=$FROM_B
+FROM scratch AS broken
+COPY missing /x
+FROM c
+COPY --from=0 /a /index0
+LABEL last=1

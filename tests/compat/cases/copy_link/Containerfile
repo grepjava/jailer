@@ -1,0 +1,4 @@
+FROM scratch
+COPY --link a.txt /x
+COPY --link=false b.txt /y
+ADD --link a.txt /z

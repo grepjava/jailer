@@ -1,0 +1,18 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "Healthcheck": {
+   "Interval": 5000000000,
+   "Test": [
+    "CMD-SHELL",
+    "/bin/true"
+   ]
+  },
+  "WorkingDir": "/"
+ },
+ "files": {
+  "a": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+ }
+}

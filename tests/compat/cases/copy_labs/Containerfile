@@ -1,0 +1,5 @@
+# syntax=docker/dockerfile:1-labs
+FROM scratch
+COPY --exclude=*.md d /e/
+COPY --parents p/q/r.txt /kept/
+COPY --parents ./p/./q/r.txt /dotted/

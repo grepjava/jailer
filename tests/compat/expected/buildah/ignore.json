@@ -1,0 +1,18 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "Labels": {
+   "io.buildah.version": "1.43.2"
+  },
+  "WorkingDir": "/"
+ },
+ "files": {
+  "all": "dir 755",
+  "all/.containerignore": "file 644 0b9f85bcf1bcde6e54824f7545c2b1516c9c98cef9ffcf23c7e85afd50567365",
+  "all/.dockerignore": "file 644 0b9f85bcf1bcde6e54824f7545c2b1516c9c98cef9ffcf23c7e85afd50567365",
+  "all/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "all/keep.log": "file 644 19732980d68fbd00358a0a4d98246c960400b87e4fa2a2e155db98be2b42ed6c"
+ }
+}

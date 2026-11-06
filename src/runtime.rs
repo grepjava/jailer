@@ -74,7 +74,7 @@ pub struct RunSpec {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Limits {
     /// Bytes of resident memory for each process: one going past it is
-    /// killed, as on a Legion node.
+    /// killed. A Legion node also holds the container's total to it.
     pub memory: Option<u64>,
     /// CPUs' worth of time, as a percentage of one CPU.
     pub pcpu: Option<u64>,

@@ -1,0 +1,41 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "WorkingDir": "/rel"
+ },
+ "files": {
+  "added": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "class": "dir 755",
+  "class/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "class/b.txt": "file 644 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+  "file": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "flat": "dir 755",
+  "flat/sub": "dir 755",
+  "flat/sub/y.txt": "file 644 3bb2abb69ebb27fbfe63c7639624c6ec5e331b841a5bc8c3ebc10b9285e90877",
+  "flat/x.txt": "file 644 73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+  "flat2": "dir 755",
+  "flat2/sub": "dir 755",
+  "flat2/sub/y.txt": "file 644 3bb2abb69ebb27fbfe63c7639624c6ec5e331b841a5bc8c3ebc10b9285e90877",
+  "flat2/x.txt": "file 644 73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+  "flat3": "dir 755",
+  "flat3/deep": "dir 755",
+  "flat3/deep/y.txt": "file 644 3bb2abb69ebb27fbfe63c7639624c6ec5e331b841a5bc8c3ebc10b9285e90877",
+  "glob": "dir 755",
+  "glob/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "glob/b.txt": "file 644 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+  "into": "dir 755",
+  "into/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "json name": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "m640": "file 640 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "many": "dir 755",
+  "many/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "many/b.txt": "file 644 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+  "q": "dir 755",
+  "q/y.txt": "file 644 3bb2abb69ebb27fbfe63c7639624c6ec5e331b841a5bc8c3ebc10b9285e90877",
+  "rel": "dir 755",
+  "rel/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "rel/here": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+ }
+}

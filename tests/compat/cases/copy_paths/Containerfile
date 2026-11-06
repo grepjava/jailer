@@ -1,0 +1,16 @@
+FROM scratch
+COPY a.txt /file
+COPY a.txt /into/
+COPY a.txt b.txt /many/
+COPY dir /flat
+COPY dir/ /flat2/
+COPY dir/sub /flat3/deep/
+COPY *.txt /glob/
+COPY d?r/sub/y.txt /q/
+COPY [ab].txt /class/
+COPY --chmod=640 a.txt /m640
+COPY ["a.txt", "/json name"]
+WORKDIR /rel
+COPY a.txt here
+COPY a.txt .
+ADD a.txt /added

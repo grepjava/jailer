@@ -1,0 +1,22 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "WorkingDir": "/w"
+ },
+ "files": {
+  "abs": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "dots": "dir 755",
+  "dots/x.txt": "file 644 73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+  "w": "dir 755",
+  "w/many": "dir 755",
+  "w/many/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "w/many/b.txt": "file 644 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+  "w/rel": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "w/sub": "dir 755",
+  "w/sub/a.txt": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "w/sub2": "dir 755",
+  "w/sub2/x.txt": "file 644 73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac"
+ }
+}

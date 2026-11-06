@@ -1,0 +1,4 @@
+FROM scratch
+COPY a.txt /a
+SHELL ["/bin/csh", "-c"]
+CMD echo hi

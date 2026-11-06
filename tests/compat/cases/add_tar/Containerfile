@@ -1,0 +1,4 @@
+FROM scratch
+ADD t.tar /x/
+ADD t.tar /y
+COPY t.tar /z

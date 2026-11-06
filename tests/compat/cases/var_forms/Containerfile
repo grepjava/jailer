@@ -1,0 +1,5 @@
+FROM scratch
+ENV A=abc
+ENV B=${A#a}
+ENV C=${A%c}
+ENV D=${A/b/x}

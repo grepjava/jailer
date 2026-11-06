@@ -1,0 +1,8 @@
+FROM scratch AS broken
+COPY missing /x
+FROM scratch AS a
+COPY a.txt /a
+FROM scratch AS wanted
+COPY --from=a /a /copied
+FROM scratch
+COPY missing /y

@@ -699,24 +699,15 @@ async fn execute_instruction(
     match &sp.instruction {
         Instruction::Arg(args) => {
             for (name, default) in args {
-                // An ENV of the same name goes over an ARG, before or after.
-                let prefix = format!("{name}=");
-                if stage
-                    .config
-                    .config
-                    .env
-                    .iter()
-                    .any(|e| e.starts_with(&prefix))
-                {
-                    continue;
-                }
+                // Given a value, it goes over an ENV of its name for the
+                // steps after it, though the image keeps the ENV.
                 if let Some(val) = cli_build_args.get(name) {
                     vars.insert(name.clone(), val.clone());
                 } else if let Some(def) = default {
                     let expanded = expand_word(def, vars);
                     vars.insert(name.clone(), expanded);
                 } else if let Some(val) = global_args.get(name) {
-                    vars.entry(name.clone()).or_insert_with(|| val.clone());
+                    vars.insert(name.clone(), val.clone());
                 }
             }
             record_history(&mut stage.config, &sp.raw, true);
@@ -833,6 +824,13 @@ async fn execute_instruction(
         Instruction::Healthcheck(_) => {
             record_history(&mut stage.config, &sp.raw, true);
         }
+        Instruction::Maintainer(name) => {
+            stage
+                .config
+                .extra
+                .insert("author".to_owned(), serde_json::json!(name));
+            record_history(&mut stage.config, &sp.raw, true);
+        }
         Instruction::Onbuild(trigger) => {
             stage.config.config.on_build.push(trigger.clone());
             record_history(&mut stage.config, &sp.raw, true);
@@ -889,12 +887,7 @@ async fn execute_instruction(
             let argv = form.to_argv(&shell_of(&stage.config));
             let mut run_env = stage.config.config.env.clone();
             for (k, v) in vars.iter() {
-                if !run_env
-                    .iter()
-                    .any(|e| e.split('=').next() == Some(k.as_str()))
-                {
-                    run_env.push(format!("{k}={v}"));
-                }
+                set_env(&mut run_env, k, v);
             }
             let mut mounts =
                 RunMounts::prepare(env, completed_stages, vars, step_no, run_opts, sp.line).await?;
@@ -1826,6 +1819,11 @@ impl CopyExtras {
                 "line {line}: ADD --checksum needs exactly one http(s) source"
             )));
         }
+        if let Some(url) = urls.iter().find(|u| u.ends_with(".git")) {
+            return Err(Error::Build(format!(
+                "line {line}: ADD {url}: Git sources are not supported"
+            )));
+        }
         if urls.is_empty() && spec.heredocs.is_empty() {
             return Ok(Self {
                 _dir: None,
@@ -2057,7 +2055,8 @@ fn apply_copy(
                 Keep::No => false,
             })
             .collect();
-        if matches.is_empty() {
+        // A wildcard may match nothing, as for `COPY go.sum* ./`.
+        if matches.is_empty() && !pattern.contains(['*', '?', '[']) {
             return Err(Error::Build(format!(
                 "line {line_no}: source {src_pat:?} not found"
             )));

@@ -1,0 +1,30 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "P=one",
+   "Q=onex",
+   "R=two words",
+   "S=$A",
+   "T=$A",
+   "U=dflt",
+   "V=one",
+   "W=alt",
+   "X=",
+   "Y=dflt",
+   "Z=",
+   "OLD=value with spaces"
+  ],
+  "Labels": {
+   "a": "one",
+   "b c": "d e",
+   "e": "$A"
+  },
+  "WorkingDir": "/w/one/sub"
+ },
+ "files": {
+  "w": "dir 755",
+  "w/one": "dir 755",
+  "w/one/sub": "dir 755"
+ }
+}

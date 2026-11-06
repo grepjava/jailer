@@ -1,0 +1,8 @@
+FROM scratch AS base
+COPY a.txt /a
+ONBUILD COPY b.txt /b
+ONBUILD ENV TRIGGERED=1
+FROM base AS child
+LABEL child=1
+FROM child
+LABEL grandchild=1

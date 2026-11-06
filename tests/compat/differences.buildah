@@ -1,0 +1,45 @@
+# Differences from Buildah that are meant: CASE PATH, with why above it.
+# Recorded through podman, on FreeBSD.
+
+# `podman save --format oci-archive` drops fields of Docker's that OCI lacks.
+config /config/OnBuild
+shell_forms /config/Shell
+
+# An ARG given a value goes over an ENV of its name for what follows in
+# BuildKit, and jailer follows it. Buildah keeps the ENV.
+arg_scope /config/Env
+
+# Buildah leaves a WORKDIR out of the layer until something is written in it.
+config /files/app
+config_vars /files/data
+
+# BuildKit and jailer read `CMD` by the SHELL before it. Buildah does not.
+shell_forms /config/Cmd
+
+# With `# escape=`, `\` is an ordinary character in BuildKit and jailer. Buildah
+# still takes it away.
+escape_directive /config/Labels/p
+
+# Buildah keeps what `COPY --exclude` leaves out, with a `# syntax=` line.
+copy_labs /files/e/drop.md
+
+# For many files by wildcard to a path with no `/`, Buildah keeps the last.
+# jailer loses nothing: they go into a directory.
+copy_glob_many /files/glob
+
+# A wildcard matching nothing copies nothing, as `COPY go.sum* ./` relies on in
+# BuildKit. Buildah refuses it.
+copy_glob_no_match /build
+
+# Buildah reads `../a.txt` as `a.txt`. jailer says the path leaves the context.
+copy_parent_path /build
+
+# Buildah has no `${VAR-default}`, only the forms with `:`.
+variables /build
+
+# Buildah makes the directory without looking for the USER. jailer gives it to
+# the USER, whom it must find, and BuildKit refuses it too.
+workdir_unknown_user /build
+
+# Not expanded by jailer, and refused rather than left empty.
+var_forms /build

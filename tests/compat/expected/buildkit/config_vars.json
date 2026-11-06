@@ -1,0 +1,33 @@
+{
+ "config": {
+  "Cmd": [
+   "$P",
+   "${D}"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "D=/data"
+  ],
+  "ExposedPorts": {
+   "8080/tcp": {},
+   "8080/udp": {}
+  },
+  "Labels": {
+   "k2": "a\"b",
+   "k3": "a b",
+   "quoted key": "v"
+  },
+  "StopSignal": "SIGQUIT",
+  "User": "1000",
+  "Volumes": {
+   "/data": {},
+   "/vol": {}
+  },
+  "WorkingDir": "/data/x"
+ },
+ "files": {
+  "a": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "data": "dir 755",
+  "data/x": "dir 755"
+ }
+}

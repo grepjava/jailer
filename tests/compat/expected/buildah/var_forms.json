@@ -1,0 +1,16 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "A=abc",
+   "B=bc",
+   "C=ab",
+   "D=axc"
+  ],
+  "Labels": {
+   "io.buildah.version": "1.43.2"
+  },
+  "WorkingDir": "/"
+ },
+ "files": {}
+}

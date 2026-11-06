@@ -1,0 +1,8 @@
+FROM scratch
+WORKDIR /w
+COPY a.txt ./rel
+COPY a.txt sub/
+COPY dir sub2
+COPY a.txt b.txt ./many/
+COPY dir/. /dots/
+COPY ./a.txt /abs

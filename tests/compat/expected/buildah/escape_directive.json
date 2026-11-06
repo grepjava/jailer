@@ -1,0 +1,17 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "A=onetwo"
+  ],
+  "Labels": {
+   "io.buildah.version": "1.43.2",
+   "p": "C:dir"
+  },
+  "WorkingDir": "/"
+ },
+ "files": {
+  "x": "file 644 87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+  "y": "file 644 0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f"
+ }
+}

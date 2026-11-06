@@ -1,0 +1,16 @@
+FROM scratch
+ARG V=value
+COPY <<EOF /one
+hello $V
+EOF
+COPY <<"EOF" /two
+hello $V
+EOF
+COPY <<-EOF /three
+	indented
+	EOF
+COPY <<A <<B /dir/
+first
+A
+second
+B

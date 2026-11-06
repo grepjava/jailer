@@ -1,0 +1,5 @@
+FROM scratch AS base
+COPY a.txt /a
+CMD ["kept?"]
+FROM base
+ENTRYPOINT echo hi

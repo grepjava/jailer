@@ -1,0 +1,11 @@
+# escape=`
+FROM scratch
+COPY a.txt `
+     /x
+ENV A=one`
+two
+# a comment between
+LABEL p=C:\dir
+COPY b.txt `
+# comment in a continuation
+     /y

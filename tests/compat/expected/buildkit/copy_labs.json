@@ -1,0 +1,19 @@
+{
+ "config": {
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "WorkingDir": "/"
+ },
+ "files": {
+  "dotted": "dir 755",
+  "dotted/q": "dir 755",
+  "dotted/q/r.txt": "file 644 8e54b0ca18020275e4aef1ca0eb5e197e066c065c1864817652a8a39c55402cd",
+  "e": "dir 755",
+  "e/keep.txt": "file 644 19732980d68fbd00358a0a4d98246c960400b87e4fa2a2e155db98be2b42ed6c",
+  "kept": "dir 755",
+  "kept/p": "dir 755",
+  "kept/p/q": "dir 755",
+  "kept/p/q/r.txt": "file 644 8e54b0ca18020275e4aef1ca0eb5e197e066c065c1864817652a8a39c55402cd"
+ }
+}

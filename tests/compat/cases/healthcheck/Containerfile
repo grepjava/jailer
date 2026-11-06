@@ -1,0 +1,3 @@
+FROM scratch
+COPY a.txt /a
+HEALTHCHECK --interval=5s CMD /bin/true

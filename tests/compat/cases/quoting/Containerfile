@@ -1,0 +1,7 @@
+FROM scratch
+COPY a.txt /a
+ENV A="a b" B=c\ d C='e f' D="g'h" E='i"j' F=k"l m"n
+ENV G="multi \
+line" H=x
+LABEL one=1 \
+      two=2

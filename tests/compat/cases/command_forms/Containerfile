@@ -1,0 +1,9 @@
+FROM scratch AS a
+COPY a.txt /a
+CMD ["a", "b"
+FROM a AS b
+ENTRYPOINT []
+FROM b AS c
+CMD []
+FROM c
+CMD 'single quoted'

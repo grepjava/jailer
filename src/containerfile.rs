@@ -204,6 +204,7 @@ pub enum Instruction {
     Volume(Vec<String>),
     Stopsignal(String),
     Healthcheck(String),
+    Maintainer(String),
     Shell(Vec<String>),
     Onbuild(String),
 }
@@ -576,6 +577,11 @@ fn parse_from(
     line_no: usize,
     escape: char,
 ) -> Result<(Option<String>, String, Option<String>), Error> {
+    if let Some(form) = unknown_expansion(rest, escape) {
+        return Err(Error::Build(format!(
+            "line {line_no}: `{form}`: this form of expansion is not supported"
+        )));
+    }
     let tokens = tokenize_words(rest, escape);
     let mut idx = 0;
     let mut platform = None;
@@ -629,6 +635,36 @@ fn parse_arg(
         .collect())
 }
 
+/// The first `${...}` in `text` of a form that is not expanded, and would
+/// otherwise come out empty: `${A#x}`, `${A%x}`, `${A/x/y}` or `${A:?x}`.
+/// Single quotes and the escape character keep a `$` from expanding.
+fn unknown_expansion(text: &str, escape: char) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut single, mut double) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            c if c == escape && !single => i += 1,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '$' if !single && chars.get(i + 1) == Some(&'{') => {
+                let name = chars[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                    .count();
+                let after = &chars[i + 2 + name..];
+                if !matches!(after, ['}', ..] | [':', '-' | '+', ..] | ['-' | '+', ..]) {
+                    let end = after.iter().position(|c| *c == '}').map_or(0, |e| e + 1);
+                    return Some(chars[i..i + 2 + name + end].iter().collect());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_instruction(
     verb: &str,
     rest: &str,
@@ -636,6 +672,24 @@ fn parse_instruction(
     escape: char,
     heredocs: Vec<Heredoc>,
 ) -> Result<Instruction, Error> {
+    // `RUN`, `CMD` and `ENTRYPOINT` leave `$` to the shell.
+    if !matches!(
+        verb,
+        "RUN" | "CMD" | "ENTRYPOINT" | "HEALTHCHECK" | "SHELL" | "ONBUILD" | "MAINTAINER"
+    ) {
+        let bodies = heredocs
+            .iter()
+            .filter(|h| h.expand)
+            .map(|h| h.body.as_str());
+        if let Some(form) = std::iter::once(rest)
+            .chain(bodies)
+            .find_map(|t| unknown_expansion(t, escape))
+        {
+            return Err(Error::Build(format!(
+                "line {line_no}: `{form}`: this form of expansion is not supported"
+            )));
+        }
+    }
     if !heredocs.is_empty() && !matches!(verb, "RUN" | "COPY" | "ADD") {
         return Err(Error::Build(format!(
             "line {line_no}: here-documents are for RUN, COPY and ADD"
@@ -658,6 +712,7 @@ fn parse_instruction(
                 | "VOLUME"
                 | "STOPSIGNAL"
                 | "HEALTHCHECK"
+                | "MAINTAINER"
                 | "SHELL"
                 | "ONBUILD"
         )
@@ -684,14 +739,14 @@ fn parse_instruction(
         )?)),
         "RUN" => {
             let (opts, command) = parse_run_flags(rest, line_no, escape)?;
-            let form = run_heredocs(parse_command_form(command), heredocs, line_no)?;
+            let form = run_heredocs(parse_command_form(command, line_no)?, heredocs, line_no)?;
             Ok(Instruction::Run(form, opts))
         }
-        "CMD" => Ok(Instruction::Cmd(parse_command_form(rest))),
-        "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command_form(rest))),
+        "CMD" => Ok(Instruction::Cmd(parse_command_form(rest, line_no)?)),
+        "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command_form(rest, line_no)?)),
         "EXPOSE" => Ok(Instruction::Expose(tokenize_words(rest, escape))),
         "VOLUME" => {
-            if let Some(arr) = try_parse_json_array(rest) {
+            if let Some(arr) = try_parse_json_array(rest, line_no)? {
                 Ok(Instruction::Volume(arr))
             } else {
                 Ok(Instruction::Volume(tokenize_words(rest, escape)))
@@ -699,8 +754,9 @@ fn parse_instruction(
         }
         "STOPSIGNAL" => Ok(Instruction::Stopsignal(unquote_word(rest, escape))),
         "HEALTHCHECK" => Ok(Instruction::Healthcheck(rest.trim().to_owned())),
+        "MAINTAINER" => Ok(Instruction::Maintainer(rest.trim().to_owned())),
         "SHELL" => {
-            let arr = try_parse_json_array(rest).ok_or_else(|| {
+            let arr = try_parse_json_array(rest, line_no)?.ok_or_else(|| {
                 Error::Build(format!(
                     "line {line_no}: `SHELL` requires a JSON array (e.g. [\"/bin/sh\", \"-c\"])"
                 ))
@@ -968,20 +1024,32 @@ pub fn parse_size(v: &str) -> Option<u64> {
     num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
-fn parse_command_form(rest: &str) -> CommandForm {
-    if let Some(arr) = try_parse_json_array(rest) {
-        CommandForm::Exec(arr)
-    } else {
-        CommandForm::Shell(rest.trim().to_owned())
-    }
+fn parse_command_form(rest: &str, line_no: usize) -> Result<CommandForm, Error> {
+    Ok(match try_parse_json_array(rest, line_no)? {
+        Some(arr) => CommandForm::Exec(arr),
+        None => CommandForm::Shell(rest.trim().to_owned()),
+    })
 }
 
-fn try_parse_json_array(s: &str) -> Option<Vec<String>> {
+/// The strings of a JSON array, if `s` is one. Anything else is left to be
+/// read as words, but an array of more than strings is a mistake.
+fn try_parse_json_array(s: &str, line_no: usize) -> Result<Option<Vec<String>>, Error> {
     let s = s.trim();
-    if s.starts_with('[') && s.ends_with(']') {
-        serde_json::from_str::<Vec<String>>(s).ok()
-    } else {
-        None
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return Ok(None);
+    }
+    match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+        Err(_) => Ok(None),
+        Ok(items) => items
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(s) => Ok(s),
+                other => Err(Error::Build(format!(
+                    "line {line_no}: a JSON array here takes only strings, not {other}"
+                ))),
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
     }
 }
 
@@ -1057,7 +1125,8 @@ fn parse_copy(
         }
     }
 
-    let mut words = try_parse_json_array(rest).unwrap_or_else(|| tokenize_words(rest, escape));
+    let mut words =
+        try_parse_json_array(rest, line_no)?.unwrap_or_else(|| tokenize_words(rest, escape));
     // Words naming here-documents stand for the files `spec.heredocs` holds;
     // another word may begin with `<<`, as a quoted `"<<name"`.
     let mut docs: Vec<&str> = spec.heredocs.iter().map(|h| h.name.as_str()).collect();
@@ -1105,7 +1174,7 @@ fn parse_key_values(
     let tokens = tokenize_words(rest, escape);
     if tokens.first().is_some_and(|t| !t.contains('=')) {
         // Legacy `ENV KEY value with spaces` form
-        let Some((k, v)) = split_verb(rest) else {
+        let Some((k, v)) = split_verb(rest).filter(|(_, v)| !v.trim().is_empty()) else {
             return Err(Error::Build(format!(
                 "line {line_no}: `{what}` needs a key and value"
             )));
@@ -1478,6 +1547,28 @@ fn glob_class(p: &[char], c: char) -> Option<(bool, &[char])> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expansions_not_known_are_refused() {
+        for form in [
+            "${A#x}", "${A##x}", "${A%x}", "${A/x/y}", "${A:?x}", "${A?x}",
+        ] {
+            let err = Containerfile::parse(&format!("FROM scratch\nENV B={form}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(form), "{err}");
+        }
+        for ok in [
+            "${A}", "${A:-x}", "${A:+x}", "${A-x}", "${A+x}", "'${A#x}'", "\\${A#x}",
+        ] {
+            Containerfile::parse(&format!("FROM scratch\nENV B={ok}\n")).unwrap();
+        }
+        // A shell's to expand, or text in a here-document left as it is.
+        Containerfile::parse("FROM scratch\nRUN echo ${A#x}\nCMD echo ${A%x}\n").unwrap();
+        Containerfile::parse("FROM scratch\nCOPY <<'E' /f\n${A#x}\nE\n").unwrap();
+        assert!(Containerfile::parse("FROM scratch\nCOPY <<E /f\n${A#x}\nE\n").is_err());
+        assert!(Containerfile::parse("FROM x${A#y}\n").is_err());
+    }
+
     use super::*;
 
     #[test]

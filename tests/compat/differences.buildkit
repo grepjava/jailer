@@ -1,0 +1,15 @@
+# Differences from BuildKit that are meant: CASE PATH, with why above it.
+
+# Not kept in the image: Legion ignores it, so `jailer check` warns instead.
+healthcheck /config/Healthcheck
+
+# BuildKit reads `../a.txt` as `a.txt`. jailer says the path leaves the context.
+copy_parent_path /build
+
+# BuildKit copies each source over the last, keeping only one, for a destination
+# with no `/`. jailer loses nothing: they go into a directory, as with Buildah.
+copy_many_no_slash /files/file
+copy_glob_many /files/glob
+
+# Not expanded by jailer, and refused rather than left empty.
+var_forms /build
