@@ -61,6 +61,7 @@ Other FreeBSD tools, as their own documentation described them in November 2026:
 | `jailer push [source-image] <registry/repo:tag>` | Push an image to an OCI registry (Docker Hub, GHCR, Harbor, etc.) |
 | `jailer export [image] <output.tar>` | Export an offline OCI archive for `legion image load` |
 | `jailer check [image-or-dir]` | Validate a `Containerfile` and/or built image against Legion's runtime |
+| `jailer doctor [--json] [--for OPERATION,...]` | Check what this host can do, and how to fix what it can't, changing nothing |
 | `jailer manifest push <registry/repo:tag> <source>...` | Publish one name for several architectures (an OCI image index) |
 | `jailer manifest inspect <reference>` | Show the manifest or index a registry holds |
 | `jailer sign --key k.key <ref>` / `jailer verify --key k.pub <ref>` | Sign an image in a registry as cosign does, or check its signature |

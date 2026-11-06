@@ -468,6 +468,22 @@ pub enum Commands {
         target: String,
     },
 
+    /// Check what this host can do, changing nothing
+    Doctor {
+        /// Print the result as JSON, on standard output
+        #[arg(long)]
+        json: bool,
+
+        /// Only what these need [default: all of them]
+        #[arg(
+            long = "for",
+            value_enum,
+            value_delimiter = ',',
+            value_name = "OPERATION"
+        )]
+        operations: Vec<jailer::doctor::Operation>,
+    },
+
     /// Pull an image from an OCI registry into the local store
     Pull {
         /// Registry credentials (USER[:PASSWORD])
@@ -673,6 +689,16 @@ fn parse_ssh(specs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
 }
 
 /// Jails can only be created or entered by root; fail before pulling anything.
@@ -1575,6 +1601,41 @@ async fn run() -> Result<()> {
                 .or_else(|| img.references.first().map(String::as_str))
                 .unwrap_or(&image_ref);
             println!("Exported {} to {}", shown, out_path.display());
+            Ok(())
+        }
+
+        Commands::Doctor { json, operations } => {
+            use jailer::doctor;
+            if !cfg!(target_os = "freebsd") {
+                bail!("`jailer doctor` checks a FreeBSD host");
+            }
+            let sys = Shell::new();
+            let zfs_root = resolve_zfs_root(&cli, &sys);
+            let host = doctor::Host {
+                root: is_root(),
+                zfs_root: zfs_root.as_deref(),
+                subnet: jailer::net::check_subnet().map_err(|e| e.to_string()),
+            };
+            let wanted = if operations.is_empty() {
+                &doctor::Operation::ALL[..]
+            } else {
+                &operations[..]
+            };
+            let report = doctor::examine(&sys, &host, wanted);
+            if *json {
+                let result = serde_json::json!({
+                    "schema": jailer::record::SCHEMA,
+                    "passed": report.passed(),
+                    "operations": report.operations,
+                    "checks": report.checks,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", doctor::text(&report));
+            }
+            if !report.passed() {
+                std::process::exit(1);
+            }
             Ok(())
         }
 

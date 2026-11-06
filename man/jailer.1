@@ -806,6 +806,31 @@ and
 .Ql docker load .
 .Fl -name
 overrides the reference recorded in the archive.
+.It Nm doctor Oo Fl -json Oc Op Fl -for Ar operation Ns Op , Ns Ar ...
+Check what this host can do, changing nothing.
+Each
+.Ar operation
+is
+.Cm build ,
+.Cm run ,
+.Cm vnet ,
+.Cm limits ,
+.Cm mounts
+or
+.Cm linux ;
+without
+.Fl -for ,
+all of them.
+It prints whether each is ready, blocked or unknown, then each check with
+how to fix what is unmet and what that blocks.
+Unknown means a check could not be read, as when
+.Xr pf 4
+is not running.
+It exits non-zero unless everything asked about is ready.
+Run it as root: an ordinary user cannot read everything it checks.
+.Fl -json
+prints the result as JSON, with each check's stable
+.Ql id .
 .It Nm check Oo Fl -json Oc Op Ar target
 Check a directory's
 .Pa Containerfile ,

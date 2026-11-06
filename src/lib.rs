@@ -10,6 +10,7 @@ pub mod build;
 pub mod cache;
 pub mod check;
 pub mod containerfile;
+pub mod doctor;
 pub mod init;
 pub mod layer;
 pub mod net;

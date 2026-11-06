@@ -1960,3 +1960,84 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
         .collect();
     assert!(rest.is_empty(), "its pod stays: {rest:?}");
 }
+
+/// On the real host: `doctor` reads and changes nothing, and an ordinary
+/// user is told what they lack, not that pf is wrong.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn doctor_reports_on_the_host_and_changes_nothing() {
+    use std::os::unix::process::CommandExt;
+    if !live("doctor_reports_on_the_host_and_changes_nothing") {
+        return;
+    }
+    let host_state = || {
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program).args(args).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        [
+            run("kldstat", &[]),
+            run("sysctl", &["-n", "net.inet.ip.forwarding"]),
+            run("ifconfig", &["-l"]),
+            run("pfctl", &["-a", "jailer", "-sA"]),
+        ]
+    };
+    let doctor = |args: &[&str], uid: Option<u32>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
+        c.args(["--no-zfs", "doctor", "--json"]).args(args);
+        if let Some(uid) = uid {
+            c.uid(uid).gid(uid);
+        }
+        let out = c.output().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!("{e}: {}", String::from_utf8_lossy(&out.stderr));
+        });
+        (out.status.success(), json)
+    };
+    let check = |json: &serde_json::Value, id: &str| {
+        json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no {id}: {json}"))
+            .clone()
+    };
+
+    let before = host_state();
+    let (_, all) = doctor(&[], None);
+    assert_eq!(host_state(), before, "doctor changed the host");
+    for id in [
+        "root",
+        "racct",
+        "pf.anchors",
+        "forwarding",
+        "subnet",
+        "module.pf",
+        "module.if_bridge",
+        "module.if_epair",
+        "module.nullfs",
+        "module.tmpfs",
+        "module.linux64",
+    ] {
+        check(&all, id);
+    }
+    assert_eq!(check(&all, "root")["state"], "met");
+
+    // What a host running these tests must be fit for.
+    let (passed, some) = doctor(&["--for", "build,run,mounts"], None);
+    assert!(passed, "{some}");
+    assert_eq!(some["passed"], true);
+    assert!(
+        some["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "racct")
+    );
+
+    let (passed, nobody) = doctor(&["--for", "vnet"], Some(65534));
+    assert!(!passed, "{nobody}");
+    assert_eq!(check(&nobody, "root")["state"], "unmet");
+    assert_eq!(check(&nobody, "pf.anchors")["state"], "unknown", "{nobody}");
+}

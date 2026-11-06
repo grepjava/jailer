@@ -141,11 +141,12 @@ pub fn limit(sys: &dyn Sys, jail: &str, limits: &Limits) -> Result<(), Error> {
     if limits.is_empty() {
         return Ok(());
     }
-    if sys.sysctl_get("kern.racct.enable").ok().as_deref() != Some("1") {
-        return Err(Error::Runtime(
-            "resource limits need rctl: set kern.racct.enable=1 in /boot/loader.conf and reboot"
-                .to_owned(),
-        ));
+    let racct = legion_sys::check::racct(sys);
+    if racct.state != legion_sys::check::State::Met {
+        return Err(Error::Runtime(format!(
+            "resource limits need rctl: {}",
+            racct.remedy.unwrap_or(racct.detail)
+        )));
     }
     unlimit(sys, jail);
     add_rules(sys, jail, &limits.rules(jail), |r| sys.rctl_add(r))
