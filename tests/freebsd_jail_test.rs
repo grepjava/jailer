@@ -1646,7 +1646,7 @@ fn a_failing_stage_nothing_needs_does_not_run() {
     std::fs::write(
         ctx.join("Containerfile"),
         "FROM docker.io/freebsd/freebsd-runtime:15.1 AS unused\nRUN false\n\
-         FROM docker.io/freebsd/freebsd-runtime:15.1 AS wanted\nRUN : > /built\n",
+         FROM docker.io/freebsd/freebsd-runtime:15.1 AS wanted\nENV S=env\nARG S=arg\nRUN test \"$S\" = arg\n",
     )
     .unwrap();
     let build = |args: &[&str]| {
@@ -1670,4 +1670,90 @@ fn a_failing_stage_nothing_needs_does_not_run() {
         !out.status.success(),
         "the stage still fails when asked for"
     );
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn memory_limits_each_process_not_the_container() {
+    if !live("memory_limits_each_process_not_the_container") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let jailer = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_jailer"))
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .arg("--no-zfs")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let image = "docker.io/freebsd/freebsd-runtime:15.1";
+    assert!(jailer(&["pull", image]).status.success());
+    // A shell's string, doubled until it holds 8 << `n` bytes.
+    let grow =
+        |n: u32| format!("a=xxxxxxxx; i=0; while [ $i -lt {n} ]; do a=$a$a; i=$((i+1)); done");
+
+    // A failed assertion must not leave the container running.
+    struct Remove<'a>(&'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
+                .arg("--state-dir")
+                .arg(self.0.join("state"))
+                .args(["--no-zfs", "rm", "-f", "many"])
+                .output();
+        }
+    }
+    let _remove = Remove(tmp.path());
+
+    // Sixteen processes of about 16 MB, which doubling a string can take a
+    // few times over, each under the limit and all of them over it. Each
+    // shell stays: one ending in `sleep` would exec it and let its memory go.
+    const LIMIT: u64 = 128 << 20;
+    let many = format!(
+        "for p in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ({}; while :; do sleep 120; done) & done; wait",
+        grow(21)
+    );
+    let started = jailer(&[
+        "run", "-d", "--name", "many", "-m", "128m", image, "/bin/sh", "-c", &many,
+    ]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let id = String::from_utf8_lossy(&started.stdout).trim().to_owned();
+    let usage = |resource: &str| -> u64 {
+        let out = Command::new("rctl")
+            .args(["-u", &format!("jail:{id}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{resource}=")))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    let mut total = 0;
+    for _ in 0..60 {
+        total = usage("memoryuse");
+        if total > LIMIT {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(total > LIMIT, "the container reached only {total} bytes");
+    // Past the time rctl takes to act: over the limit, and all still there.
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    let (total, processes) = (usage("memoryuse"), usage("maxproc"));
+    assert!(total > LIMIT, "{total} bytes left");
+    assert!(processes >= 16, "{processes} processes left");
+    assert!(jailer(&["rm", "-f", "many"]).status.success());
+
+    // One process past the limit is killed.
+    let one = format!("{}; sleep 10; echo survived", grow(25));
+    let out = jailer(&["run", "-m", "64m", image, "/bin/sh", "-c", &one]);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
 }

@@ -30,3 +30,4 @@ test . freebsd_jail_test a_signal_to_exec_ends_its_command host shared 600
 test . freebsd_jail_test interrupted_builds_and_runs_leave_nothing host shared 600
 test . freebsd_jail_test another_users_state_directory_is_refused_by_name host shared 300
 test . freebsd_jail_test a_failing_stage_nothing_needs_does_not_run host shared 300
+test . freebsd_jail_test memory_limits_each_process_not_the_container host shared 300

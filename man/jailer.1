@@ -611,8 +611,9 @@ parameter, over the security defaults, e.g.
 Kill a process of the container whose resident memory goes past
 .Ar size
 (e.g.
-.Ql 512m ) ,
-as a Legion node does.
+.Ql 512m ) .
+Each process is held to it, not the container's total, which a Legion node
+also limits.
 .It Fl -cpus Ar n
 Hold the container to
 .Ar n

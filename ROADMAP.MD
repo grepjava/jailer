@@ -37,10 +37,10 @@ Do not treat these as features still needing implementation:
 | Area | Current boundary |
 |---|---|
 | Stage execution | Native builds execute only the stages the target needs, one at a time in file order. |
-| Containerfile syntax | Broad support, but `# syntax=` is ignored and `COPY --link` has no special behavior. |
+| Containerfile syntax | Broad support, tested against BuildKit and Buildah: see `docs/COMPATIBILITY.md`. |
 | Build platforms | Native builds target the host platform and reject foreign `FROM --platform` values. Publishing a multi-architecture index does not coordinate the builds. |
 | Registry cache | OCI transport with a Jailer-specific cache configuration format; not an interchangeable BuildKit cache. |
-| Memory limits | RCTL limits resident memory per process, rather than enforcing a total container-memory budget. Sharing `legion-jail` does not include Legion agent-side aggregate-memory enforcement. |
+| Memory limits | RCTL limits resident memory per process. Legion's agent also holds a container's total, which `jailer run` does not: decided, see `docs/LOCAL-AND-LEGION.md`. |
 | Image trust | Key-based signatures exist; SBOM/provenance attestations, keyless signing and transparency-log integration are absent from the reviewed interface. |
 | Runtime equivalence | Local jail execution shares runtime primitives, but does not reproduce the full Legion agent, probes, reconciliation or service lifecycle. |
 | Qualification | FreeBSD live tests are compiled only on FreeBSD and run through `scripts/qualify`, on amd64 so far. The checkout has no `.github` workflow directory. |
@@ -307,7 +307,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 |---|---|---|
 | 1. Honest tests | P0: required live runs, a recorded qualification script, ZFS and plain-directory storage, the uncovered paths | Nothing; hosts for the full matrix |
 | 2. Stage planning | P1.1 | Nothing; runs alongside phase 1 |
-| 3. Stated guarantees | P1.2, P1.3 | Phase 2 for target semantics |
+| 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output | Phase 1 |
 | 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
 | 6. Supply chain and automation | P2.1, P2.2, P2.3 | Phases 1 and 4; a shared diagnostics crate |

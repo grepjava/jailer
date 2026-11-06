@@ -121,7 +121,7 @@ fail with a clear message.
 - [x] **Legion's `PodNetwork`** makes `jailer0` and the pods' epairs
   (Legion v0.1.4), IPv4 only and with a 1500-byte MTU.
 - [x] **Resource limits**: `-m`, `--cpus`, `--pids-limit` for `run` and
-  `build`, as rctl rules (memory per process, as on a Legion node).
+  `build`, as rctl rules (memory per process; see `docs/LOCAL-AND-LEGION.md`).
 - [x] **`--cpuset-cpus`** for `run` and `build`, set by legion-jail on
   the jail before anything runs in it (Legion v0.1.3).
 - [x] **`build --label` and `--timestamp`** (or `SOURCE_DATE_EPOCH`).
