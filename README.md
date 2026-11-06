@@ -32,6 +32,7 @@ Legion pulls OCI images, stores their layers on ZFS, and runs containers as jail
   - Verifies `ENTRYPOINT` / `CMD` exist and are executable inside the image rootfs along `PATH`.
   - Validates `STOPSIGNAL` and image platform (`freebsd/amd64`, `freebsd/arm64`).
   - Warns on `Containerfile` settings Legion ignores (`HEALTHCHECK`) and uncleaned `pkg` caches (`/var/cache/pkg`, `/var/db/pkg/repos`).
+- **Release records:** `--record FILE` follows one image through build, push, signing and export in one JSON file, with the digest to deploy, and refuses a step on another image or a moved tag ([format](docs/RELEASE-RECORD.md)).
 - **Offline archives for `legion image load`:** `jailer export app.tar` writes an `oci-archive` tarball annotated with `org.opencontainers.image.ref.name`, ready for `legion image load app.tar --zfs-root zroot/legion`.
 
 ## Compared with other tools

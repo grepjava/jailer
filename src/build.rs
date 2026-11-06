@@ -76,6 +76,8 @@ pub struct BuildOptions {
 pub struct BuildResult {
     pub image: Image,
     pub report: CheckReport,
+    /// The images it was built from, as they resolved. The native builder's.
+    pub bases: Vec<crate::record::Base>,
 }
 
 struct BuiltStage {
@@ -161,7 +163,11 @@ pub async fn build(
                 "Legion compatibility check reported errors".to_owned(),
             ));
         }
-        return Ok(BuildResult { image, report });
+        return Ok(BuildResult {
+            image,
+            report,
+            bases: Vec::new(),
+        });
     }
 
     let ignore = IgnoreMatcher::from_context_dir(&opts.context_dir)?;
@@ -218,6 +224,7 @@ pub async fn build(
     )
     .await?;
     let used = std::sync::Mutex::new(Vec::new());
+    let bases = std::sync::Mutex::new(Vec::new());
     let env = BuildEnv {
         store,
         pin: &pin,
@@ -229,6 +236,7 @@ pub async fn build(
         tmp_dir: build_tmp.path(),
         imported: &imported,
         used: &used,
+        bases: &bases,
     };
     let mut completed_stages: Vec<BuiltStage> = Vec::new();
     // With a ZFS store, stages are clones rather than copies: of the base
@@ -323,6 +331,7 @@ pub async fn build(
         } else {
             println!("Step 0/{}: FROM {base_ref}", stage_def.instructions.len());
             let base_img = pinned_base(store, &pin, opts, &base_ref).await?;
+            env.base(&base_ref, &base_img);
             store.prepare_rootfs(&base_img, &stage_root, dataset.as_deref())?;
             let mut cfg = base_img.config.clone();
             if cfg.os.is_empty() {
@@ -452,7 +461,12 @@ pub async fn build(
         crate::store::trim_cache(store, max).await?;
     }
 
-    Ok(BuildResult { image, report })
+    let bases = bases.into_inner().unwrap_or_else(|e| e.into_inner());
+    Ok(BuildResult {
+        image,
+        report,
+        bases,
+    })
 }
 
 /// Removes a build's stages, and with a ZFS store their datasets: the
@@ -498,6 +512,21 @@ struct BuildEnv<'a> {
     imported: &'a crate::cache::Imported,
     /// This build's `RUN` steps by cache key, for `--cache-to`.
     used: &'a std::sync::Mutex<Vec<(String, CachedStep)>>,
+    /// The images this build took anything from.
+    bases: &'a std::sync::Mutex<Vec<crate::record::Base>>,
+}
+
+impl BuildEnv<'_> {
+    fn base(&self, reference: &str, image: &Image) {
+        self.bases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(crate::record::Base {
+                reference: reference.to_owned(),
+                config: image.id.clone(),
+                manifest: image.digest.clone(),
+            });
+    }
 }
 
 /// Extracts the image `name` (pulled if missing, pinned for the build) at
@@ -530,6 +559,7 @@ async fn extract_image(
         }
     };
     store.prepare_rootfs(&image, at, None)?;
+    env.base(name, &image);
     Ok(image)
 }
 

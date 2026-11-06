@@ -121,6 +121,7 @@ overwrites an existing
 .Op Fl -secret Cm id Ns = Ns Ar id , Ns Cm src Ns = Ns Ar file
 .Op Fl -ssh Ar id Ns Op = Ns Ar socket
 .Op Fl -sysv Cm msg , Ns Cm sem , Ns Cm shm
+.Op Fl -record Ar file
 .Op Fl -target Ar stage
 .Op Fl -timestamp Ar seconds
 .Op Ar context
@@ -393,6 +394,21 @@ jailer builds only for the host's platform, and refuses any other.
 fails the build when the compatibility check reports an error.
 .Fl -target
 stops at the named stage, which is the one checked.
+.Fl -record
+writes a release record to
+.Ar file :
+JSON naming the image's config and manifest digests, the digest of the
+Containerfile and of the context, and the images it was built from.
+.Nm push ,
+.Nm manifest push ,
+.Nm sign ,
+.Nm verify
+and
+.Nm export
+add to it with
+.Fl -record ,
+and refuse another image, or a digest it does not name, as a moved tag's.
+Secrets, build arguments and credentials stay out of it.
 .Fl -squash
 flattens the image, its base included, into one layer.
 Layers keep file flags
@@ -670,6 +686,7 @@ mounting linprocfs, linsysfs, fdescfs and
 .Nm push
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -record Ar file
 .Op Fl -sign-key Ar path
 .Op Ar source
 .Ar target
@@ -682,11 +699,15 @@ by default the current project's image, to the registry reference
 then signs it, as
 .Nm sign
 does.
+.Fl -record
+adds to a release record: see
+.Nm build .
 .It Xo
 .Nm sign
 .Fl -key Ar path
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -record Ar file
 .Ar reference
 .Xc
 Sign the manifest or index a registry holds for
@@ -708,6 +729,7 @@ needs
 .Fl -key Ar path
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -record Ar file
 .Ar reference
 .Xc
 Check that the image
@@ -730,6 +752,7 @@ turns them into cosign's own key format.
 .Nm export
 .Op Fl o Ar path
 .Op Fl -name Ar ref
+.Op Fl -record Ar file
 .Op Ar image
 .Op Ar output.tar
 .Xc
@@ -743,7 +766,7 @@ and
 .Ql docker load .
 .Fl -name
 overrides the reference recorded in the archive.
-.It Nm check Op Ar target
+.It Nm check Oo Fl -json Oc Op Ar target
 Check a directory's
 .Pa Containerfile ,
 a local image reference, or by default the current directory's
@@ -751,6 +774,8 @@ a local image reference, or by default the current directory's
 and built image against Legion's runtime:
 the image user, an executable entrypoint, the stop signal and the
 platform.
+.Fl -json
+prints the result as JSON, with each finding's severity and code.
 .It Xo
 .Nm pull
 .Op Fl -linux
@@ -765,6 +790,7 @@ accepts a Linux image when the registry offers no FreeBSD one.
 .Nm manifest push
 .Op Fl -authfile Ar path
 .Op Fl -creds Ar user Ns Op : Ns Ar password
+.Op Fl -record Ar file
 .Op Fl -sign-key Ar path
 .Ar target
 .Ar source ...

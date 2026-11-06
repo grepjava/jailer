@@ -11,6 +11,7 @@ use jailer::check::{CheckReport, Severity, check_containerfile};
 use jailer::containerfile::Containerfile;
 use jailer::init::{InitOptions, Template, detect_app_name};
 use jailer::layer::Compression;
+use jailer::record::Record;
 use jailer::registry::Client;
 use jailer::runtime::{Config, JailRuntime};
 use jailer::store::Store;
@@ -92,6 +93,10 @@ pub enum Commands {
         /// Target build stage to stop at
         #[arg(long, value_name = "STAGE")]
         target: Option<String>,
+
+        /// Write a release record of this build (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
 
         /// Build backend (`native` or `buildah`)
         #[arg(long, value_enum, default_value_t = BuildBackend::Native)]
@@ -274,6 +279,10 @@ pub enum Commands {
         #[arg(long = "sign-key", value_name = "PATH")]
         sign_key: Option<PathBuf>,
 
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
         /// `<target-reference>` (pushes current project's image) or `<source-image> <target-reference>`
         #[arg(required = true, num_args = 1..=2)]
         refs: Vec<String>,
@@ -297,6 +306,10 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         authfile: Option<PathBuf>,
 
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
         /// The image, e.g. ghcr.io/me/app:1.0
         reference: String,
     },
@@ -314,6 +327,10 @@ pub enum Commands {
         /// Path to Docker/Podman auth.json file
         #[arg(long, value_name = "PATH")]
         authfile: Option<PathBuf>,
+
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
 
         /// The image, e.g. ghcr.io/me/app:1.0
         reference: String,
@@ -333,6 +350,10 @@ pub enum Commands {
         #[arg(long, value_name = "REF")]
         name: Option<String>,
 
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
         /// `<output.tar>` (exports current project's image) or `<image> [output.tar]`
         #[arg(num_args = 1..=2)]
         args: Vec<String>,
@@ -340,6 +361,10 @@ pub enum Commands {
 
     /// Check a Containerfile or built image for Legion compatibility
     Check {
+        /// Print the result as JSON, on standard output
+        #[arg(long)]
+        json: bool,
+
         /// Image reference or directory containing a Containerfile [default: .]
         #[arg(default_value = ".")]
         target: String,
@@ -587,6 +612,10 @@ pub enum ManifestCommand {
         #[arg(long = "sign-key", value_name = "PATH")]
         sign_key: Option<PathBuf>,
 
+        /// Add to this release record (see docs/RELEASE-RECORD.md)
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
+
         /// Registry reference to push the index to (e.g. ghcr.io/me/app:1.0)
         target: String,
 
@@ -649,6 +678,26 @@ pub enum NetworkArg {
     Host,
     Bridge,
     None,
+}
+
+/// `r` by `digest`: what a tag named, for good.
+fn pinned(r: &Reference, digest: &str) -> String {
+    Reference {
+        tag: None,
+        digest: Some(digest.to_owned()),
+        ..r.clone()
+    }
+    .to_string()
+}
+
+/// Notes a signature of `digest`, pushed for `r`, in the record, if any.
+fn signed_in(record: &Option<PathBuf>, r: &Reference, digest: &str) -> Result<()> {
+    if let Some(path) = record {
+        let mut rec = Record::open(path)?;
+        rec.signed(digest, jailer::sign::signature_ref(r, digest).to_string())?;
+        rec.save(path)?;
+    }
+    Ok(())
 }
 
 /// Signs `digest`, just pushed to `r`, with the key at `path`.
@@ -909,8 +958,12 @@ async fn run() -> Result<()> {
             cache_to,
             creds,
             authfile,
+            record,
             context,
         } => {
+            if record.is_some() && *backend == BuildBackend::Buildah {
+                bail!("--record: not supported with --backend buildah");
+            }
             let (_, store, runtime) = open_context(&cli, false)?;
             let tag = match tag {
                 Some(t) => t.clone(),
@@ -1008,6 +1061,17 @@ async fn run() -> Result<()> {
             };
 
             print_report(&res.report);
+            if let Some(path) = record {
+                let ignore = jailer::containerfile::IgnoreMatcher::from_context_dir(context)?;
+                let containerfile = file
+                    .clone()
+                    .unwrap_or_else(|| context.join("Containerfile"));
+                let source = jailer::record::Source {
+                    containerfile: jailer::record::file_digest(&containerfile)?,
+                    context: jailer::record::context_digest(context, &ignore)?,
+                };
+                Record::built(&res.image, source, res.bases.clone()).save(path)?;
+            }
             // The image may carry other names too, of builds that gave the
             // same config.
             let name = Reference::parse_local_tag(&tag)?;
@@ -1019,6 +1083,7 @@ async fn run() -> Result<()> {
             creds,
             authfile,
             sign_key,
+            record,
             refs,
         } => {
             let (_, store, _) = open_context(&cli, true)?;
@@ -1038,12 +1103,29 @@ async fn run() -> Result<()> {
             let target_ref = Reference::parse(&target_str)?;
             let resolved_creds =
                 resolve_credentials(&target_ref.registry, creds.as_deref(), authfile.as_deref())?;
+            if let (Some(path), Some(image)) = (record, store.find(&source_image)?) {
+                Record::open(path)?.check_image(&image)?;
+            }
             let digest = store
                 .push(&source_image, &target_ref, resolved_creds.as_ref())
                 .await?;
             println!("Pushed {} ({digest})", target_ref);
+            if let Some(path) = record {
+                let image = store
+                    .find(&source_image)?
+                    .ok_or_else(|| anyhow::anyhow!("{source_image}: no longer here"))?;
+                let mut r = Record::open(path)?;
+                r.pushed(
+                    &image,
+                    target_ref.to_string(),
+                    &digest,
+                    pinned(&target_ref, &digest),
+                )?;
+                r.save(path)?;
+            }
             if let Some(path) = sign_key {
                 sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
             }
             Ok(())
         }
@@ -1052,6 +1134,7 @@ async fn run() -> Result<()> {
             creds,
             authfile,
             sign_key,
+            record,
             target,
             sources,
         }) => {
@@ -1063,8 +1146,23 @@ async fn run() -> Result<()> {
                 .push_index(&target_ref, sources, resolved_creds.as_ref())
                 .await?;
             println!("Pushed {target_ref} ({digest})");
+            if let Some(path) = record {
+                let (_, doc) = store
+                    .client()
+                    .document(&target_ref, &digest, resolved_creds.as_ref())
+                    .await?;
+                let mut r = Record::open(path)?;
+                r.pushed_index(
+                    target_ref.to_string(),
+                    &digest,
+                    pinned(&target_ref, &digest),
+                    jailer::record::platforms_of(&serde_json::to_value(&doc)?),
+                )?;
+                r.save(path)?;
+            }
             if let Some(path) = sign_key {
                 sign_pushed(&store, path, &target_ref, &digest, resolved_creds.as_ref()).await?;
+                signed_in(record, &target_ref, &digest)?;
             }
             Ok(())
         }
@@ -1073,6 +1171,7 @@ async fn run() -> Result<()> {
             key,
             creds,
             authfile,
+            record,
             reference,
         } => {
             let (_, store, _) = open_context(&cli, true)?;
@@ -1083,6 +1182,7 @@ async fn run() -> Result<()> {
                 .document(&r, r.target(), creds.as_ref())
                 .await?;
             sign_pushed(&store, key, &r, &digest, creds.as_ref()).await?;
+            signed_in(record, &r, &digest)?;
             Ok(())
         }
 
@@ -1090,13 +1190,23 @@ async fn run() -> Result<()> {
             key,
             creds,
             authfile,
+            record,
             reference,
         } => {
             let (_, store, _) = open_context(&cli, true)?;
             let r = Reference::parse(reference)?;
             let creds = resolve_credentials(&r.registry, creds.as_deref(), authfile.as_deref())?;
-            let key = jailer::sign::verifying_key(&jailer::sign::read_key(key)?)?;
-            let digest = jailer::sign::verify(store.client(), &r, &key, creds.as_ref()).await?;
+            let public = jailer::sign::verifying_key(&jailer::sign::read_key(key)?)?;
+            let digest = jailer::sign::verify(store.client(), &r, &public, creds.as_ref()).await?;
+            if let Some(path) = record {
+                let mut rec = Record::open(path)?;
+                rec.verified(
+                    &digest,
+                    pinned(&r, &digest),
+                    jailer::record::file_digest(key)?,
+                )?;
+                rec.save(path)?;
+            }
             println!("{r} ({digest}) is signed by the key");
             Ok(())
         }
@@ -1142,7 +1252,12 @@ async fn run() -> Result<()> {
             Ok(())
         }
 
-        Commands::Export { output, name, args } => {
+        Commands::Export {
+            output,
+            name,
+            record,
+            args,
+        } => {
             let (_, store, _) = open_context(&cli, true)?;
             let (image_ref, out_path) = match (output, args.as_slice()) {
                 (Some(out), [img]) => (img.clone(), out.clone()),
@@ -1168,7 +1283,15 @@ async fn run() -> Result<()> {
                     .find(&image_ref)?
                     .and_then(|img| name_given(&img.references, &image_ref)),
             };
+            if let (Some(path), Some(image)) = (record, store.find(&image_ref)?) {
+                Record::open(path)?.check_image(&image)?;
+            }
             let img = store.export(&image_ref, &out_path, name.as_deref()).await?;
+            if let Some(path) = record {
+                let mut r = Record::open(path)?;
+                r.exported(&img, &out_path)?;
+                r.save(path)?;
+            }
             let shown = name
                 .as_deref()
                 .or_else(|| img.references.first().map(String::as_str))
@@ -1177,7 +1300,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
 
-        Commands::Check { target } => {
+        Commands::Check { json, target } => {
             let mut report = CheckReport::default();
             let path = Path::new(target);
             let cf_candidate = if path.is_dir() {
@@ -1224,6 +1347,30 @@ async fn run() -> Result<()> {
                 bail!("no Containerfile or local image found for {target:?}");
             }
 
+            if *json {
+                let findings: Vec<_> = report
+                    .findings
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "severity": f.severity.as_str(),
+                            "code": f.code,
+                            "message": f.message,
+                        })
+                    })
+                    .collect();
+                let result = serde_json::json!({
+                    "schema": jailer::record::SCHEMA,
+                    "target": target,
+                    "passed": !report.has_errors(),
+                    "findings": findings,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if report.has_errors() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             print_report(&report);
             if report.has_errors() {
                 bail!("Legion compatibility check failed");

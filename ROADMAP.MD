@@ -308,7 +308,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | 1. Honest tests | P0: required live runs, a recorded qualification script, ZFS and plain-directory storage, the uncovered paths | Nothing; hosts for the full matrix |
 | 2. Stage planning | P1.1 | Nothing; runs alongside phase 1 |
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
-| 4. Image handoff | P1.4's Jailer side, with structured `check` output | Phase 1 |
+| 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
 | 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
 | 6. Supply chain and automation | P2.1, P2.2, P2.3 | Phases 1 and 4; a shared diagnostics crate |
 | 7. Parallel stages | P3 | Phases 1 and 2 |

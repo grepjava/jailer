@@ -18,6 +18,16 @@ pub enum Severity {
     Error,
 }
 
+impl Severity {
+    /// As `check --json` gives it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub severity: Severity,

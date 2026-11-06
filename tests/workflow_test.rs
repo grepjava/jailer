@@ -1658,3 +1658,217 @@ async fn a_build_takes_only_the_stages_its_target_needs() {
         .to_string();
     assert!(err.contains("\"typo\" not found"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_record_follows_one_image_and_refuses_another() {
+    use std::process::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, _registry) = start_mock_registry().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    std::fs::write(ctx.join("f"), "one\n").unwrap();
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM scratch\nARG TOKEN\nCOPY f /f\n",
+    )
+    .unwrap();
+    let record = tmp.path().join("release.json");
+    let rec = record.to_str().unwrap().to_owned();
+    let jailer = |args: &[&str]| {
+        let host = host.clone();
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        let state = tmp.path().join("state");
+        async move {
+            tokio::task::spawn_blocking(move || {
+                Command::new(env!("CARGO_BIN_EXE_jailer"))
+                    .args(["--no-zfs", "--plain-http", &host, "--state-dir"])
+                    .arg(state)
+                    .args(args)
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let ok = |out: std::process::Output| {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    let read = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap()
+    };
+    let prefix = tmp.path().join("key");
+    ok(jailer(&["key", "generate", prefix.to_str().unwrap()]).await);
+    let (private, public) = (
+        prefix.with_extension("key").to_str().unwrap().to_owned(),
+        prefix.with_extension("pub").to_str().unwrap().to_owned(),
+    );
+    let context = ctx.to_str().unwrap().to_owned();
+    let target = format!("{host}/app:1");
+
+    ok(jailer(&[
+        "build",
+        "-t",
+        "app:1",
+        "--record",
+        &rec,
+        "--build-arg",
+        "TOKEN=hunter2",
+        &context,
+    ])
+    .await);
+    assert!(
+        !std::fs::read_to_string(&record)
+            .unwrap()
+            .contains("hunter2"),
+        "a build argument's value stays out of the record"
+    );
+    ok(jailer(&[
+        "push",
+        "--record",
+        &rec,
+        "--sign-key",
+        &private,
+        "app:1",
+        &target,
+    ])
+    .await);
+    ok(jailer(&["verify", "--record", &rec, "--key", &public, &target]).await);
+    let archive = tmp.path().join("app.tar");
+    let archive = archive.to_str().unwrap();
+    ok(jailer(&["export", "--record", &rec, "app:1", archive]).await);
+    let index = format!("{host}/app:index");
+    ok(jailer(&["manifest", "push", "--record", &rec, &index, "app:1"]).await);
+
+    let r = read();
+    let manifest = r["image"]["manifest"].as_str().unwrap().to_owned();
+    assert_ne!(manifest, r["image"]["config"].as_str().unwrap());
+    assert!(
+        r["source"]["context"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let published = &r["published"][0];
+    assert_eq!(published["digest"], manifest.as_str());
+    assert_eq!(published["pinned"], format!("{host}/app@{manifest}"));
+    assert!(published["signature"].as_str().unwrap().contains(".sig"));
+    assert_eq!(r["verified"][0]["digest"], manifest.as_str());
+    assert_eq!(r["archives"][0]["manifest"], manifest.as_str());
+    // The index has a digest of its own, and maps its platform to the image.
+    let by_index = &r["published"][1];
+    assert_ne!(by_index["digest"], manifest.as_str());
+    let platforms = by_index["platforms"].as_object().unwrap();
+    assert_eq!(platforms.len(), 1);
+    assert_eq!(platforms.values().next().unwrap(), manifest.as_str());
+
+    // The archive names the same manifest.
+    let mut tar = tar::Archive::new(std::fs::File::open(archive).unwrap());
+    let mut in_archive = None;
+    for entry in tar.entries().unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().unwrap().to_str() == Some("index.json") {
+            let index: serde_json::Value = serde_json::from_reader(entry).unwrap();
+            in_archive = index["manifests"][0]["digest"].as_str().map(str::to_owned);
+        }
+    }
+    assert_eq!(in_archive.as_deref(), Some(manifest.as_str()));
+
+    // The tag moves to another image, signed by the same key.
+    std::fs::write(ctx.join("f"), "two\n").unwrap();
+    ok(jailer(&["build", "-t", "app:2", &context]).await);
+    let before = std::fs::read(&record).unwrap();
+    let refused = jailer(&["push", "--record", &rec, "app:2", &target]).await;
+    assert!(!refused.status.success(), "another image, into this record");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("the record is of image"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Refused before anything was sent: the tag is where it was.
+    ok(jailer(&["verify", "--record", &rec, "--key", &public, &target]).await);
+    ok(jailer(&["push", "--sign-key", &private, "app:2", &target]).await);
+    let moved = jailer(&["verify", "--record", &rec, "--key", &public, &target]).await;
+    assert!(!moved.status.success(), "a moved tag is not the record's");
+    assert!(
+        String::from_utf8_lossy(&moved.stderr).contains("has moved"),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+
+    // What was recorded can still be had, whatever the tag says now.
+    let pinned = r["published"][0]["pinned"].as_str().unwrap();
+    ok(jailer(&["verify", "--record", &rec, "--key", &public, pinned]).await);
+    let pulled = ok(jailer(&["pull", pinned]).await);
+    let config = r["image"]["config"].as_str().unwrap();
+    assert!(
+        String::from_utf8_lossy(&pulled.stdout).contains(config),
+        "{}",
+        String::from_utf8_lossy(&pulled.stdout)
+    );
+
+    // A build names the images it took anything from, as they resolved.
+    std::fs::write(
+        ctx.join("Containerfile"),
+        "FROM app:1 AS base\nFROM scratch\nCOPY --from=base /f /g\nCOPY --from=app:2 /f /h\n",
+    )
+    .unwrap();
+    let derived = tmp.path().join("derived.json");
+    let derived_path = derived.to_str().unwrap();
+    ok(jailer(&[
+        "build",
+        "-t",
+        "derived:1",
+        "--record",
+        derived_path,
+        &context,
+    ])
+    .await);
+    let d: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&derived).unwrap()).unwrap();
+    let bases = d["bases"].as_array().unwrap();
+    assert_eq!(bases.len(), 2, "{bases:?}");
+    assert!(bases.iter().any(|b| b["manifest"] == manifest.as_str()));
+    assert!(
+        bases
+            .iter()
+            .all(|b| b["config"].as_str().unwrap().starts_with("sha256:"))
+    );
+}
+
+#[test]
+fn check_can_answer_in_json() {
+    use std::process::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let cf = tmp.path().join("Containerfile");
+    std::fs::write(
+        &cf,
+        "FROM scratch\nHEALTHCHECK CMD /bin/true\nSTOPSIGNAL NOPE\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
+        .args(["--no-zfs", "--state-dir"])
+        .arg(tmp.path().join("state"))
+        .args(["check", "--json"])
+        .arg(&cf)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["passed"], false);
+    let codes: Vec<(&str, &str)> = result["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["code"].as_str().unwrap(), f["severity"].as_str().unwrap()))
+        .collect();
+    assert!(codes.contains(&("LEGION001", "warning")), "{codes:?}");
+    assert!(codes.contains(&("LEGION003", "error")), "{codes:?}");
+}

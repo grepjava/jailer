@@ -12,6 +12,7 @@ pub mod containerfile;
 pub mod init;
 pub mod layer;
 pub mod net;
+pub mod record;
 pub mod runtime;
 pub mod sign;
 pub mod store;
