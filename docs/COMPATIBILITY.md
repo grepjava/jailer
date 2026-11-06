@@ -81,6 +81,20 @@ steps wait, as on a download. Steps' output then interleaves, each `Step` line
 marked with its stage, and if one stage fails the others stop with it. A
 `sharing=locked` cache mount is held by one stage at a time.
 
+`--jobs` overlaps steps' waiting and running, not jailer's own work: hashing and
+compressing a step's layer stay on one thread, so it helps less the more a build
+is jailer's own time. Two stages installing packages (`git-tiny` and `python311`)
+into `freebsd-runtime:15.1`, then a stage copying from both, on 2 CPUs and 2 GB
+with a release build, twice each:
+
+| | Time | jailer's CPU time | Peak memory |
+|---|---|---|---|
+| `--jobs 1` | 71.1 s, 69.5 s | 51 s | 278 MiB |
+| `--jobs 2` | 57.1 s, 55.1 s | 51 s | 275 MiB at most |
+
+Both give the same image ID. This is one build on one small host, not a general
+figure.
+
 `BUILDPLATFORM`, `TARGETPLATFORM`, `BUILDOS`, `TARGETOS`, `BUILDARCH` and
 `TARGETARCH` are set, all to this host. A foreign `FROM --platform` is refused.
 

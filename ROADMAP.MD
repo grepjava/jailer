@@ -311,7 +311,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
 | 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
 | 6. Supply chain and automation | P2.1 and P2.2 done. P2.3's host diagnostics wait on the shared crate | A shared diagnostics crate |
-| 7. Parallel stages | P3: `--jobs`, default 1, in waves of what is ready | Phases 1 and 2 |
+| 7. Parallel stages | P3: done with `--jobs`, default 1, in waves of what is ready. Measured in `docs/COMPATIBILITY.md`: jailer's hashing and compression stay on one thread, which limits the gain | Phases 1 and 2 |
 
 Use Build → Sign → Push → Deploy → Drain → Migrate → Recover as the shared
 engineering contract. Test each boundary while retaining clear ownership:
