@@ -79,13 +79,18 @@ it, and `scripts/jailer.qualify` lists the jail tests, which `cargo test` now
 reports as ignored.
 
 The paths that had no live coverage now have tests: the address kept after a
-failed teardown and `login` refusing a token realm that is not https both pass
-on the shared host. The default `(self)` publish opens a port on every address,
-so its test is `isolated` in the manifest and has yet to run on a disposable host.
+failed teardown, `login` refusing a token realm that is not https, and the
+default `(self)` publish, which opens a port on every address and so runs only on
+disposable hosts.
 
-Storage: seven tests also run on ZFS, the main workflow already did, and each of
-those fails if a stage or container dataset is left behind. The rest use plain
-directories.
+Done for amd64: all 28 steps pass on a disposable VM from Legion's `scripts/lab`
+(`--profile isolated`), and all but the `(self)` test on the shared host. Results
+name the host, its release and architecture, the VM and its image, the Legion
+version and the storage. A VM is not real hardware. arm64 waits on an arm64 host.
+
+Storage: eight tests also run on ZFS, the main workflow already did, and each of
+those eight fails if a stage or container dataset is left behind. The rest use
+plain directories.
 
 ### Shared Jailer–Legion qualification
 
@@ -310,7 +315,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 
 | Phase | Work | Waits on |
 |---|---|---|
-| 1. Honest tests | P0: required live runs, a recorded qualification script, ZFS and plain-directory storage, the uncovered paths | Nothing; hosts for the full matrix |
+| 1. Honest tests | P0: done for amd64 on disposable VMs, with ZFS and plain-directory storage and the uncovered paths. arm64 remains | An arm64 host |
 | 2. Stage planning | P1.1 | Nothing; runs alongside phase 1 |
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
