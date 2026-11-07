@@ -115,7 +115,10 @@ fn subnet(result: &Result<(), String>) -> Finding {
             "subnet",
             State::Unmet,
             e.clone(),
-            Some("remove that network, or use --network none".to_owned()),
+            Some(
+                "remove that network, choose another with --pod-subnet, or use --network none"
+                    .to_owned(),
+            ),
         ),
     }
 }

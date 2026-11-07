@@ -1,8 +1,9 @@
 //! Networking for `jailer run --vnet`, as a Legion node gives a pod, with
 //! Legion's own `PodNetwork`: an epair whose host end joins a bridge and
 //! whose other end moves into the pod's jail, with the bridge as its
-//! default route. The bridge is jailer's own, `jailer0` on 10.77.0.0/16
-//! (not 10.88.0.0/16, Podman's default network), IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
+//! default route. The bridge is jailer's own, `jailer0` on 10.77.0.0/16 or
+//! what `--pod-subnet` gives (not 10.88.0.0/16, Podman's default network),
+//! IPv4 only and with Ethernet's MTU, so that a host that is also a Legion
 //! node keeps its `legion0` to itself. NAT to the outside and
 //! published ports are pf rules in anchors under `jailer/`, which the
 //! host's pf.conf must call.
@@ -17,6 +18,7 @@ use std::fs::File;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use legion_net::PodNetwork;
 pub use legion_net::lb::Proto;
@@ -25,10 +27,35 @@ use legion_sys::{Ipv4Net, Sys};
 use crate::Error;
 
 pub const BRIDGE: &str = "jailer0";
-pub const SUBNET: Ipv4Net = Ipv4Net {
+pub const DEFAULT_SUBNET: Ipv4Net = Ipv4Net {
     addr: Ipv4Addr::new(10, 77, 0, 0),
     prefix: 16,
 };
+static CHOSEN_SUBNET: OnceLock<Ipv4Net> = OnceLock::new();
+
+/// Pods' network for this process, set once from `--pod-subnet`.
+pub fn choose_subnet(subnet: Ipv4Net) {
+    let _ = CHOSEN_SUBNET.set(subnet);
+}
+
+/// Pods' network: `--pod-subnet`'s, or jailer's own.
+pub fn subnet() -> Ipv4Net {
+    CHOSEN_SUBNET.get().copied().unwrap_or(DEFAULT_SUBNET)
+}
+
+/// `--pod-subnet`'s value: a network with room for a bridge and pods.
+pub fn parse_subnet(text: &str) -> Result<Ipv4Net, String> {
+    let net: Ipv4Net = text
+        .parse()
+        .map_err(|_| format!("{text}: not an IPv4 network, as 10.77.0.0/16"))?;
+    if !(8..=30).contains(&net.prefix) {
+        return Err(format!("{text}: the prefix must be from 8 to 30"));
+    }
+    if net.addr != net.network() {
+        return Err(format!("{text}: that is not the network's first address"));
+    }
+    Ok(net)
+}
 /// Where addresses taken are kept; gone at boot, as the jails are.
 pub const LEASES: &str = "/var/run/jailer/net";
 /// What the host's pf.conf must hold for jailer's anchors to be used.
@@ -41,7 +68,7 @@ const NAT_ANCHOR: &str = "jailer/nat";
 
 /// jailer's bridge, as Legion's pod network code makes it.
 pub fn network() -> PodNetwork {
-    PodNetwork::new(SUBNET)
+    PodNetwork::new(subnet())
         .named(BRIDGE, "jp")
         .expect("valid interface names")
         .without_v6()
@@ -150,7 +177,8 @@ pub fn subnet_route(route_get: &str) -> Option<&str> {
 pub fn check_subnet() -> Result<(), Error> {
     #[cfg(target_os = "freebsd")]
     {
-        let probe = Ipv4Addr::from(u32::from(SUBNET.addr) + 2).to_string();
+        let subnet = subnet();
+        let probe = Ipv4Addr::from(u32::from(subnet.addr) + 2).to_string();
         let out = std::process::Command::new("/sbin/route")
             .args(["-n", "get", &probe])
             .output()?;
@@ -158,8 +186,8 @@ pub fn check_subnet() -> Result<(), Error> {
             && other != BRIDGE
         {
             return Err(Error::Runtime(format!(
-                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: another network has the same addresses; remove it or use --network none",
-                SUBNET.addr, SUBNET.prefix
+                "jailer's pod network {}/{} is routed to {other}, not {BRIDGE}: another network has the same addresses; remove it, choose another with --pod-subnet, or use --network none",
+                subnet.addr, subnet.prefix
             )));
         }
     }
@@ -195,7 +223,8 @@ pub fn ensure(sys: &dyn Sys) -> Result<(), Error> {
 }
 
 pub fn nat_rules(egress: &str) -> String {
-    format!("nat on {egress} inet from {SUBNET} to ! {SUBNET} -> ({egress})\n")
+    let subnet = subnet();
+    format!("nat on {egress} inet from {subnet} to ! {subnet} -> ({egress})\n")
 }
 
 /// The pf rules publishing `ports` of the pod at `ip`. They leave the
@@ -340,6 +369,20 @@ impl Locked<'_> {
         Ok(out)
     }
 
+    /// Refused while a pod runs on another network than this process's:
+    /// the bridge has one address, and taking it would cut that pod off.
+    pub fn same_network(&self, sys: &dyn Sys) -> Result<(), Error> {
+        let net = network();
+        match self.live(sys)?.iter().find(|(ip, _)| !net.contains(*ip)) {
+            Some((ip, lease)) => Err(Error::Runtime(format!(
+                "jail {} has {ip}, outside the pod network {}: stop it first, or give the --pod-subnet it runs on",
+                lease.jail,
+                subnet()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// The lowest free address, refused if another pod publishes one of
     /// `ports` already.
     pub fn allocate(&self, sys: &dyn Sys, ports: &[Port]) -> Result<Ipv4Addr, Error> {
@@ -368,11 +411,12 @@ impl Locked<'_> {
         }
         let used: BTreeSet<Ipv4Addr> = live.iter().map(|(ip, _)| *ip).collect();
         let first = u32::from(gateway()) + 1;
-        let last = u32::from(SUBNET.addr) + (1u32 << (32 - u32::from(SUBNET.prefix))) - 2;
+        let subnet = subnet();
+        let last = u32::from(subnet.addr) + (1u32 << (32 - u32::from(subnet.prefix))) - 2;
         (first..=last)
             .map(Ipv4Addr::from)
             .find(|ip| !used.contains(ip))
-            .ok_or_else(|| Error::Runtime(format!("no address left in {SUBNET}")))
+            .ok_or_else(|| Error::Runtime(format!("no address left in {subnet}")))
     }
 
     /// Records `ip` as the pod's in `jail`.
@@ -440,6 +484,49 @@ mod tests {
         sys.set_main_rules(main);
         let err = ensure(&sys).unwrap_err().to_string();
         assert!(err.contains("rdr-anchor \"jailer/*\""), "{err}");
+    }
+
+    #[test]
+    fn a_pod_subnet_must_be_a_network_with_room() {
+        let net = parse_subnet("192.168.50.0/24").unwrap();
+        assert_eq!(net.to_string(), "192.168.50.0/24");
+        assert!(
+            parse_subnet("10.77.0.1/16")
+                .unwrap_err()
+                .contains("first address")
+        );
+        assert!(parse_subnet("10.0.0.0/31").unwrap_err().contains("prefix"));
+        assert!(parse_subnet("10.0.0.0/7").unwrap_err().contains("prefix"));
+        assert!(
+            parse_subnet("fd00::/64")
+                .unwrap_err()
+                .contains("not an IPv4")
+        );
+        assert!(parse_subnet("pods").unwrap_err().contains("not an IPv4"));
+    }
+
+    #[test]
+    fn a_pod_on_another_network_keeps_the_bridge_until_it_is_gone() {
+        let t = tempfile::tempdir().unwrap();
+        let sys = FakeSys::new();
+        sys.add_jail("old", true);
+        let leases = Leases::new(t.path());
+        let held = leases.lock().unwrap();
+        held.record(Ipv4Addr::new(10, 79, 0, 2), "old", &[])
+            .unwrap();
+        let err = held.same_network(&sys).unwrap_err().to_string();
+        assert!(
+            err.contains("10.79.0.2") && err.contains("--pod-subnet"),
+            "{err}"
+        );
+        // Gone, it is no reason to refuse.
+        sys.remove_jail("old");
+        held.same_network(&sys).unwrap();
+        // And one on this network never was.
+        sys.add_jail("new", true);
+        held.record(Ipv4Addr::new(10, 77, 0, 2), "new", &[])
+            .unwrap();
+        held.same_network(&sys).unwrap();
     }
 
     #[test]

@@ -314,8 +314,9 @@ mod containers {
             // Held until the address is recorded as the pod's.
             let mut lease = None;
             if spec.network == Network::Bridge {
-                net::ensure(sys)?;
                 let held = leases.lock()?;
+                held.same_network(sys)?;
+                net::ensure(sys)?;
                 let ip = held.allocate(sys, &spec.ports)?;
                 pod_spec.labels.insert(LABEL_IP.to_owned(), ip.to_string());
                 if !spec.ports.is_empty() {

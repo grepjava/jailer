@@ -587,6 +587,11 @@ interface.
 .Nm
 refuses to start a pod while another interface, such as a VPN's, routes
 those addresses.
+.Fl -pod-subnet Ar cidr ,
+or
+.Ev JAILER_POD_SUBNET ,
+puts pods on another network, its first address the bridge's.
+The bridge has one network at a time, so pods on another must stop first.
 .Nm stop
 and
 .Nm rm

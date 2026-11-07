@@ -2601,6 +2601,74 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
     }
 }
 
+/// Pods on a network the host chooses, one network at a time.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn pods_run_on_the_network_given_and_only_one_at_a_time() {
+    if !live("pods_run_on_the_network_given_and_only_one_at_a_time") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1\n",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["chosen", "back"]);
+    let run = |name: &'static str| {
+        [
+            "run",
+            "-d",
+            "--vnet",
+            "--name",
+            name,
+            "--entrypoint",
+            "/bin/sh",
+            "localhost/i:1",
+            "-c",
+            "sleep 300",
+        ]
+    };
+
+    succeeded(
+        jailer_in(&state)
+            .args(["--pod-subnet", "10.79.0.0/24"])
+            .args(run("chosen")),
+    );
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    assert!(ps.contains("10.79.0.2"), "{ps}");
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(bridge.contains("10.79.0.1"), "{bridge}");
+    let nat = host(&["pfctl", "-a", "jailer/nat", "-sn"]);
+    assert!(nat.contains("10.79.0.0/24"), "{nat}");
+
+    // The bridge is that pod's while it runs.
+    let out = jailer_in(&state).args(run("back")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("--pod-subnet"),
+        "{err}"
+    );
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(bridge.contains("10.79.0.1"), "{bridge}");
+
+    // Then it goes back, leaving nothing of the other network.
+    succeeded(jailer_in(&state).args(["rm", "-f", "chosen"]));
+    let _ = jailer_in(&state).args(["rm", "-f", "back"]).output();
+    succeeded(jailer_in(&state).args(run("back")));
+    let ps = succeeded(jailer_in(&state).arg("ps"));
+    assert!(ps.contains("10.77.0.2"), "{ps}");
+    let bridge = host(&["ifconfig", "jailer0", "inet"]);
+    assert!(
+        bridge.contains("10.77.0.1") && !bridge.contains("10.79."),
+        "{bridge}"
+    );
+}
+
 // The tests storage matters to, on ZFS: clones in place of copies.
 
 #[test]

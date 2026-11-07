@@ -43,6 +43,16 @@ pub struct Cli {
     )]
     pub no_zfs: bool,
 
+    /// Pods' network on jailer's bridge [default: 10.77.0.0/16]
+    #[arg(
+        long,
+        env = "JAILER_POD_SUBNET",
+        global = true,
+        value_name = "CIDR",
+        value_parser = jailer::net::parse_subnet
+    )]
+    pub pod_subnet: Option<legion_sys::Ipv4Net>,
+
     /// Talk to this registry over plain HTTP instead of HTTPS
     #[arg(long, global = true, value_name = "HOST[:PORT]")]
     pub plain_http: Vec<String>,
@@ -1065,6 +1075,9 @@ async fn run() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(subnet) = cli.pod_subnet {
+        jailer::net::choose_subnet(subnet);
+    }
 
     match &cli.command {
         Commands::JailShim { args } => {

@@ -14,7 +14,7 @@ equivalent locally, so a good local run says less than a good deployment.
 | Open-file limit | None | rctl rule on the jail |
 | CPU sets | `--cpuset-cpus` | Not offered for pods |
 | Network by default | The host's | A pod on the node's bridge |
-| Bridge | `--vnet`: `jailer0`, 10.77.0.0/16, IPv4 only | Legion's own |
+| Bridge | `--vnet`: `jailer0`, 10.77.0.0/16 or `--pod-subnet`'s, IPv4 only | Legion's own |
 | Published ports | `-p`, through pf anchors under `jailer/` | Services, and Legion's load balancing |
 | Health | None: `HEALTHCHECK` is not kept | Startup, liveness and readiness probes |
 | Restart | None: a container that stops stays stopped | Restart policy, with delay and attempts |
