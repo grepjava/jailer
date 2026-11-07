@@ -565,6 +565,12 @@ CMD ["default-arg"]
         let client = ClientJail::new();
         let got = client.read("10.99.0.1", "18080");
         assert_eq!(got, "hello\n", "published port 18080, from outside");
+        // jailer sets neither: on a fresh host this says --vnet works without.
+        println!(
+            "pfil_member {} pfil_local_phys {}",
+            host(&["sysctl", "-n", "net.link.bridge.pfil_member"]).trim(),
+            host(&["sysctl", "-n", "net.link.bridge.pfil_local_phys"]).trim()
+        );
         // Its command done, the container is kept and its pod lets go of
         // its address and port.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1888,8 +1894,8 @@ fn an_sbom_lists_what_pkg_knows_of_an_image() {
 
 #[test]
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
-fn stages_at_once_finish_sooner_share_caches_and_fail_together() {
-    if !live("stages_at_once_finish_sooner_share_caches_and_fail_together") {
+fn stages_at_once_overlap_share_caches_and_fail_together() {
+    if !live("stages_at_once_overlap_share_caches_and_fail_together") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1919,18 +1925,42 @@ fn stages_at_once_finish_sooner_share_caches_and_fail_together() {
     };
 
     // Two stages of nothing but waiting, and a last one taking from both.
+    // Each says when it waited: the build's total depends on how busy the
+    // host is, and whether the two overlapped does not.
+    let wait = |n: &str| {
+        format!(
+            "FROM {image} AS {n}\n\
+             RUN echo {n}-from $(date +%s); sleep 6; echo {n}-to $(date +%s); : > /{n}\n"
+        )
+    };
     let waits = format!(
-        "FROM {image} AS a\nRUN sleep 6; : > /a\nFROM {image} AS b\nRUN sleep 6; : > /b\n\
-         FROM {image}\nCOPY --from=a /a /a\nCOPY --from=b /b /b\n"
+        "{}{}FROM {image}\nCOPY --from=a /a /a\nCOPY --from=b /b /b\n",
+        wait("a"),
+        wait("b")
     );
+    let spans = |run: (std::process::Output, f64)| {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.0.stdout),
+            String::from_utf8_lossy(&run.0.stderr)
+        );
+        let took = ok(run);
+        // The step's own line names the mark too, before a `$(date`.
+        let at = |mark: &str| -> u64 {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            words
+                .windows(2)
+                .find_map(|w| (w[0] == mark).then(|| w[1].parse().ok()).flatten())
+                .unwrap_or_else(|| panic!("no {mark} in: {text}"))
+        };
+        (took, (at("a-from"), at("a-to")), (at("b-from"), at("b-to")))
+    };
     ok(build(&format!("FROM {image}\n"), "1"));
-    let one = ok(build(&waits, "1"));
-    let two = ok(build(&waits, "2"));
+    let (one, a, b) = spans(build(&waits, "1"));
+    assert!(a.1 <= b.0 || b.1 <= a.0, "one at a time: {a:?}, {b:?}");
+    let (two, a, b) = spans(build(&waits, "2"));
+    assert!(a.0 < b.1 && b.0 < a.1, "two at once: {a:?}, {b:?}");
     println!("one at a time {one:.1}s, two at once {two:.1}s");
-    assert!(
-        two + 3.0 < one,
-        "one at a time {one:.1}s, two at once {two:.1}s"
-    );
 
     // A locked cache: one stage holds it until the other has waited for it.
     let locked = format!(
@@ -2605,8 +2635,8 @@ fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
 
 #[test]
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
-fn stages_at_once_finish_sooner_share_caches_and_fail_together_on_zfs() {
-    on_zfs(stages_at_once_finish_sooner_share_caches_and_fail_together);
+fn stages_at_once_overlap_share_caches_and_fail_together_on_zfs() {
+    on_zfs(stages_at_once_overlap_share_caches_and_fail_together);
 }
 
 #[test]
