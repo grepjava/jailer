@@ -83,13 +83,13 @@ failed teardown, `login` refusing a token realm that is not https, and the
 default `(self)` publish, which opens a port on every address and so runs only on
 disposable hosts.
 
-Done for amd64: all 28 steps pass on a disposable VM from Legion's `scripts/lab`
+Done for amd64: all 30 steps pass on a disposable VM from Legion's `scripts/lab`
 (`--profile isolated`), and all but the `(self)` test on the shared host. Results
 name the host, its release and architecture, the VM and its image, the Legion
 version and the storage. A VM is not real hardware. arm64 waits on an arm64 host.
 
-Storage: eight tests also run on ZFS, the main workflow already did, and each of
-those eight fails if a stage or container dataset is left behind. The rest use
+Storage: nine tests also run on ZFS, the main workflow already did, and each of
+those nine fails if a stage or container dataset is left behind. The rest use
 plain directories.
 
 ### Shared Jailer–Legion qualification
