@@ -81,6 +81,60 @@ impl Drop for ClientJail {
     }
 }
 
+/// The ZFS root a test runs on, plain directories if none.
+static ZFS_ROOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn zfs_root() -> Option<String> {
+    ZFS_ROOT.lock().unwrap().clone()
+}
+
+/// The storage options of the test running. `scripts/qualify` runs each test
+/// in a process of its own, so one setting holds for the whole of it.
+fn storage() -> Vec<String> {
+    match zfs_root() {
+        Some(root) => vec!["--zfs-root".to_owned(), root],
+        None => vec!["--no-zfs".to_owned()],
+    }
+}
+
+/// Runs `test` on a ZFS root of its own, on JAILER_TEST_POOL, then fails if
+/// it left a stage's or a container's dataset: a build can succeed with one
+/// still there.
+fn on_zfs(test: fn()) {
+    struct Destroy(String);
+    impl Drop for Destroy {
+        fn drop(&mut self) {
+            // A jail just gone may hold its root a while yet.
+            for _ in 0..60 {
+                if Command::new("zfs")
+                    .args(["destroy", "-r", &self.0])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            eprintln!("{} stays", self.0);
+        }
+    }
+    let pool = std::env::var("JAILER_TEST_POOL").unwrap_or_else(|_| "zroot".to_owned());
+    let root = format!("{pool}/jailer-test-{}", std::process::id());
+    let _destroy = Destroy(root.clone());
+    *ZFS_ROOT.lock().unwrap() = Some(root.clone());
+    test();
+    let left: Vec<String> = host(&["zfs", "list", "-H", "-o", "name", "-r", &root])
+        .lines()
+        .filter(|d| {
+            d.strip_prefix(&format!("{root}/"))
+                .and_then(|d| d.split_once('/'))
+                .is_some_and(|(top, _)| top == "build" || top == "jails")
+        })
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(left, Vec::<String>::new(), "datasets left behind");
+}
+
 /// Whether `test` can run, which takes root.
 fn live(test: &str) -> bool {
     if is_root() {
@@ -926,7 +980,8 @@ CMD ["/bin/sh", "-c", "for f in count bound secretlen tmpfs ifs ctxls fromimg hd
     let jailer = |args: &[&str]| {
         let out = Command::new(bin)
             .current_dir(&ctx)
-            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
             .args(args)
             .output()
             .unwrap();
@@ -1122,7 +1177,8 @@ CMD ["/bin/sh", "-c", "set -- $(ls -l /tool); echo $1 $3:$4; test -e /nonempty &
     .unwrap();
     let jailer = |args: &[&str]| {
         let out = Command::new(bin)
-            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
             .args(args)
             .output()
             .unwrap();
@@ -1224,7 +1280,8 @@ CMD ["/bin/sh", "-c", "for f in /owned /d /d/g /arc/t; do set -- $(ls -ld $f); e
     };
     let jailer = |args: &[&str]| {
         let out = Command::new(bin)
-            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
             .args(args)
             .output()
             .unwrap();
@@ -1275,7 +1332,8 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
     .unwrap();
     let jailer = || {
         let mut c = Command::new(bin);
-        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
         c
     };
     let ok = |args: &[&str]| {
@@ -1298,7 +1356,8 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
             let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
-                .args(["--no-zfs", "rm", "-f", "attached"])
+                .args(storage())
+                .args(["rm", "-f", "attached"])
                 .output();
             let _ = jailer::layer::remove_tree(&self.0);
         }
@@ -1377,7 +1436,8 @@ fn a_signal_to_exec_ends_its_command() {
     .unwrap();
     let jailer = || {
         let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
-        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
         c
     };
     let ok = |args: &[&str]| {
@@ -1394,7 +1454,8 @@ fn a_signal_to_exec_ends_its_command() {
             let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
-                .args(["--no-zfs", "rm", "-f", "held"])
+                .args(storage())
+                .args(["rm", "-f", "held"])
                 .output();
             let _ = jailer::layer::remove_tree(&self.0);
         }
@@ -1437,7 +1498,8 @@ fn a_signal_to_exec_ends_its_command() {
     let out = tmp.path().join("out");
     let mut terminal = Command::new("script")
         .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_jailer")])
-        .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+        .args(["--state-dir", state.to_str().unwrap()])
+        .args(storage())
         .args(["exec", "-t", "held", "/bin/sh", "-c"])
         .arg("trap 'echo caught' INT; /bin/sleep 7703; echo done; exit 5")
         .stdin(std::process::Stdio::piped())
@@ -1484,7 +1546,8 @@ fn interrupted_builds_and_runs_leave_nothing() {
     .unwrap();
     let jailer = || {
         let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
-        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage());
         c
     };
     let ok = |args: &[&str]| {
@@ -1643,7 +1706,8 @@ fn another_users_state_directory_is_refused_by_name() {
     let state = tmp.path().join("state");
     let jailer = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
-        c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+        c.args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
             .args(args);
         c
     };
@@ -1678,7 +1742,8 @@ fn a_failing_stage_nothing_needs_does_not_run() {
         Command::new(env!("CARGO_BIN_EXE_jailer"))
             .args(["--state-dir"])
             .arg(tmp.path().join("state"))
-            .args(["--no-zfs", "build"])
+            .args(storage())
+            .arg("build")
             .args(args)
             .arg(&ctx)
             .output()
@@ -1726,7 +1791,8 @@ fn memory_limits_each_process_not_the_container() {
             let _ = Command::new(env!("CARGO_BIN_EXE_jailer"))
                 .arg("--state-dir")
                 .arg(self.0.join("state"))
-                .args(["--no-zfs", "rm", "-f", "many"])
+                .args(storage())
+                .args(["rm", "-f", "many"])
                 .output();
         }
     }
@@ -1836,7 +1902,8 @@ fn stages_at_once_finish_sooner_share_caches_and_fail_together() {
         let out = Command::new(env!("CARGO_BIN_EXE_jailer"))
             .arg("--state-dir")
             .arg(tmp.path().join("state"))
-            .args(["--no-zfs", "build", "--no-cache", "--jobs", jobs])
+            .args(storage())
+            .args(["build", "--no-cache", "--jobs", jobs])
             .arg(&ctx)
             .output()
             .unwrap();
@@ -1916,7 +1983,8 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
     .unwrap();
     let jailer = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_jailer"))
-            .args(["--state-dir", state.to_str().unwrap(), "--no-zfs"])
+            .args(["--state-dir", state.to_str().unwrap()])
+            .args(storage())
             .args(args)
             .output()
             .unwrap()
@@ -1955,15 +2023,40 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
     assert_eq!(dirs.len(), 1, "{dirs:?}");
     let dir = &dirs[0];
     let root = dir.join("root");
-    assert!(
-        Command::new("chflags")
-            .args(["-R", "0"])
-            .arg(&root)
-            .status()
-            .unwrap()
-            .success()
-    );
-    std::fs::remove_dir_all(&root).unwrap();
+    if let Some(zfs) = zfs_root() {
+        let id = dir.file_name().unwrap().to_str().unwrap();
+        let clones = host(&[
+            "zfs",
+            "list",
+            "-H",
+            "-o",
+            "name",
+            "-r",
+            &format!("{zfs}/jails"),
+        ]);
+        let clone = clones
+            .lines()
+            .find(|d| d.contains(id))
+            .unwrap_or_else(|| panic!("no dataset for {id}: {clones}"));
+        assert!(
+            Command::new("zfs")
+                .args(["destroy", "-r", "-f", clone])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = std::fs::remove_dir(&root);
+    } else {
+        assert!(
+            Command::new("chflags")
+                .args(["-R", "0"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     for file in ["run.json", "exit.json"] {
         let _ = std::fs::remove_file(dir.join(file));
     }
@@ -2069,7 +2162,8 @@ fn doctor_reports_on_the_host_and_changes_nothing() {
 /// `jailer` on a state directory of a test's own.
 fn jailer_in(state: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_jailer"));
-    c.args(["--state-dir", state.to_str().unwrap(), "--no-zfs"]);
+    c.args(["--state-dir", state.to_str().unwrap()])
+        .args(storage());
     c
 }
 
@@ -2398,4 +2492,48 @@ fn login_refuses_a_token_realm_that_is_not_https() {
     assert!(!out.status.success(), "{err}");
     assert!(err.contains("not https"), "{err}");
     assert!(realm.accept().is_err(), "the login went to the http realm");
+}
+
+// The tests storage matters to, on ZFS: clones in place of copies.
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn run_mounts_reach_the_step_but_not_the_image_on_zfs() {
+    on_zfs(run_mounts_reach_the_step_but_not_the_image);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid_on_zfs() {
+    on_zfs(cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count_on_zfs() {
+    on_zfs(stage_copies_keep_owners_archives_take_flags_and_cache_options_count);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn interrupted_builds_and_runs_leave_nothing_on_zfs() {
+    on_zfs(interrupted_builds_and_runs_leave_nothing);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
+    on_zfs(a_failing_stage_nothing_needs_does_not_run);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn stages_at_once_finish_sooner_share_caches_and_fail_together_on_zfs() {
+    on_zfs(stages_at_once_finish_sooner_share_caches_and_fail_together);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_container_left_without_its_root_is_listed_and_removed_on_zfs() {
+    on_zfs(a_container_left_without_its_root_is_listed_and_removed);
 }

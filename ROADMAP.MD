@@ -83,6 +83,10 @@ failed teardown and `login` refusing a token realm that is not https both pass
 on the shared host. The default `(self)` publish opens a port on every address,
 so its test is `isolated` in the manifest and has yet to run on a disposable host.
 
+Storage: seven tests also run on ZFS, the main workflow already did, and each of
+those fails if a stage or container dataset is left behind. The rest use plain
+directories.
+
 ### Shared Jailer–Legion qualification
 
 Extend qualification across the product boundary, using a recorded pair of

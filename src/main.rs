@@ -2069,7 +2069,14 @@ async fn containers(cli: &Cli) -> Result<()> {
             let attached = runtime.run_attached(&id, *interactive, *tty);
             let signalled = signalled(true)?;
             let code = tokio::select! {
-                code = attached => code,
+                // As in the setup above, whose wait takes Ctrl-C too: a tool
+                // it was running may have had the signal first.
+                code = attached => match code {
+                    Err(e) => tokio::time::timeout(Duration::from_millis(200), setup.as_mut())
+                        .await
+                        .map_err(|_| e),
+                    code => code,
+                },
                 code = signalled => Ok(code),
             };
             if auto_rm {
