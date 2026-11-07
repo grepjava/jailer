@@ -976,6 +976,8 @@ Needs root.
 .It Nm stop Oo Fl t Ar seconds Oc Ar container
 Stop a container, killing it after
 .Ar seconds .
+One still starting is waited for, up to a minute, then stopped; past that the
+stop fails and the container may yet start.
 .It Nm rm Oo Fl f Oc Ar container ...
 Remove containers.
 A running container is refused unless

@@ -2601,6 +2601,66 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
     }
 }
 
+/// A `stop` from another process just as a run starts must end the run, and
+/// `--rm` taking the container away first is no failure. A `stop` takes longer
+/// to start than a start takes here, so this rarely lands before the run is
+/// there: Legion's own tests, with a slow supervisor, cover the wait itself.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_stop_while_a_run_starts_ends_it() {
+    use std::os::unix::process::CommandExt;
+    if !live("a_stop_while_a_run_starts_ends_it") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+    let _remove = RemoveAll(&state, &["starting"]);
+
+    let marked = || {
+        std::fs::read_dir(state.join("containers")).is_ok_and(|dirs| {
+            dirs.flatten()
+                .any(|d| d.path().join("starting.json").exists())
+        })
+    };
+    for delay in 0..20 {
+        let mut run = jailer_in(&state)
+            .args(["run", "--rm", "--name", "starting"])
+            .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7727"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marked() {
+            assert!(std::time::Instant::now() < deadline, "no start marked");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        succeeded(jailer_in(&state).args(["stop", "starting"]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while run.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
+                let _ = run.wait();
+                panic!("a stop {delay} ms into a start left the command running");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        assert!(!all.contains("starting"), "{delay} ms: {all}");
+    }
+}
+
 /// Pods on a network the host chooses, one network at a time.
 #[test]
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
@@ -2705,6 +2765,12 @@ fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn stages_at_once_overlap_share_caches_and_fail_together_on_zfs() {
     on_zfs(stages_at_once_overlap_share_caches_and_fail_together);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_stop_while_a_run_starts_ends_it_on_zfs() {
+    on_zfs(a_stop_while_a_run_starts_ends_it);
 }
 
 #[test]

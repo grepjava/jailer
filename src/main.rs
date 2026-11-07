@@ -2225,7 +2225,11 @@ async fn containers(cli: &Cli) -> Result<()> {
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
             let id = runtime.find(container)?;
             let wait = Duration::from_secs(time.unwrap_or(10));
-            jailer::runtime::stop(&runtime, &*sys, &leases, &id, wait).await?;
+            match jailer::runtime::stop(&runtime, &*sys, &leases, &id, wait).await {
+                // Found just now: `run --rm` takes away what is stopped.
+                Err(jailer::Error::NotFound(_)) => {}
+                r => r?,
+            }
             println!("{container}");
             Ok(())
         }
@@ -2255,7 +2259,11 @@ async fn containers(cli: &Cli) -> Result<()> {
                 if !force && runtime.inspect(&id).await?.state.running {
                     bail!("container {c:?} is running: stop it first or use `rm -f`");
                 }
-                jailer::runtime::remove(&runtime, &*sys, &leases, &id).await?;
+                match jailer::runtime::remove(&runtime, &*sys, &leases, &id).await {
+                    // Found just now: `run --rm` got there first.
+                    Err(jailer::Error::NotFound(_)) => {}
+                    r => r?,
+                }
                 println!("{c}");
             }
             Ok(())
