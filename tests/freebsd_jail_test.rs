@@ -2494,6 +2494,83 @@ fn login_refuses_a_token_realm_that_is_not_https() {
     assert!(realm.accept().is_err(), "the login went to the http realm");
 }
 
+/// A Ctrl-C while a run starts, before its command can hear it, must end the
+/// run all the same: it would otherwise wait on a command nothing told to
+/// stop. At delays across the start, as the moment depends on the storage.
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_ctrl_c_while_a_run_starts_ends_it() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    if !live("a_ctrl_c_while_a_run_starts_ends_it") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Containerfile"),
+        "FROM docker.io/freebsd/freebsd-runtime:15.1
+",
+    )
+    .unwrap();
+    succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
+
+    // From when its record appears: what comes before that, the signal ends
+    // outright or in its setup, and the window is some tens of milliseconds.
+    let recorded = || {
+        std::fs::read_dir(state.join("containers")).is_ok_and(|dirs| {
+            dirs.flatten()
+                .any(|d| d.path().join("record.json").exists())
+        })
+    };
+    for delay in (0..120).step_by(3) {
+        let mut command = jailer_in(&state);
+        command
+            .args(["run", "--rm", "--name", "starting"])
+            .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7726"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // As from a terminal: a background job, as a qualification run is,
+        // starts with SIGINT ignored, and jailer would inherit that.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut run = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !recorded() {
+            assert!(std::time::Instant::now() < deadline, "no record");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        unsafe { libc::kill(-(run.id() as i32), libc::SIGINT) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = run.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
+                let _ = run.wait();
+                let _ = jailer_in(&state).args(["rm", "-f", "starting"]).output();
+                panic!("a Ctrl-C {delay} ms into a run was lost");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Before jailer's handlers are in place, the signal ends it outright.
+        assert!(
+            status.code() == Some(130) || status.signal() == Some(libc::SIGINT),
+            "{delay} ms: {status:?}"
+        );
+        let all = succeeded(jailer_in(&state).args(["ps", "-a"]));
+        assert!(!all.contains("starting"), "{delay} ms: {all}");
+    }
+}
+
 // The tests storage matters to, on ZFS: clones in place of copies.
 
 #[test]
@@ -2530,6 +2607,12 @@ fn a_failing_stage_nothing_needs_does_not_run_on_zfs() {
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn stages_at_once_finish_sooner_share_caches_and_fail_together_on_zfs() {
     on_zfs(stages_at_once_finish_sooner_share_caches_and_fail_together);
+}
+
+#[test]
+#[ignore = "needs root: scripts/jailer.qualify runs it"]
+fn a_ctrl_c_while_a_run_starts_ends_it_on_zfs() {
+    on_zfs(a_ctrl_c_while_a_run_starts_ends_it);
 }
 
 #[test]

@@ -2064,20 +2064,33 @@ async fn containers(cli: &Cli) -> Result<()> {
                 return Ok(());
             }
             // In this process's group, the command takes Ctrl-C itself, and
-            // ending is its own: what follows cleans up after it. Dropped,
-            // the run kills it and takes its jail down.
-            let attached = runtime.run_attached(&id, *interactive, *tty);
-            let signalled = signalled(true)?;
-            let code = tokio::select! {
-                // As in the setup above, whose wait takes Ctrl-C too: a tool
-                // it was running may have had the signal first.
-                code = attached => match code {
-                    Err(e) => tokio::time::timeout(Duration::from_millis(200), setup.as_mut())
-                        .await
-                        .map_err(|_| e),
-                    code => code,
-                },
-                code = signalled => Ok(code),
+            // ending is its own: what follows cleans up after it.
+            // Its start goes in one step to the command, whose Ctrl-C is then
+            // its own. One that came before it reached only this process and
+            // the tools, so this process acts on it: the command would never
+            // hear it, and an error of a tool it killed is no error. Dropped,
+            // the run kills the command and takes its jail down.
+            let code = {
+                let mut attached = std::pin::pin!(runtime.run_attached(&id, *interactive, *tty));
+                let signalled = signalled(true)?;
+                let early = Duration::from_millis(5);
+                match futures::poll!(attached.as_mut()) {
+                    std::task::Poll::Ready(Err(e)) => {
+                        tokio::time::timeout(Duration::from_millis(200), setup.as_mut())
+                            .await
+                            .map_err(|_| e)
+                    }
+                    std::task::Poll::Ready(code) => code,
+                    std::task::Poll::Pending => {
+                        match tokio::time::timeout(early, setup.as_mut()).await {
+                            Ok(code) => Ok(code),
+                            Err(_) => tokio::select! {
+                                code = attached => code,
+                                code = signalled => Ok(code),
+                            },
+                        }
+                    }
+                }
             };
             if auto_rm {
                 let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;

@@ -41,6 +41,7 @@ test . freebsd_jail_test stages_at_once_finish_sooner_share_caches_and_fail_toge
 test . freebsd_jail_test a_container_left_without_its_root_is_listed_and_removed host shared 300
 test . freebsd_jail_test doctor_reports_on_the_host_and_changes_nothing host shared 120
 test . freebsd_jail_test a_failed_teardown_keeps_the_address_until_it_can_go host shared 300
+test . freebsd_jail_test a_ctrl_c_while_a_run_starts_ends_it host shared 900
 
 # On ZFS, where a stage or a root is a clone, not a copy.
 test . freebsd_jail_test run_mounts_reach_the_step_but_not_the_image_on_zfs host shared 600
@@ -50,6 +51,7 @@ test . freebsd_jail_test interrupted_builds_and_runs_leave_nothing_on_zfs host s
 test . freebsd_jail_test a_failing_stage_nothing_needs_does_not_run_on_zfs host shared 600
 test . freebsd_jail_test stages_at_once_finish_sooner_share_caches_and_fail_together_on_zfs host shared 600
 test . freebsd_jail_test a_container_left_without_its_root_is_listed_and_removed_on_zfs host shared 600
+test . freebsd_jail_test a_ctrl_c_while_a_run_starts_ends_it_on_zfs host shared 900
 
 # Publishes a port on every address the host has: disposable hosts only.
 test . freebsd_jail_test a_port_given_no_address_answers_on_the_hosts_own_addresses host isolated 300
