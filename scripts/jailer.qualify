@@ -1,5 +1,5 @@
 # jailer's manifest for Legion's scripts/qualify. See that script for the
-# format. From jailer's root, with the script from the Legion revision jailer pins:
+# format. From jailer's root, with the script from the Legion version jailer pins:
 #
 #   qualify --manifest scripts/jailer.qualify --profile shared --pool POOL
 project jailer
@@ -7,7 +7,7 @@ scan tests/*.rs
 
 # What a result must name beyond the host: the Legion it tested, and storage,
 # which each test sets for itself.
-record legion grep -o 'legion?rev=[0-9a-f]*' Cargo.lock | sort -u | cut -d= -f2 | grep .
+record legion grep -oE 'legion\?(rev|tag)=[0-9A-Za-z.]+' Cargo.lock | sort -u | cut -d= -f2 | grep .
 record storage echo "ZFS and plain directories, by test"
 
 # What jailer's tests make, in the before/after snapshots. The bridge jailer0
