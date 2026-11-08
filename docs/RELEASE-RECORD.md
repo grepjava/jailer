@@ -113,7 +113,7 @@ not an inventory, not an empty list that reads as complete.
 
 Legion resolves a tag when a Service or Job is deployed: its leading manager asks
 the registry once what the tag names, and every task of that deployment runs that
-digest, on whichever node it lands. This is in Legion after v0.1.13. The digest
+digest, on whichever node it lands. This is in Legion from v0.1.14. The digest
 is the same one a push records as `published[].digest`, the index's for an image
 of several platforms, so a record can be checked against what Legion deployed:
 
