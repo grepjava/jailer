@@ -109,6 +109,28 @@ other way, such as by `COPY` or a build from source, are not in it, and the
 document says so. An image with no package database gets a document saying it is
 not an inventory, not an empty list that reads as complete.
 
+## Deploying with Legion
+
+Legion resolves a tag when a Service or Job is deployed: its leading manager asks
+the registry once what the tag names, and every task of that deployment runs that
+digest, on whichever node it lands. This is in Legion after v0.1.13. The digest
+is the same one a push records as `published[].digest`, the index's for an image
+of several platforms, so a record can be checked against what Legion deployed:
+
+- The Service's or Job's `status.images` maps each reference as written to
+  `registry/repo@sha256:...`, which matches the record's `pinned`.
+- Each task's status names the manifest its node ran. For an index, that is one
+  of `published[].platforms`, the one for the node's platform.
+
+A tag moved after the deployment changes nothing until the Service is deployed
+again. Scaling is not a deployment, and a rollback runs the digests from before
+the update. A reference by digest, such as `pinned`, and a `localhost/` name are
+used as written.
+
+Legion pins only once every node runs a version that reads pins. Until then, a
+deployment by tag runs whatever each node pulls by that name. Deploy `pinned` to
+get the recorded image whichever version the nodes run.
+
 ## What a record does not do
 
 `verified` says a signature was good when jailer checked it. It does not stop a
