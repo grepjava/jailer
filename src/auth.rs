@@ -2,49 +2,14 @@
 //! `$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`), matching
 //! the format Legion's `imagePullSecrets` reads.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::registry::Credentials;
 use crate::registry_of;
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct AuthFile {
-    #[serde(default)]
-    auths: BTreeMap<String, AuthEntry>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct AuthEntry {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    username: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    password: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    auth: String,
-}
-
-impl AuthEntry {
-    /// As `legion_api::login::decode` reads it: `auth` wins. An entry naming
-    /// only a user, or only a password, has the other empty; one with
-    /// neither form, as with an identity token, is no login.
-    fn into_credentials(self) -> Option<Credentials> {
-        let auth = Some(self.auth.as_str()).filter(|a| !a.is_empty());
-        let named = !self.username.is_empty() || !self.password.is_empty();
-        let (username, password) = legion_api::login::decode(
-            auth,
-            named.then_some(self.username.as_str()),
-            named.then_some(self.password.as_str()),
-        )
-        .ok()?;
-        Some(Credentials { username, password })
-    }
-}
 
 /// Where a command's registry credentials come from, looked up for each
 /// registry it talks to: `--creds`, else `--authfile` or the standard files.
@@ -92,18 +57,12 @@ pub fn resolve_credentials(
     Ok(None)
 }
 
+/// The login for `registry` in a Docker or Podman auth file, as Legion
+/// reads a person's: entries with nothing usable are passed over.
 pub fn from_json(text: &str, registry: &str) -> Result<Option<Credentials>, Error> {
-    let parsed: AuthFile = serde_json::from_str(text)
+    let logins = legion_api::login::docker_config_lenient(text.as_bytes())
         .map_err(|e| Error::Registry(format!("parsing auth config: {e}")))?;
-    let target = registry_of(registry);
-    for (key, entry) in parsed.auths {
-        if registry_of(&key) == target
-            && let Some(c) = entry.into_credentials()
-        {
-            return Ok(Some(c));
-        }
-    }
-    Ok(None)
+    Ok(Credentials::for_registry(&logins, &registry_of(registry)))
 }
 
 /// Saves credentials for `registry` into `authfile` (or `~/.docker/config.json`).
@@ -228,6 +187,21 @@ mod tests {
         let g = from_json(json, "ghcr.io").unwrap().unwrap();
         assert_eq!((g.username.as_str(), g.password.as_str()), ("me", "tok"));
         assert!(from_json(json, "quay.io").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_config_with_no_logins_is_none() {
+        // As Docker writes one before any login, or with a credential store.
+        for json in [
+            "{}",
+            r#"{"auths": {}}"#,
+            r#"{"credsStore": "desktop"}"#,
+            r#"{"psFormat": "table {{.ID}}", "proxies": {"default": {"httpProxy": "http://p:3128"}}}"#,
+            r#"{"auths": {"ghcr.io": {}}, "credsStore": "desktop", "currentContext": "x"}"#,
+        ] {
+            assert!(from_json(json, "ghcr.io").unwrap().is_none(), "{json}");
+        }
+        assert!(from_json("{not json", "ghcr.io").is_err());
     }
 
     #[test]

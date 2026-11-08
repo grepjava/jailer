@@ -855,16 +855,6 @@ pub enum NetworkArg {
     None,
 }
 
-/// `r` by `digest`: what a tag named, for good.
-fn pinned(r: &Reference, digest: &str) -> String {
-    Reference {
-        tag: None,
-        digest: Some(digest.to_owned()),
-        ..r.clone()
-    }
-    .to_string()
-}
-
 /// Notes a signature of `digest`, pushed for `r`, in the record, if any.
 fn signed_in(record: &Option<PathBuf>, r: &Reference, digest: &str) -> Result<()> {
     if let Some(path) = record {
@@ -1298,7 +1288,7 @@ async fn run() -> Result<()> {
                     &image,
                     target_ref.to_string(),
                     &digest,
-                    pinned(&target_ref, &digest),
+                    target_ref.by_digest(&digest).to_string(),
                 )?;
                 r.save(path)?;
             }
@@ -1384,7 +1374,7 @@ async fn run() -> Result<()> {
                 r.pushed_index(
                     target_ref.to_string(),
                     &digest,
-                    pinned(&target_ref, &digest),
+                    target_ref.by_digest(&digest).to_string(),
                     jailer::record::platforms_of(&serde_json::to_value(&doc)?),
                 )?;
                 r.save(path)?;
@@ -1448,7 +1438,7 @@ async fn run() -> Result<()> {
                 let mut rec = Record::open(path)?;
                 rec.verified(
                     &digest,
-                    pinned(&r, &digest),
+                    r.by_digest(&digest).to_string(),
                     jailer::record::file_digest(key)?,
                 )?;
                 rec.save(path)?;
