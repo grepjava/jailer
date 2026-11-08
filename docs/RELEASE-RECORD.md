@@ -119,6 +119,13 @@ An offline archive keeps the image's manifest digest, which `archives[].manifest
 records. Signatures and attestations live in the registry, so they do not travel
 in the archive.
 
+A Legion node finds a loaded archive only by the name it was loaded under, not by
+digest, and Legion asks the registry what a tag names when it deploys. Offline,
+an archive named `localhost/...`, as `jailer export` names a local image by
+default, needs nothing more. One named for a registry, as with `--name
+ghcr.io/me/app:1`, runs only with the container's `pullPolicy: never`, which runs
+what each node holds by that name.
+
 ## `jailer check --json`
 
 `jailer check --json` prints one object on standard output:

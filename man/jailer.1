@@ -811,6 +811,13 @@ and
 .Ql docker load .
 .Fl -name
 overrides the reference recorded in the archive.
+Legion asks the registry what a tag names when it deploys, and finds a loaded
+image only by the name it was loaded under.
+Offline, a
+.Ql localhost/
+name, as an image built here has by default, needs nothing more; one named for
+a registry runs only with the container's
+.Ql pullPolicy: never .
 .It Nm doctor Oo Fl -json Oc Op Fl -for Ar operation Ns Op , Ns Ar ...
 Check what this host can do, changing nothing.
 Each
