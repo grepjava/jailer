@@ -135,6 +135,29 @@ fn on_zfs(test: fn()) {
     assert_eq!(left, Vec::<String>::new(), "datasets left behind");
 }
 
+/// A test's directory. Layers hold files with `schg` set, which `TempDir` cannot
+/// delete, so every test that extracted an image would leave its directory.
+struct Scratch(tempfile::TempDir);
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("chflags")
+            .args(["-R", "noschg"])
+            .arg(self.path())
+            .output();
+    }
+}
+
+fn scratch() -> Scratch {
+    Scratch(tempfile::tempdir().unwrap())
+}
+
 /// Whether `test` can run, which takes root.
 fn live(test: &str) -> bool {
     if is_root() {
@@ -152,7 +175,7 @@ fn real_freebsd_jail_build_run_export_workflow() {
     }
 
     let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state_dir = tmp.path().join("state");
     let project_dir = tmp.path().join("hello-service");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -944,7 +967,7 @@ fn run_mounts_reach_the_step_but_not_the_image() {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(ctx.join("data")).unwrap();
@@ -1157,7 +1180,7 @@ fn cached_steps_follow_the_layer_before_them_and_chown_keeps_setuid() {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
     let other = tmp.path().join("other");
@@ -1233,7 +1256,7 @@ fn stage_copies_keep_owners_archives_take_flags_and_cache_options_count() {
     }
     use std::os::unix::fs::PermissionsExt;
     let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
     let packed = tmp.path().join("packed");
@@ -1327,7 +1350,7 @@ fn the_pods_hostname_wins_and_a_stop_ends_an_attached_run() {
         return;
     }
     let bin = env!("CARGO_BIN_EXE_jailer");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
@@ -1431,7 +1454,7 @@ fn a_signal_to_exec_ends_its_command() {
     if !live("a_signal_to_exec_ends_its_command") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
@@ -1534,7 +1557,7 @@ fn interrupted_builds_and_runs_leave_nothing() {
     if !live("interrupted_builds_and_runs_leave_nothing") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let base = tmp.path().join("base");
     let step = tmp.path().join("step");
@@ -1707,7 +1730,7 @@ fn another_users_state_directory_is_refused_by_name() {
     if !live("another_users_state_directory_is_refused_by_name") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let state = tmp.path().join("state");
     let jailer = |args: &[&str]| {
@@ -1735,7 +1758,7 @@ fn a_failing_stage_nothing_needs_does_not_run() {
     if !live("a_failing_stage_nothing_needs_does_not_run") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
     std::fs::write(
@@ -1774,7 +1797,7 @@ fn memory_limits_each_process_not_the_container() {
     if !live("memory_limits_each_process_not_the_container") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let jailer = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_jailer"))
             .arg("--state-dir")
@@ -1861,7 +1884,7 @@ fn an_sbom_lists_what_pkg_knows_of_an_image() {
     if !live("an_sbom_lists_what_pkg_knows_of_an_image") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let jailer = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_jailer"))
             .arg("--state-dir")
@@ -1898,7 +1921,7 @@ fn stages_at_once_overlap_share_caches_and_fail_together() {
     if !live("stages_at_once_overlap_share_caches_and_fail_together") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let ctx = tmp.path().join("ctx");
     std::fs::create_dir_all(&ctx).unwrap();
     let image = "docker.io/freebsd/freebsd-runtime:15.1";
@@ -2002,7 +2025,7 @@ fn a_container_left_without_its_root_is_listed_and_removed() {
     if !live("a_container_left_without_its_root_is_listed_and_removed") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let project = tmp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -2227,7 +2250,7 @@ fn a_port_given_no_address_answers_on_the_hosts_own_addresses() {
     if !live("a_port_given_no_address_answers_on_the_hosts_own_addresses") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let context = tmp.path().join("nc");
     nc_context(&context, "docker.io/freebsd/freebsd-runtime:15.1");
@@ -2281,7 +2304,7 @@ fn a_failed_teardown_keeps_the_address_until_it_can_go() {
     if !live("a_failed_teardown_keeps_the_address_until_it_can_go") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let project = tmp.path().join("project");
     let bin = tmp.path().join("bin");
@@ -2394,7 +2417,7 @@ fn login_refuses_a_token_realm_that_is_not_https() {
     use std::io::{Read, Write};
     use std::sync::Arc;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let file = |name: &str| tmp.path().join(name);
     let openssl = |args: &[&str]| {
         let out = Command::new("openssl").args(args).output().unwrap();
@@ -2534,7 +2557,7 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
     if !live("a_ctrl_c_while_a_run_starts_ends_it") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let project = tmp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -2601,10 +2624,12 @@ fn a_ctrl_c_while_a_run_starts_ends_it() {
     }
 }
 
-/// A `stop` from another process just as a run starts must end the run, and
-/// `--rm` taking the container away first is no failure. A `stop` takes longer
-/// to start than a start takes here, so this rarely lands before the run is
-/// there: Legion's own tests, with a slow supervisor, cover the wait itself.
+/// A `stop` or `rm -f` from another process while a run makes and starts its
+/// container finds nothing running yet. It must end the run all the same, not
+/// report it stopped and leave the command to start, and `--rm` taking the
+/// container away first is no failure. From when its record appears, which
+/// spends the time in making it: a `stop` takes longer to start than what
+/// follows, which Legion's own tests cover with a slow supervisor.
 #[test]
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn a_stop_while_a_run_starts_ends_it() {
@@ -2612,7 +2637,7 @@ fn a_stop_while_a_run_starts_ends_it() {
     if !live("a_stop_while_a_run_starts_ends_it") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let project = tmp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -2625,13 +2650,13 @@ fn a_stop_while_a_run_starts_ends_it() {
     succeeded(jailer_in(&state).args(["build", "-t", "i:1", project.to_str().unwrap()]));
     let _remove = RemoveAll(&state, &["starting"]);
 
-    let marked = || {
+    let recorded = || {
         std::fs::read_dir(state.join("containers")).is_ok_and(|dirs| {
             dirs.flatten()
-                .any(|d| d.path().join("starting.json").exists())
+                .any(|d| d.path().join("record.json").exists())
         })
     };
-    for delay in 0..20 {
+    for delay in (0..60).step_by(3) {
         let mut run = jailer_in(&state)
             .args(["run", "--rm", "--name", "starting"])
             .args(["--entrypoint", "/bin/sleep", "localhost/i:1", "7727"])
@@ -2641,18 +2666,23 @@ fn a_stop_while_a_run_starts_ends_it() {
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !marked() {
-            assert!(std::time::Instant::now() < deadline, "no start marked");
+        while !recorded() {
+            assert!(std::time::Instant::now() < deadline, "no record");
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
         std::thread::sleep(std::time::Duration::from_millis(delay));
-        succeeded(jailer_in(&state).args(["stop", "starting"]));
+        let end: &[&str] = if delay % 2 == 0 {
+            &["stop", "starting"]
+        } else {
+            &["rm", "-f", "starting"]
+        };
+        succeeded(jailer_in(&state).args(end));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while run.try_wait().unwrap().is_none() {
             if std::time::Instant::now() > deadline {
                 unsafe { libc::kill(-(run.id() as i32), libc::SIGKILL) };
                 let _ = run.wait();
-                panic!("a stop {delay} ms into a start left the command running");
+                panic!("{end:?} {delay} ms into a run left the command running");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2668,7 +2698,7 @@ fn pods_run_on_the_network_given_and_only_one_at_a_time() {
     if !live("pods_run_on_the_network_given_and_only_one_at_a_time") {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let state = tmp.path().join("state");
     let project = tmp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();

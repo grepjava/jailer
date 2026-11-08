@@ -976,13 +976,20 @@ Needs root.
 .It Nm stop Oo Fl t Ar seconds Oc Ar container
 Stop a container, killing it after
 .Ar seconds .
-One still starting is waited for, up to a minute, then stopped; past that the
-stop fails and the container may yet start.
+One a
+.Nm run
+is still making or starting is waited for, up to a minute, then stopped; past
+that the stop fails, and can be tried again.
 .It Nm rm Oo Fl f Oc Ar container ...
 Remove containers.
 A running container is refused unless
 .Fl f
 is given, which stops it first.
+One a
+.Nm run
+is still making or starting is waited for first, as
+.Nm stop
+does.
 .El
 .Pp
 A signal ending

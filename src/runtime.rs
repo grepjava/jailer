@@ -306,7 +306,7 @@ mod containers {
         sys: &dyn Sys,
         leases: &Leases,
         spec: &RunSpec,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, legion_jail::Starting), Error> {
         let mut member = member_spec(spec)?;
         let mut pod = None;
         if spec.network != Network::Host {
@@ -370,15 +370,17 @@ mod containers {
             member.labels.insert(LABEL_POD.to_owned(), id);
         }
         let made = async {
-            let id = rt.create(&member).await?;
+            let (id, starting) = rt.create_for_run(&member).await?;
             if let Err(e) = limit(sys, &jail_of(&id, pod.as_deref()), &spec.limits) {
+                // Its remove waits for no start but this one.
+                drop(starting);
                 let _ = rt.remove(&id).await;
                 return Err(e);
             }
-            Ok(id)
+            Ok((id, starting))
         };
         match made.await {
-            Ok(id) => Ok(id),
+            Ok(made) => Ok(made),
             Err(e) => {
                 if let Some(p) = pod {
                     // Its published ports must not reach whoever takes its

@@ -2053,14 +2053,20 @@ async fn containers(cli: &Cli) -> Result<()> {
             // the tools extracting the image too, and this process just after.
             let wait = Duration::from_millis(if created.is_err() { 200 } else { 0 });
             if let Ok(code) = tokio::time::timeout(wait, setup.as_mut()).await {
-                if let Ok(id) = &created {
-                    let _ = jailer::runtime::remove(&runtime, &*sys, &leases, id).await;
+                if let Ok((id, starting)) = created {
+                    drop(starting);
+                    let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
                 }
                 std::process::exit(code);
             }
-            let id = created?;
+            // Until the start is over, a stop or `rm` from elsewhere waits for
+            // it: one that found nothing running would let the command start
+            // after it. Let go before this process stops or removes it itself.
+            let (id, starting) = created?;
             if *detach {
-                if let Err(e) = runtime.start(&id).await {
+                let started = runtime.start(&id).await;
+                drop(starting);
+                if let Err(e) = started {
                     if *rm {
                         let _ = jailer::runtime::remove(&runtime, &*sys, &leases, &id).await;
                     } else {
@@ -2084,6 +2090,8 @@ async fn containers(cli: &Cli) -> Result<()> {
             // hear it, and an error of a tool it killed is no error. Dropped,
             // the run kills the command and takes its jail down.
             let code = {
+                // Dropped after the run, before what follows stops it.
+                let _starting = starting;
                 let mut attached = std::pin::pin!(runtime.run_attached(&id, *interactive, *tty));
                 let signalled = signalled(true)?;
                 let early = Duration::from_millis(5);
@@ -2256,6 +2264,8 @@ async fn containers(cli: &Cli) -> Result<()> {
             let leases = jailer::net::Leases::new(jailer::net::LEASES);
             for c in containers {
                 let id = runtime.find(c)?;
+                // During a start it is not running yet.
+                runtime.start_settled(&id).await?;
                 if !force && runtime.inspect(&id).await?.state.running {
                     bail!("container {c:?} is running: stop it first or use `rm -f`");
                 }
