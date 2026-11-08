@@ -117,19 +117,24 @@ digest, on whichever node it lands. This is in Legion after v0.1.13. The digest
 is the same one a push records as `published[].digest`, the index's for an image
 of several platforms, so a record can be checked against what Legion deployed:
 
-- The Service's or Job's `status.images` maps each reference as written to
-  `registry/repo@sha256:...`, which matches the record's `pinned`.
-- Each task's status names the manifest its node ran. For an index, that is one
-  of `published[].platforms`, the one for the node's platform.
+- The Service's or Job's `status.images.resolved` maps each reference as written
+  to `registry/repo@sha256:...`, which matches the record's `pinned`. These pins
+  apply when `status.images.pod` names the pod as it now is and there is no
+  `status.images.message`, which says why they are not resolved yet.
+- Each task's `status.images` maps each container's image, as the pod names it, to
+  the `sha256:...` digest of the manifest its node ran. For an index, that is the
+  one for the node's platform, which `published[].platforms` maps to that same
+  digest.
 
 A tag moved after the deployment changes nothing until the Service is deployed
-again. Scaling is not a deployment, and a rollback runs the digests from before
-the update. A reference by digest, such as `pinned`, and a `localhost/` name are
-used as written.
+again. Scaling is not a deployment, and a rollback runs the digests the earlier
+tasks ran. A reference by digest, such as `pinned`, a `localhost/` name, and an
+image under `pullPolicy: never` are not resolved: they run as written, and are
+not in `resolved`.
 
-Legion pins only once every node runs a version that reads pins. Until then, a
-deployment by tag runs whatever each node pulls by that name. Deploy `pinned` to
-get the recorded image whichever version the nodes run.
+Legion pins only when the cluster has nodes and every one runs a version that
+reads pins. Until then, a deployment by tag runs whatever each node pulls by that
+name. Deploy `pinned` to get the recorded image whichever version the nodes run.
 
 ## What a record does not do
 
