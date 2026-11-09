@@ -100,6 +100,16 @@ separate milestone from P0 above: the registry and offline routes need Legion's
 P1.3, the stateful scenarios its P0.2, P1.2 and P1.4, so it does not hold P0
 open.
 
+On main: Legion's `crates/legion/tests/handoff.rs` runs in each of its full lab
+records, on three FreeBSD nodes, against a jailer revision it records. It covers
+the registry route (scale, redeploy after the tag moved, rollback) and the
+offline route (`localhost/`, `pullPolicy: never`). It also covers a stateful
+task of a jailer image drained to another node: the same manifest, the same
+data byte for byte, and its first writer stopped before the data moved. Not yet
+covered: zstd layers (the tests build gzip), a multi-architecture index (the
+lab is amd64 only), and recovery after an interrupted migration, which waits on
+Legion's P1.4.
+
 - Build and test a native application with Jailer, sign and push its immutable
   digest, then deploy that exact image through Legion.
 - Exercise both registry distribution and offline export followed by
