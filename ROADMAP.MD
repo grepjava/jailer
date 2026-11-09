@@ -106,9 +106,9 @@ the registry route (scale, redeploy after the tag moved, rollback) and the
 offline route (`localhost/`, `pullPolicy: never`), with gzip and zstd layers by
 each. It also covers a stateful task of a jailer image drained to another node:
 the same manifest, the same data byte for byte, and its first writer stopped
-before the data moved. Not yet covered: a multi-architecture index (the lab is
-amd64 only), and recovery after an interrupted migration, which waits on
-Legion's P1.4.
+before the data moved, both in a plain drain and in one whose last part is cut
+short and sent again. Not yet covered: a multi-architecture index (the lab is
+amd64 only), and a signed push, which Legion does not check yet.
 
 - Build and test a native application with Jailer, sign and push its immutable
   digest, then deploy that exact image through Legion.
