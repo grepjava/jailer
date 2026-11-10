@@ -162,6 +162,11 @@ check these signatures with the same code, Legion's `legion_image::cosign`.
 
 Under `mode: warn` the image runs, and `status.images.warning` says what failed.
 
+Every image a policy covers waits for that check before any task of it starts,
+whether it is named by tag, by digest or under `pullPolicy: never`. While a
+node of the cluster runs a Legion too old to read pins, as during an upgrade,
+the check is not made, and these images wait until every node is upgraded.
+
 ## What a record does not do
 
 `verified` says a signature was good when jailer checked it. It does not stop a
