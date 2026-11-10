@@ -859,7 +859,10 @@ pub enum NetworkArg {
 fn signed_in(record: &Option<PathBuf>, r: &Reference, digest: &str) -> Result<()> {
     if let Some(path) = record {
         let mut rec = Record::open(path)?;
-        rec.signed(digest, jailer::sign::signature_ref(r, digest).to_string())?;
+        rec.signed(
+            digest,
+            jailer::sign::signature_reference(r, digest).to_string(),
+        )?;
         rec.save(path)?;
     }
     Ok(())
@@ -877,7 +880,7 @@ async fn sign_pushed(
     jailer::sign::sign(store.client(), r, digest, &key, creds).await?;
     println!(
         "Signed {r} ({digest}) as {}",
-        jailer::sign::signature_ref(r, digest)
+        jailer::sign::signature_reference(r, digest)
     );
     Ok(())
 }
@@ -1433,7 +1436,8 @@ async fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&predicate)?);
                 return Ok(());
             }
-            let digest = jailer::sign::verify(store.client(), &r, &public, creds.as_ref()).await?;
+            let (digest, fingerprint) =
+                jailer::sign::verify(store.client(), &r, &public, creds.as_ref()).await?;
             if let Some(path) = record {
                 let mut rec = Record::open(path)?;
                 rec.verified(
@@ -1443,7 +1447,7 @@ async fn run() -> Result<()> {
                 )?;
                 rec.save(path)?;
             }
-            println!("{r} ({digest}) is signed by the key");
+            println!("{r} ({digest}) is signed by the key {fingerprint}");
             Ok(())
         }
 
@@ -1526,7 +1530,8 @@ async fn run() -> Result<()> {
                     bail!("{} exists already", p.display());
                 }
             }
-            let (private_pem, public_pem) = jailer::sign::generate()?;
+            let key = jailer::sign::PrivateKey::generate();
+            let (private_pem, public_pem) = (key.to_pem(), key.public().to_pem());
             let mut file = std::fs::OpenOptions::new();
             file.write(true).create_new(true);
             #[cfg(unix)]
@@ -1534,9 +1539,10 @@ async fn run() -> Result<()> {
             std::io::Write::write_all(&mut file.open(&private)?, private_pem.as_bytes())?;
             std::fs::write(&public, public_pem)?;
             println!(
-                "Wrote {} (keep it secret) and {}",
+                "Wrote {} (keep it secret) and {}, key {}",
                 private.display(),
-                public.display()
+                public.display(),
+                key.public().fingerprint()
             );
             Ok(())
         }

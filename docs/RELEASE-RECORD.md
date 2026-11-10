@@ -136,11 +136,37 @@ Legion pins only when the cluster has nodes and every one runs a version that
 reads pins. Until then, a deployment by tag runs whatever each node pulls by that
 name. Deploy `pinned` to get the recorded image whichever version the nodes run.
 
+### Signatures Legion checks
+
+From Legion v0.1.17, an `ImagePolicy` makes a good signature a condition of
+running: an image whose repository its `spec.images` patterns name runs only if
+it is signed by one of its `spec.keys`, the public keys `jailer key generate`
+writes. Legion checks the digest it resolved, the one `push`, `publish` and
+`manifest push` sign with `--sign-key` and record in `published[].digest`, so
+signing an index once covers every platform in it. jailer and Legion make and
+check these signatures with the same code, Legion's `legion_image::cosign`.
+
+- `status.images.verified` maps each image a policy covers to the digest checked
+  and the key that signed it, as `sha256:...` of the key. `jailer key generate`
+  and `jailer verify` print the same fingerprint.
+- An unsigned image, one signed by another key, or one whose signature the
+  registry cannot give holds the deployment, and `status.images.message` says
+  which. The old tasks run on, and Legion tries again every 30 seconds, so
+  `jailer sign` after the deployment lets it go ahead.
+- A signature names the repository it was made in: an image copied to another
+  repository, as a mirror would, fails the check until it is signed there.
+- An archive loaded as `localhost/...` has no registry to keep a signature, so a
+  policy naming it refuses it. Load it under a registry's name and deploy it by
+  digest with `pullPolicy: never`: Legion then asks the registry only for the
+  signature.
+
+Under `mode: warn` the image runs, and `status.images.warning` says what failed.
+
 ## What a record does not do
 
 `verified` says a signature was good when jailer checked it. It does not stop a
-deployment: enforcing that is the job of the deployment's own policy, and Legion
-does not read these records yet. See `ROADMAP.MD`.
+deployment. Legion's `ImagePolicy` does that, from the signatures in the registry,
+not from the record: Legion does not read these records.
 
 An offline archive keeps the image's manifest digest, which `archives[].manifest`
 records. Signatures and attestations live in the registry, so they do not travel

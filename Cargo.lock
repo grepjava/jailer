@@ -913,7 +913,6 @@ dependencies = [
  "legion-runtime",
  "legion-sys",
  "libc",
- "p256",
  "reqwest",
  "rustls",
  "serde",
@@ -1007,7 +1006,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 [[package]]
 name = "legion-api"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1020,14 +1019,16 @@ dependencies = [
 [[package]]
 name = "legion-image"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "base64 0.22.1",
  "flate2",
  "futures",
+ "getrandom 0.3.4",
  "legion-api",
  "legion-sys",
  "libc",
+ "p256",
  "reqwest",
  "ruzstd",
  "serde",
@@ -1044,7 +1045,7 @@ dependencies = [
 [[package]]
 name = "legion-jail"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "bytes",
  "futures",
@@ -1062,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "legion-net"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "hickory-proto",
  "legion-sys",
@@ -1078,7 +1079,7 @@ dependencies = [
 [[package]]
 name = "legion-runtime"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "bytes",
  "futures",
@@ -1090,7 +1091,7 @@ dependencies = [
 [[package]]
 name = "legion-sys"
 version = "0.1.16"
-source = "git+https://github.com/grepjava/legion?tag=v0.1.16#326d995c6e657c92608568af6ad07d098fcf655c"
+source = "git+https://github.com/grepjava/legion?rev=b83b964#b83b96488611759dfa95375bc438de8b28dc1044"
 dependencies = [
  "libc",
  "serde",

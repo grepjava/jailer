@@ -11,13 +11,12 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use legion_image::cosign;
 use serde_json::{Value, json};
 
 use crate::record::Record;
 use crate::registry::{Client, Credentials};
-use crate::sign::{SIGNATURE, add_layer};
+use crate::sign::{PrivateKey, PublicKey, SIGNATURE_ANNOTATION, add_layer};
 use crate::{Error, Reference};
 
 pub const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
@@ -69,18 +68,18 @@ fn statement(r: &Reference, digest: &str, predicate_type: &str, predicate: &Valu
 }
 
 /// A signed envelope of `statement`.
-fn envelope(statement: &Value, key: &SigningKey) -> Result<Vec<u8>, Error> {
+fn envelope(statement: &Value, key: &PrivateKey) -> Result<Vec<u8>, Error> {
     let payload = serde_json::to_vec(statement)?;
-    let signature: Signature = key.sign(&pae(STATEMENT_TYPE, &payload));
+    let signature = cosign::sign(&pae(STATEMENT_TYPE, &payload), key);
     Ok(serde_json::to_vec(&json!({
         "payloadType": STATEMENT_TYPE,
         "payload": B64.encode(&payload),
-        "signatures": [{"keyid": "", "sig": B64.encode(signature.to_der().as_bytes())}],
+        "signatures": [{"keyid": "", "sig": signature}],
     }))?)
 }
 
 /// The statement in `envelope`, if `key` signed it.
-fn open(envelope: &[u8], key: &VerifyingKey) -> Option<Value> {
+fn open(envelope: &[u8], key: &PublicKey) -> Option<Value> {
     let envelope: Value = serde_json::from_slice(envelope).ok()?;
     if envelope["payloadType"] != STATEMENT_TYPE {
         return None;
@@ -90,9 +89,7 @@ fn open(envelope: &[u8], key: &VerifyingKey) -> Option<Value> {
     envelope["signatures"].as_array()?.iter().find(|s| {
         s["sig"]
             .as_str()
-            .and_then(|sig| B64.decode(sig).ok())
-            .and_then(|der| Signature::from_der(&der).ok())
-            .is_some_and(|sig| key.verify(&signed, &sig).is_ok())
+            .is_some_and(|sig| key.verifies(&signed, sig))
     })?;
     serde_json::from_slice(&payload).ok()
 }
@@ -105,12 +102,12 @@ pub async fn attest(
     digest: &str,
     predicate_type: &str,
     predicate: &Value,
-    key: &SigningKey,
+    key: &PrivateKey,
     creds: Option<&Credentials>,
 ) -> Result<(), Error> {
     let body = envelope(&statement(r, digest, predicate_type, predicate), key)?;
     let annotations = BTreeMap::from([
-        (SIGNATURE.to_owned(), String::new()),
+        (SIGNATURE_ANNOTATION.to_owned(), String::new()),
         (PREDICATE_TYPE.to_owned(), predicate_type.to_owned()),
     ]);
     let at = attestation_ref(r, digest);
@@ -123,7 +120,7 @@ pub async fn verify(
     client: &Client,
     r: &Reference,
     predicate_type: &str,
-    key: &VerifyingKey,
+    key: &PublicKey,
     creds: Option<&Credentials>,
 ) -> Result<(String, Value), Error> {
     let (digest, _) = client.document(r, r.target(), creds).await?;
@@ -304,7 +301,7 @@ pub fn sbom(name: &str, digest: &str, created: &str, packages: Option<&[Package]
 mod tests {
     use super::*;
     use crate::record::{Base, Source};
-    use crate::sign::{generate, signing_key, verifying_key};
+    use crate::sign::PrivateKey;
 
     #[test]
     fn the_encoding_is_dsses() {
@@ -317,15 +314,15 @@ mod tests {
 
     #[test]
     fn an_envelope_opens_only_for_its_key() {
-        let (private, public) = generate().unwrap();
-        let (_, other) = generate().unwrap();
+        let private = PrivateKey::generate();
+        let other = PrivateKey::generate().public();
         let r = Reference::parse("ghcr.io/me/app:1").unwrap();
         let said = statement(&r, "sha256:abc", PROVENANCE, &json!({"a": 1}));
-        let sealed = envelope(&said, &signing_key(&private).unwrap()).unwrap();
-        let key = verifying_key(&public).unwrap();
+        let sealed = envelope(&said, &private).unwrap();
+        let key = private.public();
         assert_eq!(open(&sealed, &key).unwrap(), said);
         assert_eq!(said["subject"][0]["digest"]["sha256"], "abc");
-        assert!(open(&sealed, &verifying_key(&other).unwrap()).is_none());
+        assert!(open(&sealed, &other).is_none());
 
         // Changing what is said breaks the signature.
         let mut changed: Value = serde_json::from_slice(&sealed).unwrap();

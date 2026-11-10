@@ -1042,7 +1042,7 @@ async fn registry_cache_carries_steps_to_another_store() {
 
 #[tokio::test]
 async fn pushed_images_are_signed_and_verified() {
-    use jailer::sign::{generate, sign, signature_ref, signing_key, verify, verifying_key};
+    use jailer::sign::{PrivateKey, sign, signature_reference, verify};
     let tmp = tempfile::tempdir().unwrap();
     let (addr, registry) = start_mock_registry().await;
     let host = format!("127.0.0.1:{}", addr.port());
@@ -1106,22 +1106,31 @@ async fn pushed_images_are_signed_and_verified() {
     let digest = store.push("signed:1", &target, None).await.unwrap();
 
     // Unsigned, then signed by one key and not another.
-    let (private, public) = generate().unwrap();
-    let (other_private, other_public) = generate().unwrap();
-    let key = verifying_key(&public).unwrap();
-    let other = verifying_key(&other_public).unwrap();
+    let private = PrivateKey::generate();
+    let other_private = PrivateKey::generate();
+    let (key, other) = (private.public(), other_private.public());
+    let signed_by = |k: &jailer::sign::PublicKey| (digest.clone(), k.fingerprint().to_owned());
     let err = verify(client, &target, &key, None).await.unwrap_err();
     assert!(err.to_string().contains("not signed"), "{err}");
-    sign(
-        client,
-        &target,
-        &digest,
-        &signing_key(&private).unwrap(),
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(verify(client, &target, &key, None).await.unwrap(), digest);
+    sign(client, &target, &digest, &private, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        verify(client, &target, &key, None).await.unwrap(),
+        signed_by(&key)
+    );
+
+    // The same image and signatures under another repository, as a mirror
+    // would copy them: the signature names the first, so it is refused, as
+    // Legion's image policies refuse it. (The mock keeps manifests by tag.)
+    let mirror = Reference::parse(&format!("{host}/me/mirror:1")).unwrap();
+    let err = verify(client, &mirror, &key, None).await.unwrap_err();
+    let err = err.to_string();
+    assert!(
+        err.contains("has no signature by this key") && err.contains("me/app"),
+        "{err}"
+    );
+
     let err = verify(client, &target, &other, None).await.unwrap_err();
     assert!(
         err.to_string().contains("no signature by this key"),
@@ -1129,27 +1138,22 @@ async fn pushed_images_are_signed_and_verified() {
     );
 
     // A second signer adds to the signatures; signing again changes nothing.
-    sign(
-        client,
-        &target,
-        &digest,
-        &signing_key(&other_private).unwrap(),
-        None,
-    )
-    .await
-    .unwrap();
-    sign(
-        client,
-        &target,
-        &digest,
-        &signing_key(&private).unwrap(),
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(verify(client, &target, &other, None).await.unwrap(), digest);
-    assert_eq!(verify(client, &target, &key, None).await.unwrap(), digest);
-    let sig_tag = signature_ref(&target, &digest).tag.unwrap();
+    sign(client, &target, &digest, &other_private, None)
+        .await
+        .unwrap();
+    sign(client, &target, &digest, &private, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        verify(client, &target, &other, None).await.unwrap(),
+        signed_by(&other)
+    );
+    assert_eq!(
+        verify(client, &target, &key, None).await.unwrap(),
+        signed_by(&key)
+    );
+
+    let sig_tag = signature_reference(&target, &digest).tag.unwrap();
     let (_, sig) = registry.manifests.lock().unwrap()[&sig_tag].clone();
     let sig: serde_json::Value = serde_json::from_slice(&sig).unwrap();
     assert_eq!(sig["layers"].as_array().unwrap().len(), 2, "{sig}");
