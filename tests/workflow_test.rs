@@ -2057,3 +2057,27 @@ async fn publish_pushes_the_index_only_when_every_host_succeeds() {
     );
     assert!(!std::fs::read_to_string(&record).unwrap().contains("a b"));
 }
+
+#[test]
+fn the_version_names_the_legion_crates_it_was_built_with() {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
+    let at = lock.find("name = \"legion-image\"").unwrap();
+    let source = lock[at..]
+        .lines()
+        .find_map(|l| l.strip_prefix("source = \"git+"))
+        .unwrap();
+    let (url, commit) = source.trim_end_matches('"').rsplit_once('#').unwrap();
+    let pin = match url.split_once("?tag=") {
+        Some((_, tag)) => format!("{tag} {}", &commit[..7]),
+        None => commit[..7].to_owned(),
+    };
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jailer"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        format!("jailer {} (legion {pin})", env!("CARGO_PKG_VERSION"))
+    );
+}

@@ -21,7 +21,7 @@ use jailer::{Reference, shim};
 #[derive(Parser, Debug)]
 #[command(
     name = "jailer",
-    version,
+    version = env!("JAILER_VERSION"),
     about = "Build, test, and publish FreeBSD jail OCI images for Legion"
 )]
 pub struct Cli {

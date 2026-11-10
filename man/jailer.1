@@ -12,6 +12,8 @@
 .Op Fl -plain-http Ar host Ns Op : Ns Ar port
 .Ar command
 .Op Ar args ...
+.Nm
+.Fl V | -version
 .Sh DESCRIPTION
 .Nm
 scaffolds
@@ -54,6 +56,10 @@ on it first.
 .It Fl -plain-http Ar host Ns Op : Ns Ar port
 Talk to this registry over HTTP instead of HTTPS.
 May be given more than once.
+.It Fl V , Fl -version
+Print the version and the Legion crates it was built with, by tag and
+commit, as in
+.Ql jailer 0.5.4 (legion v0.1.17 7df630d) .
 .El
 .Pp
 Commands that take
