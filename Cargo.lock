@@ -1006,7 +1006,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 [[package]]
 name = "legion-api"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1019,7 +1019,7 @@ dependencies = [
 [[package]]
 name = "legion-image"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -1045,7 +1045,7 @@ dependencies = [
 [[package]]
 name = "legion-jail"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "bytes",
  "futures",
@@ -1063,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "legion-net"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "hickory-proto",
  "legion-sys",
@@ -1079,7 +1079,7 @@ dependencies = [
 [[package]]
 name = "legion-runtime"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "bytes",
  "futures",
@@ -1091,7 +1091,7 @@ dependencies = [
 [[package]]
 name = "legion-sys"
 version = "0.1.18"
-source = "git+https://github.com/grepjava/legion?rev=60b02d5#60b02d5beed4568a52eac65fdc874ac7dfbee6d6"
+source = "git+https://github.com/grepjava/legion?tag=v0.1.18#ac7048731d1e21b765f3be32588130fac3a5ba97"
 dependencies = [
  "libc",
  "serde",
