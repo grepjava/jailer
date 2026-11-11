@@ -83,8 +83,10 @@ failed teardown, `login` refusing a token realm that is not https, and the
 default `(self)` publish, which opens a port on every address and so runs only on
 disposable hosts.
 
-Done for amd64: all 30 steps pass on a disposable VM from Legion's `scripts/lab`
-(`--profile isolated`), and all but the `(self)` test on the shared host. Results
+Done for amd64: all 31 steps pass on a disposable VM from Legion's `scripts/lab`
+(`--profile isolated`), and all but two on the shared host: the `(self)` test,
+and the static Linux program, which sets `kern.elf64.fallback_brand` and so runs
+only on disposable hosts. Results
 name the host, its release and architecture, the VM and its image, the Legion
 version and the storage. A VM is not real hardware. arm64 waits on an arm64 host.
 
@@ -111,7 +113,14 @@ short and sent again. From Legion v0.1.17 it covers a signed push too: jailer
 signs with `legion_image::cosign`, and an `ImagePolicy` wanting jailer's key
 runs what jailer signed, on the digest signed, and holds an unsigned image, one
 signed by another key, one whose signature the registry cannot give, and a
-loaded image with no signature, the old tasks running. Not yet covered: a
+loaded image with no signature, the old tasks running. From Legion v0.1.18 one
+test takes a single jailer image through all of it: jailer builds a writer, signs
+it and pushes it; Legion runs it under a policy enforcing jailer's key, drains
+its node, moves it back with the move's last part cut short, backs its Volume
+up, loses the host and restores it onto another. At each stage the task runs the
+digest jailer recorded and the policy verified, its data is the same byte for
+byte, and each writer in turn stops before the next starts. The record names
+both versions, jailer's as `jailer --version` gives it. Not yet covered: a
 multi-architecture index (the lab is amd64 only).
 
 - Build and test a native application with Jailer, sign and push its immutable
