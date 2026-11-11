@@ -2841,8 +2841,10 @@ fn a_static_linux_program_runs_under_linux() {
     let brand = || host(&["sysctl", "-n", BRAND]).trim().to_owned();
     let tmp = scratch();
     let state = tmp.path().join("state");
-    // busybox's image is one static program, linked under many names.
-    let image = "docker.io/library/busybox:1.37";
+    // busybox's musl image is one static program, linked under many
+    // names, with no note to brand it: its default, glibc's, names an
+    // interpreter, and so runs whatever the fallback brand.
+    let image = "docker.io/library/busybox:1.37-musl";
     let run = || {
         jailer_in(&state)
             .args(["run", "--rm", "--network", "none", "--linux", image])
