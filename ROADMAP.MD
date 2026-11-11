@@ -339,10 +339,10 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | Phase | Work | Waits on |
 |---|---|---|
 | 1. Honest tests | P0: done for amd64 on disposable VMs, with ZFS and plain-directory storage and the uncovered paths. arm64 remains | An arm64 host |
-| 2. Stage planning | P1.1 | Nothing; runs alongside phase 1 |
+| 2. Stage planning | P1.1: done | Nothing; runs alongside phase 1 |
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
-| 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria | Legion P1.3, P0.2, P1.2, P1.4, P2.1 |
+| 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria: done for amd64 in Legion's handoff tests, from Legion v0.1.18. A multi-architecture index remains | An arm64 host |
 | 6. Supply chain and automation | P2.1, P2.2 and P2.3 done: `jailer doctor` on `legion_sys::check`, shared with `legion doctor` | Phase 1 |
 | 7. Parallel stages | P3: done with `--jobs`, default 1, in waves of what is ready. Measured in `docs/COMPATIBILITY.md`: jailer's hashing and compression stay on one thread, which limits the gain | Phases 1 and 2 |
 
