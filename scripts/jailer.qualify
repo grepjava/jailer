@@ -58,3 +58,6 @@ test . freebsd_jail_test a_stop_while_a_run_starts_ends_it_on_zfs host shared 60
 
 # Publishes a port on every address the host has: disposable hosts only.
 test . freebsd_jail_test a_port_given_no_address_answers_on_the_hosts_own_addresses host isolated 300
+
+# Sets kern.elf64.fallback_brand, a sysctl of the whole host: disposable hosts only.
+test . freebsd_jail_test a_static_linux_program_runs_under_linux host isolated 600

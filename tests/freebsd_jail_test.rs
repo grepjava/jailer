@@ -2189,6 +2189,7 @@ fn doctor_reports_on_the_host_and_changes_nothing() {
         "module.nullfs",
         "module.tmpfs",
         "module.linux64",
+        "linux.static",
     ] {
         check(&all, id);
     }
@@ -2813,4 +2814,65 @@ fn a_ctrl_c_while_a_run_starts_ends_it_on_zfs() {
 #[ignore = "needs root: scripts/jailer.qualify runs it"]
 fn a_container_left_without_its_root_is_listed_and_removed_on_zfs() {
     on_zfs(a_container_left_without_its_root_is_listed_and_removed);
+}
+
+/// Puts a sysctl back as it was when dropped.
+struct Sysctl(&'static str, String);
+
+impl Drop for Sysctl {
+    fn drop(&mut self) {
+        host(&["sysctl", &format!("{}={}", self.0, self.1)]);
+    }
+}
+
+/// `run --linux` runs a static Linux program, which names no interpreter
+/// to brand it Linux, by setting the fallback ELF brand to Linux's where the
+/// host left it unset, as Legion's agent does; a value the host chose stays,
+/// with a warning, and such a program then fails as it would on its own. It
+/// sets a sysctl of the whole host, so: disposable hosts only.
+#[test]
+#[ignore = "needs root, Linux ABI modules and a disposable host: scripts/jailer.qualify runs it"]
+fn a_static_linux_program_runs_under_linux() {
+    if !live("a_static_linux_program_runs_under_linux") {
+        return;
+    }
+    const BRAND: &str = "kern.elf64.fallback_brand";
+    let _restore = Sysctl(BRAND, host(&["sysctl", "-n", BRAND]).trim().to_owned());
+    let brand = || host(&["sysctl", "-n", BRAND]).trim().to_owned();
+    let tmp = scratch();
+    let state = tmp.path().join("state");
+    // busybox's image is one static program, linked under many names.
+    let image = "docker.io/library/busybox:1.37";
+    let run = || {
+        jailer_in(&state)
+            .args(["run", "--rm", "--network", "none", "--linux", image])
+            .args(["/bin/echo", "static"])
+            .output()
+            .unwrap()
+    };
+
+    // As FreeBSD leaves it: set to Linux's, and the program runs.
+    host(&["sysctl", &format!("{BRAND}=-1")]);
+    assert_eq!(brand(), "-1");
+    let out = run();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "static\n");
+    assert!(!said.contains("warning"), "{said}");
+    assert_eq!(brand(), "3", "set to Linux's");
+
+    // FreeBSD's, as a host may choose: kept, said, and the program, being
+    // static, is refused by the kernel.
+    host(&["sysctl", &format!("{BRAND}=9")]);
+    let out = run();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("static Linux programs will not run"),
+        "{said}"
+    );
+    assert!(
+        !out.status.success(),
+        "a static program ran unbranded: {said}"
+    );
+    assert_eq!(brand(), "9", "the host's choice kept");
 }

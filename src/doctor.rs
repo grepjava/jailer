@@ -153,6 +153,7 @@ pub fn examine(sys: &dyn Sys, host: &Host, operations: &[Operation]) -> Report {
     for name in check::LINUX_MODULES.iter().filter(|m| **m != "tmpfs") {
         add(&[Linux], &mut || check::module(sys, name));
     }
+    add(&[Linux], &mut || check::linux_static(sys));
     for name in ["pf", "if_bridge", "if_epair"] {
         add(&[Vnet], &mut || check::module(sys, name));
     }

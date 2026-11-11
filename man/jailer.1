@@ -698,6 +698,10 @@ Run a Linux image through
 .Xr linux 4 ,
 mounting linprocfs, linsysfs, fdescfs and
 .Pa /dev/shm .
+It loads the Linux modules and, where the host left
+.Va kern.elf64.fallback_brand
+unset, sets it to 3, Linux's, as Legion's agent does, so static Linux
+programs run; a value the host chose is kept, with a warning.
 .El
 .It Xo
 .Nm push

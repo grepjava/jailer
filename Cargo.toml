@@ -15,12 +15,12 @@ clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1.1"
 futures = "0.3"
 getrandom = "0.3"
-legion-api = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
-legion-image = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
-legion-jail = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
-legion-net = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
-legion-runtime = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
-legion-sys = { git = "https://github.com/grepjava/legion", tag = "v0.1.17" }
+legion-api = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
+legion-image = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
+legion-jail = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
+legion-net = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
+legion-runtime = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
+legion-sys = { git = "https://github.com/grepjava/legion", rev = "60b02d5" }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",

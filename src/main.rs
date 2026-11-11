@@ -1906,9 +1906,7 @@ fn signalled(_: bool) -> std::io::Result<impl Future<Output = i32>> {
 #[cfg(unix)]
 async fn containers(cli: &Cli) -> Result<()> {
     use futures::StreamExt;
-    use jailer::runtime::{
-        LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, LINUX_MODULES, Mount, Network, RunSpec,
-    };
+    use jailer::runtime::{LABEL_IP, LABEL_POD, LABEL_PORTS, LABEL_ROLE, Mount, Network, RunSpec};
     use std::time::Duration;
 
     use legion_runtime::{Output, Runtime};
@@ -1961,8 +1959,14 @@ async fn containers(cli: &Cli) -> Result<()> {
                         "{image_ref} is a Linux image; pass --linux to run it through FreeBSD's Linux ABI"
                     );
                 }
-                for m in LINUX_MODULES {
-                    let _ = sys.kld_load(m);
+                // As Legion's agent does: the modules, and the fallback ELF
+                // brand set to Linux's where the host left it unset, so
+                // static Linux programs run. What cannot be done is said,
+                // and the run goes on, as `jailer doctor` tells the rest.
+                match legion_jail::enable_linux(sys.as_ref()) {
+                    Ok(None) => {}
+                    Ok(Some(note)) => eprintln!("warning: {note}"),
+                    Err(e) => eprintln!("warning: enabling Linux images: {e}"),
                 }
             }
 
