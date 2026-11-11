@@ -1946,7 +1946,8 @@ async fn containers(cli: &Cli) -> Result<()> {
                 let r = Reference::parse(&image_ref)?;
                 if !r.is_local() {
                     let creds = resolve_credentials(&r.registry, None, None)?;
-                    println!("Pulling {r}...");
+                    // On stderr: stdout is the program's own.
+                    eprintln!("Pulling {r}...");
                     store.pull(&image_ref, creds.as_ref(), "root").await?;
                 }
             }
