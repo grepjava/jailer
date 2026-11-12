@@ -90,9 +90,9 @@ only on disposable hosts. Results
 name the host, its release and architecture, the VM and its image, the Legion
 version and the storage. A VM is not real hardware.
 
-arm64: all but those two pass on FreeBSD 15.1 aarch64 (`--profile shared`), in
-a QEMU VM on Apple silicon that is kept between runs. The two disposable-host
-tests wait on a VM restored after each run.
+arm64: all 31 pass on FreeBSD 15.1 aarch64, in a QEMU VM on Apple silicon:
+`--profile shared` as it is kept, and `--profile isolated` from a disk snapshot
+restored afterwards.
 
 Storage: nine tests also run on ZFS, the main workflow already did, and each of
 those nine fails if a stage or container dataset is left behind. The rest use
@@ -342,7 +342,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 
 | Phase | Work | Waits on |
 |---|---|---|
-| 1. Honest tests | P0: done for amd64 on disposable VMs, with ZFS and plain-directory storage and the uncovered paths; on arm64 all but the two disposable-host tests | A disposable arm64 VM |
+| 1. Honest tests | P0: done for amd64 and arm64 on disposable VMs, with ZFS and plain-directory storage and the uncovered paths | Nothing |
 | 2. Stage planning | P1.1: done | Nothing; runs alongside phase 1 |
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
