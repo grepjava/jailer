@@ -1,5 +1,5 @@
 //! Names the Legion crates jailer is built with in `jailer --version`, as
-//! Cargo.lock has them: "0.5.4 (legion v0.1.19 e2c2251)", or the commit
+//! Cargo.lock has them: "0.5.5 (legion v0.1.19 e2c2251)", or the commit
 //! alone for a pin by revision.
 
 use std::path::Path;

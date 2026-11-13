@@ -11,10 +11,10 @@ people building images for Legion.
   hosts. Tested against a mock registry and Docker's `registry:2`, and on
   GHCR: an amd64 image pushed from one host and an arm64 one from another,
   one signed index naming both, each architecture pulling its own. The
-  test suite passed on arm64 (FreeBSD 15.1 VM) at the time; arm64 has had
-  no qualified run since.
+  full test suite passes on arm64 (FreeBSD 15.1 VM, 2026-11-12), and
+  Legion's handoff tests run a signed two-architecture index jailer made.
 
-- [ ] **Packaging.** v0.5.4 is released with an amd64 tarball (aarch64 to come),
+- [ ] **Packaging.** v0.5.5 is released with an amd64 tarball (aarch64 to come),
   built by `scripts/release.sh` on FreeBSD 15.1 (they need its libc,
   FBSD_1.9). The port in `ports/sysutils/jailer` is at 0.5.4 (FreeBSD 15+,
   amd64 and aarch64), with Legion's git crates fetched by the ports
