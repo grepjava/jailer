@@ -124,8 +124,8 @@ its node, moves it back with the move's last part cut short, backs its Volume
 up, loses the host and restores it onto another. At each stage the task runs the
 digest jailer recorded and the policy verified, its data is the same byte for
 byte, and each writer in turn stops before the next starts. The record names
-both versions, jailer's as `jailer --version` gives it. From Legion 65122d1
-(for v0.1.19) one test covers a multi-architecture index: an arm64 image jailer
+both versions, jailer's as `jailer --version` gives it. From Legion v0.1.19
+one test covers a multi-architecture index: an arm64 image jailer
 built on FreeBSD aarch64, pushed beside an amd64 one jailer builds in the test,
 in one index jailer signs. The service pins the index, the policy verifies it on
 that digest, and each amd64 node runs amd64's manifest. A service wanting arm64
@@ -352,7 +352,7 @@ Dependencies: P1.1 and P0; validate shared store/cache synchronization first.
 | 2. Stage planning | P1.1: done | Nothing; runs alongside phase 1 |
 | 3. Stated guarantees | P1.2, P1.3: done, in `docs/` and `tests/compat` | Phase 2 for target semantics |
 | 4. Image handoff | P1.4's Jailer side, with structured `check` output: done, in `docs/RELEASE-RECORD.md` | Phase 1 |
-| 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria: done in Legion's handoff tests, from Legion v0.1.18, and the multi-architecture index from Legion 65122d1, with an arm64 image jailer built on aarch64 | Nothing |
+| 5. Shared qualification | Build to Recover across both products; P1.4's joint criteria: done in Legion's handoff tests, from Legion v0.1.18, and the multi-architecture index from Legion v0.1.19, with an arm64 image jailer built on aarch64 | Nothing |
 | 6. Supply chain and automation | P2.1, P2.2 and P2.3 done: `jailer doctor` on `legion_sys::check`, shared with `legion doctor` | Phase 1 |
 | 7. Parallel stages | P3: done with `--jobs`, default 1, in waves of what is ready. Measured in `docs/COMPATIBILITY.md`: jailer's hashing and compression stay on one thread, which limits the gain | Phases 1 and 2 |
 
