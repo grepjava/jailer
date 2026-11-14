@@ -14,7 +14,7 @@ people building images for Legion.
   full test suite passes on arm64 (FreeBSD 15.1 VM, 2026-11-12), and
   Legion's handoff tests run a signed two-architecture index jailer made.
 
-- [ ] **Packaging.** v0.5.5 is released with an amd64 tarball (aarch64 to come),
+- [ ] **Packaging.** v0.5.5 is released with amd64 and aarch64 tarballs,
   built by `scripts/release.sh` on FreeBSD 15.1 (they need its libc,
   FBSD_1.9). The port in `ports/sysutils/jailer` is at 0.5.5 (FreeBSD 15+,
   amd64 and aarch64), with Legion's git crates fetched by the ports
