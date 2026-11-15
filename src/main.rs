@@ -548,10 +548,11 @@ pub enum Commands {
     /// List images in the local store
     Images,
 
-    /// Remove an image from the local store
+    /// Remove images from the local store
     Rmi {
-        /// Image reference or ID
-        reference: String,
+        /// Image references or IDs
+        #[arg(required = true)]
+        references: Vec<String>,
     },
 
     /// Remove layers and blobs no image or build cache entry uses
@@ -559,6 +560,10 @@ pub enum Commands {
         /// Also clear the build cache
         #[arg(long)]
         cache: bool,
+
+        /// First remove every image no container was made from
+        #[arg(long)]
+        images: bool,
     },
 
     /// List local containers
@@ -1841,19 +1846,39 @@ async fn run() -> Result<()> {
             Ok(())
         }
 
-        Commands::Prune { cache } => {
-            let (_, store, _) = open_context(&cli, true)?;
+        Commands::Prune { cache, images } => {
+            let (_, store, runtime) = open_context(&cli, true)?;
+            if *images {
+                use legion_runtime::Runtime;
+                let in_use: Vec<String> = runtime
+                    .list(&[])
+                    .await?
+                    .into_iter()
+                    .map(|c| c.image)
+                    .collect();
+                for name in jailer::store::remove_unused_images(&store, &in_use).await? {
+                    println!("Removed {name}");
+                }
+            }
             let n = jailer::store::prune(&store, *cache).await?;
             println!("Removed {n} layer(s)");
             Ok(())
         }
 
-        Commands::Rmi { reference } => {
+        Commands::Rmi { references } => {
             let (_, store, _) = open_context(&cli, true)?;
-            if jailer::store::remove(&store, reference).await? {
-                println!("Removed {reference}");
-            } else {
-                bail!("image {reference:?} not found");
+            // Each that can go goes, as with `docker rmi`; then the
+            // command fails if any could not.
+            let mut missing = Vec::new();
+            for reference in references {
+                if jailer::store::remove(&store, reference).await? {
+                    println!("Removed {reference}");
+                } else {
+                    missing.push(format!("{reference:?}"));
+                }
+            }
+            if !missing.is_empty() {
+                bail!("image {} not found", missing.join(", "));
             }
             Ok(())
         }

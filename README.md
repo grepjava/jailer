@@ -68,8 +68,8 @@ Other FreeBSD tools, as their own documentation described them in November 2026:
 | `jailer key generate [prefix]` | Make a P-256 key pair for signing |
 | `jailer pull <reference>` | Pull an image from an OCI registry into the local store |
 | `jailer load <archive.tar>` | Load an OCI archive into the local store |
-| `jailer images` / `jailer rmi <ref>` | List or remove local images |
-| `jailer prune [--cache]` | Free layers nothing uses; `--cache` also clears the build cache |
+| `jailer images` / `jailer rmi <ref>...` | List or remove local images |
+| `jailer prune [--cache] [--images]` | Free layers nothing uses; `--cache` also clears the build cache, `--images` first removes images no container uses |
 | `jailer ps` / `jailer logs` / `jailer exec` / `jailer stop` / `jailer rm` | Manage detached test containers |
 
 ## Installing

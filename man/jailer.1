@@ -961,12 +961,17 @@ the command line, where other users can see it:
 .Dl gh auth token | jailer login -u me --password-stdin ghcr.io
 .It Nm images
 List local images.
-.It Nm rmi Ar reference
-Remove a local image, along with any layers and blobs no other image or
+.It Nm rmi Ar reference ...
+Remove local images, along with any layers and blobs no other image or
 build cache entry uses.
-.It Nm prune Op Fl -cache
+The cached layers of a removed image's build stay, so the next build of
+it still uses them.
+.It Nm prune Op Fl -cache Op Fl -images
 Remove build cache entries whose layer is gone, then the layers and blobs
 nothing uses.
+With
+.Fl -images ,
+first remove every image no container was made from, by all its names.
 With
 .Fl -cache ,
 clear the build cache first, freeing the layers only it kept, and the

@@ -2081,3 +2081,94 @@ fn the_version_names_the_legion_crates_it_was_built_with() {
         format!("jailer {} (legion {pin})", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[tokio::test]
+async fn prune_images_removes_what_no_container_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = tmp.path().join("ctx");
+    std::fs::create_dir_all(&ctx).unwrap();
+    let sys = Arc::new(FakeSys::new());
+    let store = Arc::new(
+        jailer::store::open(
+            sys.clone(),
+            None,
+            &tmp.path().join("store"),
+            Client::new().unwrap(),
+        )
+        .unwrap(),
+    );
+    let runtime = JailRuntime::new(
+        sys,
+        store.clone(),
+        Config {
+            state_dir: tmp.path().join("containers"),
+            dataset: None,
+            shim: vec![OsString::from("jailer"), OsString::from("jail-shim")],
+            prune_images: false,
+        },
+    )
+    .unwrap();
+    // `a` one image; `b` another, named twice.
+    for (file, tag) in [("a", "a:1"), ("b", "b:1"), ("b", "b:2")] {
+        std::fs::write(ctx.join(file), file.repeat(1000)).unwrap();
+        let cf = ctx.join(format!("{file}.Containerfile"));
+        std::fs::write(&cf, format!("FROM scratch\nCOPY {file} /{file}\n")).unwrap();
+        build(
+            &store,
+            &runtime,
+            &BuildOptions {
+                context_dir: ctx.clone(),
+                containerfile: Some(cf),
+                tag: tag.to_owned(),
+                build_args: BTreeMap::new(),
+                target: None,
+                jobs: 1,
+                backend: BuildBackend::Native,
+                creds: Default::default(),
+                strict_lint: false,
+                no_cache: false,
+                squash: false,
+                cache_max: None,
+                secrets: BTreeMap::new(),
+                ssh: BTreeMap::new(),
+                jail_params: Vec::new(),
+                labels: BTreeMap::new(),
+                timestamp: None,
+                limits: Default::default(),
+                compression: Default::default(),
+                cpuset: None,
+                annotations: BTreeMap::new(),
+                cache_from: Vec::new(),
+                cache_to: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(store.images().unwrap().len(), 2);
+
+    // A container names its image as the store does; one naming an image
+    // gone, or nothing, keeps nothing.
+    let in_use = [
+        "localhost/a:1".to_owned(),
+        "localhost/gone:1".to_owned(),
+        String::new(),
+    ];
+    let mut removed = jailer::store::remove_unused_images(&store, &in_use)
+        .await
+        .unwrap();
+    removed.sort();
+    assert_eq!(removed, ["localhost/b:1", "localhost/b:2"]);
+    let left = store.images().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].references, ["localhost/a:1"]);
+
+    // Named as written, too; and again, nothing more goes.
+    assert!(
+        jailer::store::remove_unused_images(&store, &["a:1".to_owned()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.images().unwrap().len(), 1);
+}

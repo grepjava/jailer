@@ -57,6 +57,31 @@ pub async fn remove(store: &Store, query: &str) -> Result<bool, Error> {
     Ok(store.remove(&name).await?)
 }
 
+/// Forgets every image that none of `in_use` (images as containers name
+/// them) finds, by each of its names, and destroys what nothing uses any
+/// more. Returns the names forgotten. A build running meanwhile keeps
+/// what it has pinned, and the image it makes.
+pub async fn remove_unused_images(store: &Store, in_use: &[String]) -> Result<Vec<String>, Error> {
+    let mut kept = BTreeSet::new();
+    for name in in_use.iter().filter(|n| !n.is_empty()) {
+        if let Some(i) = store.find(name)? {
+            kept.insert((i.id, i.digest));
+        }
+    }
+    let mut removed = Vec::new();
+    for i in store.images()? {
+        if kept.contains(&(i.id.clone(), i.digest.clone())) {
+            continue;
+        }
+        for name in &i.references {
+            if store.remove(name).await? {
+                removed.push(name.clone());
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// The outcome of a cached build step: the layer it added, if any.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedStep {
