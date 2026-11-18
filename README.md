@@ -4,6 +4,10 @@
 
 # jailer
 
+> **Archived.** jailer has been merged into [Legion](https://github.com/grepjava/legion):
+> `legion build` builds images, `legion local` runs, tests and pushes them, on any
+> FreeBSD host with or without a cluster. This repository is kept read-only for its history.
+
 `jailer` is a standalone FreeBSD OCI image builder, local jail test runner, compatibility checker, and registry publisher designed for [Legion](https://github.com/grepjava/legion) — and usable on any FreeBSD host without it.
 
 It covers the pre-deployment workflow before scheduling containers onto a Legion cluster:
